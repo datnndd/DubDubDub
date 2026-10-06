@@ -59,8 +59,8 @@ The UI offers ASR choices including Qwen-ASR, Deepgram, Gemini STT, Google STT, 
 PowerShell example (skip the clone step if you already have the repository):
 
 ```powershell
-git clone https://github.com/datnndd/DubDub.git
-Set-Location DubDub
+git clone https://github.com/datnndd/DubDubDub.git
+Set-Location DubDubDub
 uv sync --frozen
 bun install --frozen-lockfile
 Push-Location frontend
