@@ -1,4 +1,4 @@
-# DubDub (pyVideoTrans)
+# DubDubDub
 
 **A local web studio for transcribing, translating, dubbing, and exporting video.**
 
