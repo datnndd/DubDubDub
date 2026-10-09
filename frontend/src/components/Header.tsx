@@ -1,6 +1,6 @@
 import React from 'react';
 import { useDubDubStore } from '../store';
-import { Waves, Video, Mic, FolderOpen, Sparkles, Settings as SettingsIcon, ArrowLeft } from 'lucide-react';
+import { Waves, Video, Mic, FolderOpen, Sparkles, Settings as SettingsIcon, ArrowLeft, Layers } from 'lucide-react';
 
 export const Header: React.FC = () => {
   const activeView = useDubDubStore((s) => s.activeView);
@@ -9,6 +9,9 @@ export const Header: React.FC = () => {
   const project = useDubDubStore((s) => s.project);
   const projectsList = useDubDubStore((s) => s.projectsList);
   const openSettings = useDubDubStore((s) => s.openSettings);
+  const sessionSubprojects = useDubDubStore((s) => s.sessionSubprojects || []);
+  const sessionDrawerOpen = useDubDubStore((s) => s.sessionDrawerOpen);
+  const setSessionDrawerOpen = useDubDubStore((s) => s.setSessionDrawerOpen);
 
   return (
     <header className="h-[50px] flex-shrink-0 bg-white border-b border-[#E7E4DC] px-4 flex items-center justify-between gap-4 z-30 shadow-2xs">
@@ -107,6 +110,25 @@ export const Header: React.FC = () => {
             <span>Back to Projects</span>
           </button>
         )}
+
+        <button
+          onClick={() => setSessionDrawerOpen(!sessionDrawerOpen)}
+          data-testid="header-session-drawer-toggle"
+          className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors flex items-center gap-1.5 leading-none cursor-pointer border shadow-2xs ${
+            sessionDrawerOpen
+              ? 'bg-amber-100 text-[#8D4B00] border-amber-300 font-bold'
+              : 'text-stone-700 hover:text-[#8D4B00] bg-stone-100/90 hover:bg-amber-50 border-stone-200'
+          }`}
+          title="Toggle Session Videos Drawer"
+        >
+          <Layers className="w-3.5 h-3.5 text-[#8D4B00]" />
+          <span>Session Videos</span>
+          {sessionSubprojects.length > 0 && (
+            <span className="px-1.5 py-0.2 rounded-full text-[9px] font-bold bg-[#8D4B00] text-white">
+              {sessionSubprojects.length}
+            </span>
+          )}
+        </button>
 
         <button
           onClick={() => openSettings()}

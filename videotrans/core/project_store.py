@@ -64,10 +64,18 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
     return d
 
 
+def get_parent_project_dir(parent_id_or_name: str) -> Path:
+    """Return the base artifact directory for a parent project."""
+    base = get_projects_root() / parent_id_or_name
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
 def create_project(
     project_id: Optional[str] = None,
     name: str = "Untitled Project",
     *,
+    parent_id: Optional[str] = None,
     media_id: Optional[str] = None,
     media_path: Optional[str] = None,
     duration: float = 0.0,
@@ -85,15 +93,52 @@ def create_project(
         conn.execute(
             """
             INSERT OR REPLACE INTO projects
-            (id, name, media_id, media_path, duration, stage, status, audio_hash, state_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, name, parent_id, media_id, media_path, duration, stage, status, audio_hash, state_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (pid, name, media_id, media_path, duration, stage, status, audio_hash, state_json, now, now),
+            (pid, name, parent_id, media_id, media_path, duration, stage, status, audio_hash, state_json, now, now),
         )
 
     init_project_dirs(pid)
     logger.info("Created project %s ('%s')", pid, name)
     return get_project(pid)  # type: ignore[return-value]
+
+
+def get_or_create_date_parent_project(date_str: Optional[str] = None) -> dict[str, Any]:
+    """Get or create the date-based parent project (e.g. '2026-10-09')."""
+    import datetime
+    target_date = date_str or datetime.date.today().isoformat()
+    parent_id = f"parent_{target_date}"
+    existing = get_project(parent_id)
+    if existing:
+        return existing
+
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM projects WHERE (id = ? OR name = ?) AND (parent_id IS NULL OR parent_id = '') LIMIT 1",
+            (parent_id, target_date),
+        ).fetchone()
+    if row:
+        return _row_to_dict(row)
+
+    parent = create_project(
+        project_id=parent_id,
+        name=target_date,
+        parent_id=None,
+        status="active",
+        state={"is_parent": True, "date": target_date},
+    )
+    get_parent_project_dir(target_date)
+    return parent
+
+
+def list_subprojects(parent_id: str) -> list[dict[str, Any]]:
+    """List all subprojects belonging to a parent project."""
+    with db_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM projects WHERE parent_id = ? ORDER BY created_at ASC", (parent_id,)
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
 
 
 def get_project(project_id: str) -> Optional[dict[str, Any]]:
@@ -103,12 +148,18 @@ def get_project(project_id: str) -> Optional[dict[str, Any]]:
     return _row_to_dict(row) if row else None
 
 
-def list_projects(limit: int = 100) -> list[dict[str, Any]]:
-    """List all projects sorted by last updated timestamp descending."""
+def list_projects(limit: int = 100, parent_id: Optional[str] = None) -> list[dict[str, Any]]:
+    """List projects sorted by last updated timestamp descending."""
     with db_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM projects ORDER BY updated_at DESC LIMIT ?", (limit,)
-        ).fetchall()
+        if parent_id is not None:
+            rows = conn.execute(
+                "SELECT * FROM projects WHERE parent_id = ? ORDER BY updated_at DESC LIMIT ?",
+                (parent_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM projects ORDER BY updated_at DESC LIMIT ?", (limit,)
+            ).fetchall()
     return [_row_to_dict(r) for r in rows]
 
 
@@ -128,6 +179,7 @@ def update_project(project_id: str, **kwargs: Any) -> Optional[dict[str, Any]]:
     """Update arbitrary fields of a project record."""
     allowed = {
         "name",
+        "parent_id",
         "media_id",
         "media_path",
         "duration",

@@ -13,6 +13,8 @@ import { Stage3VoiceDubbing } from './screens/Stage3VoiceDubbing';
 import { Stage4EditVideo } from './screens/Stage4EditVideo';
 import { SettingsModal } from './components/settings/SettingsModal';
 import { CapCutExportModal } from './components/CapCutExportModal';
+import { FolderScanModal } from './components/FolderScanModal';
+import { SessionVideosDrawer } from './components/SessionVideosDrawer';
 import { ErrorBoundary } from './components/ErrorBoundary';
 
 export const App: React.FC = () => {
@@ -85,6 +87,8 @@ export const App: React.FC = () => {
       <FloatingPill />
       <SettingsModal />
       <CapCutExportModal />
+      <FolderScanModal />
+      <SessionVideosDrawer />
     </div>
   );
 };

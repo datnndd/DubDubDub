@@ -18,6 +18,8 @@ import {
   Sparkles,
   StopCircle,
   FileVideo,
+  FolderTree,
+  ListFilter,
 } from 'lucide-react';
 import { ProviderDocLink } from '../components/ProviderDocLink';
 
@@ -63,6 +65,10 @@ export const Stage1Prepare: React.FC = () => {
   const updateDeepgramOptions = useDubDubStore((s) => s.updateDeepgramOptions);
   const cancelActiveJob = useDubDubStore((s) => s.cancelActiveJob);
   const openSettings = useDubDubStore((s) => s.openSettings);
+  const sessionSubprojects = useDubDubStore((s) => s.sessionSubprojects || []);
+  const activeParentProjectName = useDubDubStore((s) => s.activeParentProjectName);
+  const setScanModalOpen = useDubDubStore((s) => s.setScanModalOpen);
+  const setSessionDrawerOpen = useDubDubStore((s) => s.setSessionDrawerOpen);
 
   const options = backend.options;
   const isAnalyzing = backend.status === 'analyzing';
@@ -111,6 +117,47 @@ export const Stage1Prepare: React.FC = () => {
         onChange={handleFileChange}
       />
 
+      {/* BATCH MODE BANNER (when session subprojects exist) */}
+      {sessionSubprojects.length > 0 && (
+        <div
+          data-batch-banner="true"
+          className="bg-amber-500/10 border border-amber-500/30 rounded-xl px-4 py-2.5 flex items-center justify-between text-xs text-amber-950 shrink-0 shadow-2xs"
+        >
+          <div className="flex items-center gap-2">
+            <FolderTree className="w-4 h-4 text-amber-600 shrink-0" />
+            <div>
+              <span className="font-bold">Batch Mode Active: </span>
+              <span>{sessionSubprojects.length} videos loaded in Parent Project </span>
+              <span className="font-mono font-bold text-amber-800">
+                [{activeParentProjectName || 'Today'}]
+              </span>
+              {project.filename && (
+                <span className="ml-2 text-stone-600 hidden md:inline">
+                  • Currently editing: <strong className="text-stone-900">{project.filename}</strong>
+                </span>
+              )}
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setSessionDrawerOpen(true)}
+              className="px-2.5 py-1 rounded-md bg-[#8D4B00] text-white font-semibold hover:bg-[#743D00] transition cursor-pointer flex items-center gap-1.5 shadow-2xs"
+            >
+              <ListFilter className="w-3.5 h-3.5" />
+              <span>Session Videos ({sessionSubprojects.length})</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setScanModalOpen(true)}
+              className="px-2.5 py-1 rounded-md bg-white border border-amber-400 text-amber-900 font-medium hover:bg-amber-50 transition cursor-pointer"
+            >
+              Scan More
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* TOP ZONE: Studio Video Monitor & Ingest Telemetry */}
       <section className="min-h-[300px] flex-1 w-full grid grid-cols-12 gap-3">
         {/* LEFT: Video Canvas & Viewport (8 cols) */}
@@ -132,11 +179,20 @@ export const Stage1Prepare: React.FC = () => {
               </span>
             </div>
 
-            <div className="flex items-center gap-3">
-              <div className="flex items-center gap-1.5 font-mono text-[10px] text-stone-600">
+            <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5 font-mono text-[10px] text-stone-600 mr-1">
                 <span className={`w-2 h-2 rounded-full ${project.hasAudio ? 'bg-emerald-500' : 'bg-amber-500'}`} />
                 <span>{project.hasAudio ? `Audio: ${project.audioCodec}` : 'No verified audio stream'}</span>
               </div>
+              <button
+                type="button"
+                onClick={() => setScanModalOpen(true)}
+                className="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-50 hover:bg-amber-100 text-[#8D4B00] border border-amber-300 transition-colors cursor-pointer flex items-center gap-1"
+                title="Scan folders recursively for MP4 videos"
+              >
+                <FolderTree className="w-3 h-3" />
+                <span>Scan Folders</span>
+              </button>
               {project.verified && (
                 <button
                   type="button"
@@ -188,13 +244,29 @@ export const Stage1Prepare: React.FC = () => {
                     Supports MP4, MKV, MOV, WebM, MP3, WAV up to 4K. Audio will be automatically extracted for transcription.
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  className="mt-1 px-3.5 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-xs font-semibold cursor-pointer transition-all"
-                >
-                  Select Media File
-                </button>
+                <div className="flex items-center gap-2 mt-1">
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      fileInputRef.current?.click();
+                    }}
+                    className="px-3.5 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-xs font-semibold cursor-pointer transition-all"
+                  >
+                    Select Media File
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setScanModalOpen(true);
+                    }}
+                    className="px-3.5 py-1.5 rounded-lg bg-stone-800 hover:bg-stone-700 text-stone-200 border border-stone-600 text-xs font-semibold cursor-pointer transition-all flex items-center gap-1.5"
+                  >
+                    <FolderTree className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Scan Folders (Batch)</span>
+                  </button>
+                </div>
               </div>
             )}
           </div>

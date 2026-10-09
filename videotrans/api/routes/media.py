@@ -10,6 +10,8 @@ from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, FileResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from videotrans.configure.contants import AUDIO_EXITS, VIDEO_EXTS
 from videotrans.core.edit_asset_store import EDIT_ASSET_STORE
 from videotrans.core.media_store import MEDIA
@@ -19,6 +21,116 @@ EDIT_ASSETS = EDIT_ASSET_STORE.items
 EDIT_ASSETS_LOCK = EDIT_ASSET_STORE.lock
 
 router = APIRouter()
+
+
+class ScanFoldersRequest(BaseModel):
+    paths: list[str] = Field(default_factory=list)
+    recursive: bool = True
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+class RegisterLocalMediaRequest(BaseModel):
+    paths: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+@router.post("/api/media/scan-folders")
+@router.post("/api/media/scan_folders")
+async def scan_folders_handler(payload: ScanFoldersRequest) -> JSONResponse:
+    target_paths = payload.paths or []
+    recursive = payload.recursive
+    found_map: dict[str, Path] = {}
+
+    for raw in target_paths:
+        clean = str(raw).strip().strip('"').strip("'")
+        if not clean:
+            continue
+        p = Path(clean)
+        if not p.exists():
+            continue
+        if p.is_file():
+            if p.suffix.lower() == ".mp4":
+                found_map[str(p.resolve())] = p.resolve()
+        elif p.is_dir():
+            pattern = "**/*.mp4" if recursive else "*.mp4"
+            try:
+                for match in p.glob(pattern):
+                    if match.is_file() and match.suffix.lower() == ".mp4":
+                        found_map[str(match.resolve())] = match.resolve()
+            except Exception:
+                pass
+
+    results = []
+    for resolved_str, path_obj in sorted(found_map.items()):
+        try:
+            sz = path_obj.stat().st_size
+            results.append({
+                "path": resolved_str,
+                "filename": path_obj.name,
+                "sizeBytes": sz,
+                "parentDir": str(path_obj.parent),
+            })
+        except Exception:
+            pass
+
+    return JSONResponse({"ok": True, "videos": results, "count": len(results)})
+
+
+@router.post("/api/media/register-local", status_code=201)
+@router.post("/api/media/register_local", status_code=201)
+async def register_local_media_handler(
+    payload: RegisterLocalMediaRequest,
+    request: Request,
+) -> JSONResponse:
+    store = getattr(request.app.state, "media_store", None) or MEDIA
+    records = []
+
+    for raw in payload.paths:
+        clean = str(raw).strip().strip('"').strip("'")
+        if not clean:
+            continue
+        p = Path(clean)
+        if not p.is_file():
+            continue
+        try:
+            rec = store.inspect(p, filename=p.name)
+            records.append(rec.snapshot())
+        except Exception:
+            pass
+
+    return JSONResponse({"ok": True, "media": records, "count": len(records)}, status_code=201)
+
+
+@router.post("/api/media/batch-upload", status_code=201)
+@router.post("/api/media/batch_upload", status_code=201)
+async def batch_upload_media_handler(
+    request: Request,
+) -> JSONResponse:
+    store = getattr(request.app.state, "media_store", None) or MEDIA
+    form = await request.form()
+    uploaded_records = []
+
+    for key, value in form.multi_items():
+        if isinstance(value, (UploadFile, StarletteUploadFile)) and value.filename:
+            filename = Path(unquote(value.filename)).name
+            ext = Path(filename).suffix.lower().lstrip(".")
+            if ext not in {*VIDEO_EXTS, *AUDIO_EXITS}:
+                continue
+            media_id = uuid.uuid4().hex
+            upload_path = store.upload_dir / f"{media_id}-{filename}"
+            try:
+                with upload_path.open("wb") as output:
+                    while chunk := await value.read(4 * 1024 * 1024):
+                        output.write(chunk)
+                if upload_path.is_file() and upload_path.stat().st_size > 0:
+                    rec = store.inspect(upload_path, filename, media_id=media_id)
+                    uploaded_records.append(rec.snapshot())
+            except Exception:
+                upload_path.unlink(missing_ok=True)
+
+    return JSONResponse({"ok": True, "media": uploaded_records, "count": len(uploaded_records)}, status_code=201)
 
 
 @router.post("/api/media", status_code=201)

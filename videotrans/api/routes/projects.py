@@ -17,6 +17,10 @@ from videotrans.core.project_store import (
     create_project,
     get_project,
     get_project_dir,
+    get_parent_project_dir,
+    get_projects_root,
+    get_or_create_date_parent_project,
+    list_subprojects,
     list_projects,
     update_project,
     update_project_state,
@@ -35,6 +39,7 @@ router = APIRouter()
 class ProjectCreateRequest(BaseModel):
     id: Optional[str] = None
     name: Optional[str] = "Untitled Project"
+    parentId: Optional[str] = Field(None, alias="parent_id")
     mediaId: Optional[str] = Field(None, alias="media_id")
     mediaPath: Optional[str] = Field(None, alias="media_path")
     duration: Optional[float] = 0.0
@@ -47,6 +52,7 @@ class ProjectCreateRequest(BaseModel):
 
 class ProjectUpdateRequest(BaseModel):
     name: Optional[str] = None
+    parentId: Optional[str] = Field(None, alias="parent_id")
     mediaId: Optional[str] = Field(None, alias="media_id")
     mediaPath: Optional[str] = Field(None, alias="media_path")
     duration: Optional[float] = None
@@ -57,10 +63,97 @@ class ProjectUpdateRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
 
+class BatchCreateItem(BaseModel):
+    name: Optional[str] = "Untitled Video"
+    mediaId: Optional[str] = Field(None, alias="media_id")
+    mediaPath: Optional[str] = Field(None, alias="media_path")
+    duration: Optional[float] = 0.0
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+class BatchCreateProjectsRequest(BaseModel):
+    items: list[BatchCreateItem]
+    date: Optional[str] = None
+    parentId: Optional[str] = Field(None, alias="parent_id")
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
 @router.get("/api/projects")
-async def list_projects_handler(limit: int = Query(100)) -> JSONResponse:
-    projects = list_projects(limit=limit)
+async def list_projects_handler(
+    limit: int = Query(100),
+    parentId: Optional[str] = Query(None, alias="parent_id"),
+) -> JSONResponse:
+    projects = list_projects(limit=limit, parent_id=parentId)
     return JSONResponse({"projects": projects})
+
+
+@router.post("/api/projects/batch-create", status_code=201)
+async def batch_create_projects_handler(
+    payload: BatchCreateProjectsRequest,
+    request: Request,
+) -> JSONResponse:
+    parent_id = payload.parentId
+    if parent_id:
+        parent = get_project(parent_id)
+        if not parent:
+            parent = get_or_create_date_parent_project(payload.date)
+    else:
+        parent = get_or_create_date_parent_project(payload.date)
+
+    media_store = getattr(request.app.state, "media_store", None) or MEDIA
+    created_subprojects = []
+
+    for item in payload.items:
+        media_id = str(item.mediaId or "") or None
+        media = media_store.get(media_id) if media_id else None
+        media_path = str(media.path) if media else (str(item.mediaPath or "") or None)
+        name = str(item.name or "Untitled Video").strip() or "Untitled Video"
+
+        duration = 0.0
+        if media and media.info.get("time"):
+            try:
+                duration = float(media.info["time"]) / 1000.0
+            except (ValueError, TypeError):
+                pass
+        elif item.duration is not None:
+            try:
+                duration = float(item.duration)
+            except (ValueError, TypeError):
+                pass
+
+        audio_hash = ""
+        if media and media.path.is_file():
+            try:
+                audio_hash = compute_content_hash(media.path)
+            except Exception:
+                pass
+
+        proj = create_project(
+            name=name,
+            parent_id=parent["id"],
+            media_id=media_id,
+            media_path=media_path,
+            duration=duration,
+            stage=1,
+            status="pending",
+            audio_hash=audio_hash,
+            state={"parent_id": parent["id"]},
+        )
+        created_subprojects.append(proj)
+
+    return JSONResponse({
+        "ok": True,
+        "parent": parent,
+        "projects": created_subprojects,
+    }, status_code=201)
+
+
+@router.get("/api/projects/{parent_id}/subprojects")
+async def list_subprojects_handler(parent_id: str) -> JSONResponse:
+    subprojects = list_subprojects(parent_id)
+    return JSONResponse({"subprojects": subprojects})
 
 
 @router.post("/api/projects", status_code=201)
@@ -102,6 +195,8 @@ async def create_project_handler(
 
     status = str(payload.status or "pending")
     state = payload.state if isinstance(payload.state, dict) else {}
+    if payload.parentId:
+        state["parent_id"] = payload.parentId
 
     if audio_hash and not state.get("segments"):
         cached_proj = find_project_by_audio_hash(audio_hash)
@@ -113,6 +208,7 @@ async def create_project_handler(
     project = create_project(
         project_id=str(payload.id or "") or None,
         name=name,
+        parent_id=payload.parentId,
         media_id=media_id,
         media_path=media_path,
         duration=duration,
@@ -385,26 +481,36 @@ def _prepare_capcut_assets(project_id: str) -> dict[str, Path]:
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    proj_dir = get_project_dir(project_id)
-    exports_dir = proj_dir / "exports"
+    parent_id = project.get("parent_id")
+    if parent_id:
+        parent = get_project(parent_id)
+        parent_name = (parent.get("name") if parent else None) or parent_id
+        exports_dir = get_parent_project_dir(parent_name)
+        safe_stem = re.sub(r"[^\w.-]+", "-", Path(project.get("name") or project_id).stem, flags=re.UNICODE).strip("-")
+        prefix = f"{safe_stem}_" if safe_stem else ""
+    else:
+        proj_dir = get_project_dir(project_id)
+        exports_dir = proj_dir / "exports"
+        prefix = ""
     exports_dir.mkdir(parents=True, exist_ok=True)
 
     state = project.get("state") or {}
     segments = state.get("segments") or []
 
     # 1. subtitles_edited.srt
-    edited_srt_path = exports_dir / "subtitles_edited.srt"
+    edited_srt_path = exports_dir / f"{prefix}subtitles_edited.srt"
     edited_content = _build_srt(segments, field="targetText")
     edited_srt_path.write_text(edited_content, encoding="utf-8")
 
     # 2. subtitles_target.srt
-    target_srt_path = exports_dir / "subtitles_target.srt"
+    target_srt_path = exports_dir / f"{prefix}subtitles_target.srt"
     target_content = _build_srt(segments, field="rawTranslation" if any("rawTranslation" in s for s in segments) else "targetText")
     target_srt_path.write_text(target_content, encoding="utf-8")
 
     # 3. voiceover_merged.wav
-    voiceover_path = exports_dir / "voiceover_merged.wav"
+    voiceover_path = exports_dir / f"{prefix}voiceover_merged.wav"
     found_audio = None
+    proj_dir = get_project_dir(project_id)
     dubbing_dir = proj_dir / "dubbing"
     for cand_name in ["voiceover_merged.wav", "target.wav", "lastend.wav", "dubbed.wav"]:
         cand_dub = dubbing_dir / cand_name
@@ -425,11 +531,11 @@ def _prepare_capcut_assets(project_id: str) -> dict[str, Path]:
         _create_fallback_wav(voiceover_path, duration_sec=float(project.get("duration") or 1.0))
 
     # 4. bundle.zip
-    zip_path = exports_dir / f"capcut_export_{project_id}.zip"
+    zip_path = exports_dir / f"{prefix}capcut_export_{project_id}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.write(edited_srt_path, "subtitles_edited.srt")
-        zf.write(target_srt_path, "subtitles_target.srt")
-        zf.write(voiceover_path, "voiceover_merged.wav")
+        zf.write(edited_srt_path, f"{prefix}subtitles_edited.srt")
+        zf.write(target_srt_path, f"{prefix}subtitles_target.srt")
+        zf.write(voiceover_path, f"{prefix}voiceover_merged.wav")
 
     return {
         "subtitles_edited.srt": edited_srt_path,
@@ -448,19 +554,19 @@ async def get_capcut_asset_handler(project_id: str, asset_name: str):
     if clean_name in {"subtitles_edited.srt", "edited.srt"}:
         target = assets["subtitles_edited.srt"]
         media_type = "text/plain; charset=utf-8"
-        download_name = "subtitles_edited.srt"
+        download_name = target.name
     elif clean_name in {"subtitles_target.srt", "target.srt"}:
         target = assets["subtitles_target.srt"]
         media_type = "text/plain; charset=utf-8"
-        download_name = "subtitles_target.srt"
+        download_name = target.name
     elif clean_name in {"voiceover_merged.wav", "audio.wav", "audio"}:
         target = assets["voiceover_merged.wav"]
         media_type = "audio/wav"
-        download_name = "voiceover_merged.wav"
+        download_name = target.name
     elif clean_name in {"bundle.zip", "capcut_bundle.zip", "all.zip", "zip"}:
         target = assets["bundle.zip"]
         media_type = "application/zip"
-        download_name = f"capcut_export_{project_id}.zip"
+        download_name = target.name
     else:
         raise HTTPException(status_code=404, detail=f"Unknown asset {asset_name}")
 
@@ -474,9 +580,15 @@ async def open_project_folder_handler(project_id: str) -> JSONResponse:
     project = get_project(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    proj_dir = get_project_dir(project_id)
-    exports_dir = proj_dir / "exports"
-    target_dir = exports_dir if exports_dir.is_dir() else proj_dir
+    parent_id = project.get("parent_id")
+    if parent_id:
+        parent = get_project(parent_id)
+        parent_name = (parent.get("name") if parent else None) or parent_id
+        target_dir = get_parent_project_dir(parent_name)
+    else:
+        proj_dir = get_project_dir(project_id)
+        exports_dir = proj_dir / "exports"
+        target_dir = exports_dir if exports_dir.is_dir() else proj_dir
     target_dir.mkdir(parents=True, exist_ok=True)
     try:
         if hasattr(os, "startfile"):

@@ -1,7 +1,7 @@
 import { StateCreator } from 'zustand';
 import type { ProjectRecord } from '../types/project';
 import type { Segment } from '../types/segment';
-import { fetchProjects, fetchProject, createProject, deleteProject as apiDeleteProject, bulkDeleteProjects, updateProjectState, resetProjectStage } from '../api/projects';
+import { fetchProjects, fetchProject, createProject, deleteProject as apiDeleteProject, bulkDeleteProjects, updateProjectState, resetProjectStage, fetchSubprojects } from '../api/projects';
 import { DEFAULT_EDIT_VIDEO, DEFAULT_SUBTITLE_STYLES } from './editVideoSlice';
 
 let pendingProjectSave: Promise<void> = Promise.resolve();
@@ -18,10 +18,22 @@ export interface ProjectSlice {
   forceAsr: boolean;
   stage3Baseline: Segment[] | null;
   resettingStage: boolean;
-  
+  activeParentProjectId: string | null;
+  activeParentProjectName: string | null;
+  sessionSubprojects: ProjectRecord[];
+  sessionDrawerOpen: boolean;
+  scanModalOpen: boolean;
+  batchModeActive: boolean;
+
   setActiveView: (view: MainView) => void;
   setStep: (step: number) => Promise<void>;
   setDrawerOpen: (open: boolean) => void;
+  setSessionDrawerOpen: (open: boolean) => void;
+  setScanModalOpen: (open: boolean) => void;
+  setBatchModeActive: (active: boolean) => void;
+  setSessionSubprojects: (projects: ProjectRecord[], parentId?: string, parentName?: string) => void;
+  loadSubprojects: (parentId: string) => Promise<void>;
+  switchSessionVideo: (projectId: string) => Promise<void>;
   loadProjects: () => Promise<void>;
   selectProject: (id: string, autoNavigate?: boolean) => Promise<void>;
   createNewProject: (name?: string, mediaId?: string, duration?: number) => Promise<string>;
@@ -109,6 +121,12 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
   forceAsr: false,
   stage3Baseline: null,
   resettingStage: false,
+  activeParentProjectId: null,
+  activeParentProjectName: null,
+  sessionSubprojects: [],
+  sessionDrawerOpen: false,
+  scanModalOpen: false,
+  batchModeActive: false,
 
   setActiveView: (view: MainView) => set({ activeView: view }),
 
@@ -122,6 +140,39 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
   },
 
   setDrawerOpen: (open: boolean) => set({ drawerOpen: open }),
+  setSessionDrawerOpen: (open: boolean) => set({ sessionDrawerOpen: open }),
+  setScanModalOpen: (open: boolean) => set({ scanModalOpen: open }),
+  setBatchModeActive: (active: boolean) => set({ batchModeActive: active }),
+  setSessionSubprojects: (projects: ProjectRecord[], parentId?: string, parentName?: string) => {
+    set((state: any) => ({
+      sessionSubprojects: projects,
+      activeParentProjectId: parentId !== undefined ? parentId : state.activeParentProjectId,
+      activeParentProjectName: parentName !== undefined ? parentName : state.activeParentProjectName,
+      batchModeActive: projects.length > 0,
+    }));
+  },
+  loadSubprojects: async (parentId: string) => {
+    try {
+      const subs = await fetchSubprojects(parentId);
+      set({ sessionSubprojects: subs, activeParentProjectId: parentId });
+    } catch (e) {
+      console.warn('Failed to load subprojects:', e);
+    }
+  },
+  switchSessionVideo: async (projectId: string) => {
+    await get().triggerAutosave();
+    await get().selectProject(projectId, false);
+    const pStatuses = get().projectJobStatuses || {};
+    if (pStatuses[projectId]) {
+      const ps = pStatuses[projectId];
+      set({
+        jobStatus: ps.status || 'idle',
+        jobProgress: ps.progress ?? null,
+        jobMessage: ps.message || '',
+        jobStage: ps.stage || null,
+      });
+    }
+  },
 
   loadProjects: async () => {
     try {

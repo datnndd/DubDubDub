@@ -102,8 +102,15 @@ def build_task_params(
     safe_stem = re.sub(r"[^\w.-]+", "-", file_info.basename, flags=re.UNICODE).strip("-")
     pid = project_id or options.get("projectId") or options.get("project_id")
     if pid:
-        from videotrans.core.project_store import get_project_dir
-        target_dir = get_project_dir(str(pid)) / "exports"
+        from videotrans.core.project_store import get_project, get_project_dir, get_parent_project_dir
+        proj = get_project(str(pid))
+        parent_id = proj.get("parent_id") if proj else None
+        if parent_id:
+            parent = get_project(parent_id)
+            parent_name = (parent.get("name") if parent else None) or parent_id
+            target_dir = get_parent_project_dir(parent_name)
+        else:
+            target_dir = get_project_dir(str(pid)) / "exports"
         target_dir.mkdir(parents=True, exist_ok=True)
     else:
         target_dir = Path(output_dir) / (safe_stem or file_info.uuid)

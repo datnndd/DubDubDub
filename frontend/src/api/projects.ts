@@ -64,3 +64,21 @@ export async function resumeProject(id: string): Promise<{ job_id: string }> {
     method: 'POST',
   });
 }
+
+export async function batchCreateProjects(payload: {
+  items: Array<{ name: string; mediaId?: string; mediaPath?: string; duration?: number }>;
+  date?: string;
+  parentId?: string;
+}): Promise<{ ok: boolean; parent: ProjectRecord; projects: ProjectRecord[] }> {
+  return apiRequest('/api/projects/batch-create', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function fetchSubprojects(parentId: string): Promise<ProjectRecord[]> {
+  const data = await apiRequest<any>(`/api/projects/${encodeURIComponent(parentId)}/subprojects`);
+  return data?.subprojects || [];
+}
+

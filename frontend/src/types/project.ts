@@ -20,6 +20,8 @@ export interface ProjectRecord {
   name: string;
   stage: number;
   status: 'pending' | 'processing' | 'completed' | 'failed' | 'paused';
+  parent_id?: string | null;
+  parentId?: string | null;
   media_path?: string;
   duration?: number;
   created_at?: string;

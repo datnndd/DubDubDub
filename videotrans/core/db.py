@@ -23,6 +23,7 @@ PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    parent_id TEXT,
     media_id TEXT,
     media_path TEXT,
     duration REAL DEFAULT 0,
@@ -141,4 +142,9 @@ def init_db(db_path: Optional[str | Path] = None) -> None:
     """Initialize database tables and indexes idempotently."""
     with db_conn(db_path) as conn:
         conn.executescript(_BASE_SCHEMA)
+        # Check and migrate existing projects table if parent_id is missing
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(projects)").fetchall()]
+        if "parent_id" not in cols:
+            conn.execute("ALTER TABLE projects ADD COLUMN parent_id TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_parent ON projects(parent_id)")
     logger.debug("Database initialized at %s", db_path or _current_db_path)

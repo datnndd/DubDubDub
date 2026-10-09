@@ -4,6 +4,7 @@ import { Play, ArrowRight, Video, CheckCircle2, AlertCircle, Loader2, StopCircle
 
 export const StatusFooter: React.FC = () => {
   const [showCapCutTooltip, setShowCapCutTooltip] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
   const currentStep = useDubDubStore((s) => s.currentStep);
   const setStep = useDubDubStore((s) => s.setStep);
   const backend = useDubDubStore((s) => s.backend);
@@ -22,16 +23,19 @@ export const StatusFooter: React.FC = () => {
   const activeProjectId = useDubDubStore((s) => s.activeProjectId);
   const resetStage = useDubDubStore((s) => s.resetStage);
   const resettingStage = useDubDubStore((s) => s.resettingStage);
-  const translationStatus = useDubDubStore((s) => s.translationModal.status);
-  const [resetError, setResetError] = useState<string | null>(null);
+  const sessionSubprojects = useDubDubStore((s) => s.sessionSubprojects || []);
+  const startBatchPrepareJobs = useDubDubStore((s) => s.startBatchPrepareJobs);
+  const translationModal = useDubDubStore((s) => s.translationModal);
 
-  const isBusy = jobStatus === 'running' || backend.status === 'analyzing' || dubbingStatus === 'running' || assemblingDubbing || translationStatus === 'translating' || resettingStage;
+  const isBusy = jobStatus === 'running' || backend.status === 'analyzing' || dubbingStatus === 'running' || assemblingDubbing || translationModal?.status === 'translating' || resettingStage;
   const isCancellable = jobStatus === 'running';
 
   const handleAction = () => {
     if (currentStep === 1) {
       if (isCancellable) {
         cancelActiveJob();
+      } else if (sessionSubprojects.length > 1) {
+        startBatchPrepareJobs();
       } else {
         startPrepareJob();
       }
@@ -64,6 +68,14 @@ export const StatusFooter: React.FC = () => {
           icon: <Loader2 className="w-3.5 h-3.5 animate-spin" />,
           disabled: true,
           color: 'bg-stone-300 text-stone-600',
+        };
+      }
+      if (sessionSubprojects.length > 1) {
+        return {
+          text: `Start Batch Dub (${sessionSubprojects.length} Videos)`,
+          icon: <Play className="w-3.5 h-3.5 fill-current" />,
+          disabled: false,
+          color: 'bg-[#8D4B00] hover:bg-[#743D00] text-white',
         };
       }
       return {
