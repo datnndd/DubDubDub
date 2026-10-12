@@ -7,6 +7,7 @@ import soundfile as sf
 
 from videotrans.tts._base import BaseTTS
 from videotrans.util.help_role import get_vieneu_custom_voice_path
+from videotrans.services.voice_preview import resolve_vieneu_preset_voice
 
 
 @dataclass
@@ -63,8 +64,9 @@ class VieNeuTTS(BaseTTS):
 
             if resolved.get("base_type") == "preset":
                 preset_name = resolved.get("preset_voice") or resolved.get("external_voice_id") or role
+                v_target = resolve_vieneu_preset_voice(preset_name, self.engine)
                 v_key = ("preset", preset_name, style) if style else ("preset", preset_name)
-                opts = {"voice": self.engine.get_preset_voice(preset_name)}
+                opts = {"voice": v_target}
                 if style:
                     opts["style"] = style
                 if is_design:
@@ -101,9 +103,10 @@ class VieNeuTTS(BaseTTS):
                 return ("custom", reference_audio.as_posix(), item_style), {"ref_audio": reference_audio.as_posix(), "style": item_style}
             return ("custom", reference_audio.as_posix()), {"ref_audio": reference_audio.as_posix()}
 
+        v_target = resolve_vieneu_preset_voice(role, self.engine)
         if item_style:
-            return ("preset", role, item_style), {"voice": self.engine.get_preset_voice(role), "style": item_style}
-        return ("preset", role), {"voice": self.engine.get_preset_voice(role)}
+            return ("preset", role, item_style), {"voice": v_target, "style": item_style}
+        return ("preset", role), {"voice": v_target}
 
     def _exec(self) -> None:
         queue_by_voice: Dict[

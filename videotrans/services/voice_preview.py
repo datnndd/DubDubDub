@@ -23,7 +23,7 @@ from videotrans.util.help_ffmpeg import runffmpeg
 logger = logging.getLogger("videotrans.voice_preview")
 
 _preview_lock = asyncio.Lock()
-PREVIEW_TIMEOUT_SECONDS = 60.0
+PREVIEW_TIMEOUT_SECONDS = 120.0
 CLONE_TIMEOUT_SECONDS = 120.0
 
 _preview_synthesizer = None
@@ -118,6 +118,82 @@ def generate_snippet_preview(
     return _is_valid_preview_wav(output_path)
 
 
+VIENEU_PRESET_MAP: dict[str, str] = {
+    "bình": "Thanh Bình",
+    "bình (nam miền bắc)": "Thanh Bình",
+    "thanh bình": "Thanh Bình",
+    "ly": "Trúc Ly",
+    "ly (nữ miền bắc)": "Trúc Ly",
+    "trúc ly": "Trúc Ly",
+    "ngọc": "Ngọc Linh",
+    "ngọc (nữ miền bắc)": "Ngọc Linh",
+    "ngọc linh": "Ngọc Linh",
+    "tuyên": "Phạm Tuyên",
+    "tuyên (nam miền bắc)": "Phạm Tuyên",
+    "phạm tuyên": "Phạm Tuyên",
+    "vĩnh": "Xuân Vĩnh",
+    "vĩnh (nam miền nam)": "Xuân Vĩnh",
+    "xuân vĩnh": "Xuân Vĩnh",
+    "đoan": "Thục Đoan",
+    "đoan (nữ miền nam)": "Thục Đoan",
+    "thục đoan": "Thục Đoan",
+    "đoan trang": "Đoan Trang",
+    "đức": "Minh Đức",
+    "minh đức": "Minh Đức",
+    "sơn": "Thái Sơn",
+    "thái sơn": "Thái Sơn",
+    "quang sơn": "Quang Sơn",
+    "mai anh": "Mai Anh",
+    "triết": "Minh Triết",
+    "minh triết": "Minh Triết",
+    "dung": "Thùy Dung",
+    "thùy dung": "Thùy Dung",
+    "trân": "Ngọc Trân",
+    "ngọc trân": "Ngọc Trân",
+}
+
+
+def resolve_vieneu_preset_voice(voice_input: Any, engine: Any = None) -> Any:
+    """Resolve regional, short, or full VieNeu preset voice names to valid preset objects or names."""
+    if not voice_input:
+        return None
+    if isinstance(voice_input, dict):
+        return voice_input
+    if not isinstance(voice_input, str):
+        return voice_input
+
+    raw = voice_input.strip()
+    norm = raw.lower()
+    if norm in ("no", "default", "clone"):
+        return None
+
+    resolved_name: Optional[str] = VIENEU_PRESET_MAP.get(norm)
+    if not resolved_name:
+        for k, v in VIENEU_PRESET_MAP.items():
+            if k in norm or norm in k:
+                resolved_name = v
+                break
+
+    if not resolved_name:
+        resolved_name = raw
+
+    if engine and hasattr(engine, "get_preset_voice"):
+        try:
+            return engine.get_preset_voice(resolved_name)
+        except Exception:
+            # Fallback to available presets
+            if hasattr(engine, "_preset_voices") and engine._preset_voices:
+                avail = list(engine._preset_voices.keys())
+                for a in avail:
+                    if a.lower() in norm or norm in a.lower():
+                        try:
+                            return engine.get_preset_voice(a)
+                        except Exception:
+                            pass
+                return engine.get_preset_voice(avail[0])
+    return resolved_name
+
+
 def _run_vieneu_synthesis(
     ref_audio: Optional[Path] = None,
     output_file: Optional[Path] = None,
@@ -161,7 +237,7 @@ def _run_vieneu_synthesis(
                 **kwargs,
             )
         elif voice:
-            v_target = engine.get_preset_voice(voice) if isinstance(voice, str) else voice
+            v_target = resolve_vieneu_preset_voice(voice, engine)
             audios = engine.infer_batch(
                 [text],
                 voice=v_target,

@@ -334,7 +334,14 @@ export const createDubbingSlice: StateCreator<any, [], [], DubbingSlice> = (set,
       }
 
       if (get().activeProjectId === targetProjectId) {
-        set({ dubbingStatus: 'running', dubbingError: null });
+        set({
+          dubbingStatus: 'running',
+          dubbingError: null,
+          jobStatus: 'running',
+          jobProgress: 0,
+          jobMessage: 'Creating voice…',
+          jobStage: 'voice',
+        });
       }
 
       if (targetProjectId) {
@@ -351,7 +358,8 @@ export const createDubbingSlice: StateCreator<any, [], [], DubbingSlice> = (set,
         }));
       }
 
-      const segments: Segment[] = get().segments || [];
+      const rawSegments: Segment[] = get().segments || [];
+      const segments: Segment[] = rawSegments.map((s) => ({ ...s }));
       const ttsType = get().backend?.config?.ttsType ?? 2;
       const lang = get().languages?.target?.code || 'vi';
       const speed = get().tuning?.pace;
@@ -361,11 +369,44 @@ export const createDubbingSlice: StateCreator<any, [], [], DubbingSlice> = (set,
 
       let completedCount = 0;
       const totalCount = segments.length;
+      const updated: Segment[] = [...segments];
 
-      const updated = await Promise.all(
-        segments.map(async (seg, idx) => {
+      // Concurrency worker queue (concurrency = 2)
+      // Balances parallel network throughput while avoiding browser connection timeouts
+      const concurrency = 2;
+      let currentIndex = 0;
+
+      const worker = async () => {
+        while (currentIndex < segments.length) {
+          const idx = currentIndex++;
+          const seg = segments[idx];
           const activeVoice = get().getResolvedVoiceForSegment(seg);
           const text = seg.targetText || seg.sourceText || '';
+
+          // If segment already has a valid preview generated with the current voice, keep it
+          if (seg.previewAudioUrl && seg.previewVoice === activeVoice) {
+            completedCount++;
+            const pct = totalCount > 0 ? Math.round((completedCount / totalCount) * 100) : 100;
+            const msg = `Creating voice (${completedCount}/${totalCount})…`;
+            if (targetProjectId) {
+              set((s: any) => ({
+                projectJobStatuses: {
+                  ...s.projectJobStatuses,
+                  [targetProjectId!]: {
+                    status: 'running',
+                    progress: pct,
+                    message: msg,
+                    stage: 'voice',
+                  },
+                },
+              }));
+            }
+            if (get().activeProjectId === targetProjectId) {
+              set({ jobProgress: pct, jobMessage: msg });
+            }
+            continue;
+          }
+
           const nextSeg = segments[idx + 1];
           let slotDur: number | undefined = undefined;
           if (autoFit && typeof seg.startSec === 'number' && typeof seg.endSec === 'number') {
@@ -381,47 +422,68 @@ export const createDubbingSlice: StateCreator<any, [], [], DubbingSlice> = (set,
             }
           }
 
-          const res = await previewTTS({
+          try {
+            const res = await previewTTS({
               text,
               voice: activeVoice,
               provider: ttsType,
               language: lang,
               speed,
               segment_id: seg.id,
-              force_refresh: true,
+              force_refresh: false,
               auto_speed: autoFit,
               slot_duration_s: slotDur,
               max_speed_rate: maxRate,
             });
-          if (!(res.audio_url || res.preview_url)) {
-            throw new Error(`No preview audio was returned for segment ${seg.id}`);
+
+            if (res.audio_url || res.preview_url) {
+              const segDone: Segment = {
+                ...seg,
+                previewAudioUrl: res.preview_url || res.audio_url,
+                previewAudioId: res.id || res.preview_id,
+                previewSpeedFactor: res.applied_speed,
+                previewVoice: activeVoice,
+              };
+              updated[idx] = segDone;
+
+              // Live update the segment in active project state so audio preview appears on screen immediately
+              if (get().activeProjectId === targetProjectId) {
+                const currentSegs = (get().segments || []).map((s: Segment) => s.id === seg.id ? segDone : s);
+                set({ segments: currentSegs });
+              }
+            }
+          } catch (segErr) {
+            console.warn(`Failed to synthesize preview for segment ${seg.id}:`, segErr);
           }
 
           completedCount++;
+          const pct = totalCount > 0 ? Math.round((completedCount / totalCount) * 100) : 100;
+          const msg = `Creating voice (${completedCount}/${totalCount})…`;
           if (targetProjectId) {
-            const pct = totalCount > 0 ? Math.round((completedCount / totalCount) * 100) : 100;
             set((s: any) => ({
               projectJobStatuses: {
                 ...s.projectJobStatuses,
                 [targetProjectId!]: {
                   status: 'running',
                   progress: pct,
-                  message: `Creating voice (${completedCount}/${totalCount})…`,
+                  message: msg,
                   stage: 'voice',
                 },
               },
             }));
           }
+          if (get().activeProjectId === targetProjectId) {
+            set({
+              jobProgress: pct,
+              jobMessage: msg,
+            });
+          }
+        }
+      };
 
-          return {
-              ...seg,
-              previewAudioUrl: res.preview_url || res.audio_url,
-              previewAudioId: res.id || res.preview_id,
-              previewSpeedFactor: res.applied_speed,
-              previewVoice: activeVoice,
-          };
-        })
-      );
+      const workerCount = Math.min(concurrency, segments.length);
+      const workers = Array.from({ length: Math.max(1, workerCount) }, () => worker());
+      await Promise.all(workers);
 
       if (targetProjectId) {
         set((s: any) => ({
@@ -442,6 +504,9 @@ export const createDubbingSlice: StateCreator<any, [], [], DubbingSlice> = (set,
           segments: updated,
           stage3Baseline: updated.map((segment) => ({ ...segment })),
           dubbingStatus: 'completed',
+          jobStatus: 'completed',
+          jobProgress: 100,
+          jobMessage: 'Voice completed',
           maxUnlockedStep: Math.max(get().maxUnlockedStep || 1, 4),
         });
         get().triggerAutosave();

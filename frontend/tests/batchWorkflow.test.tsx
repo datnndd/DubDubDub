@@ -8,6 +8,7 @@ import { Stage1Prepare } from '../src/screens/Stage1Prepare';
 import { StatusFooter } from '../src/components/StatusFooter';
 import { ProjectsScreen } from '../src/screens/ProjectsScreen';
 import { Header } from '../src/components/Header';
+import { Stage3VoiceDubbing } from '../src/screens/Stage3VoiceDubbing';
 
 describe('Batch Video Workflow & Multi-Video Session', () => {
   beforeEach(() => {
@@ -482,6 +483,24 @@ describe('Batch Video Workflow & Multi-Video Session', () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  test('Stage3VoiceDubbing renders dubbing-running-banner with progress and message when dubbingStatus is running', () => {
+    useDubDubStore.setState({
+      currentStep: 3,
+      dubbingStatus: 'running',
+      jobProgress: 42.5,
+      jobMessage: 'Creating voice (5/12)…',
+      segments: [
+        { id: 1, sourceText: 'Hello', targetText: 'Xin chào', startSec: 0, endSec: 2 },
+      ] as any,
+    });
+
+    const html = renderToStaticMarkup(<Stage3VoiceDubbing />);
+    expect(html).toContain('data-testid="dubbing-running-banner"');
+    expect(html).toContain('Synthesizing Voice Dubbing in Background');
+    expect(html).toContain('43%');
+    expect(html).toContain('Creating voice (5/12)');
   });
 });
 

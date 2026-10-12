@@ -83,6 +83,8 @@ export const Stage3VoiceDubbing: React.FC = () => {
   const autoFitVoiceSpeed = useDubDubStore((s) => s.autoFitVoiceSpeed);
   const maxSpeedRate = useDubDubStore((s) => s.maxSpeedRate);
   const dubbingError = useDubDubStore((s) => s.dubbingError);
+  const jobProgress = useDubDubStore((s) => s.jobProgress);
+  const jobMessage = useDubDubStore((s) => s.jobMessage);
   const setAutoFitVoiceSpeed = useDubDubStore((s) => s.setAutoFitVoiceSpeed);
   const setMaxSpeedRate = useDubDubStore((s) => s.setMaxSpeedRate);
 
@@ -320,6 +322,34 @@ export const Stage3VoiceDubbing: React.FC = () => {
 
         {/* Scrollable Body */}
         <div className="flex-1 overflow-y-auto p-3 space-y-4">
+          {dubbingStatus === 'running' && (
+            <div
+              data-testid="dubbing-running-banner"
+              className="rounded-xl border border-amber-300 bg-amber-50 p-3 space-y-2 text-xs text-amber-950 shadow-xs"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 font-bold text-amber-900">
+                  <Loader2 className="w-4 h-4 animate-spin text-[#8D4B00]" />
+                  <span>Synthesizing Voice Dubbing in Background…</span>
+                </div>
+                <span className="text-xs font-mono font-bold text-[#8D4B00]">
+                  {jobProgress != null ? `${Math.round(jobProgress)}%` : 'Processing…'}
+                </span>
+              </div>
+              <p className="text-[11px] text-amber-800">
+                {jobMessage || 'Generating voice audio for dialogue segments…'}
+              </p>
+              <div className="w-full bg-amber-200/80 rounded-full h-1.5 overflow-hidden">
+                <div
+                  className="bg-[#8D4B00] h-full transition-all duration-300 rounded-full"
+                  style={{ width: `${Math.min(100, Math.max(0, jobProgress ?? 0))}%` }}
+                />
+              </div>
+              <p className="text-[10px] text-stone-500 italic">
+                Voice generation runs in the background. You can switch to other videos in the session bar to edit or review them at any time.
+              </p>
+            </div>
+          )}
           {(previewError || auditionError || dubbingError) && (
             <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
               {previewError || auditionError || dubbingError}
