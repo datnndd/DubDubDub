@@ -43,16 +43,20 @@ export const SessionVideosDrawer: React.FC = () => {
     const jobState = projectJobStatuses[sub.id];
     if (jobState) {
       if (jobState.status === 'running') {
+        const isVoice = jobState.stage === 'voice';
         return {
-          label: `ASR: ${jobState.progress != null ? jobState.progress.toFixed(0) : '0'}%`,
+          label: isVoice
+            ? (jobState.progress != null && jobState.progress > 0 ? `Voice: ${jobState.progress}%` : 'Creating Voice…')
+            : `ASR: ${jobState.progress != null ? jobState.progress.toFixed(0) : '0'}%`,
           color: 'bg-amber-100 text-[#8D4B00] border-amber-300',
           icon: <Loader2 className="w-3 h-3 animate-spin" />,
           progress: jobState.progress,
         };
       }
       if (jobState.status === 'completed') {
+        const isVoice = jobState.stage === 'voice';
         return {
-          label: 'Ready for Review',
+          label: isVoice ? 'Voice Ready' : 'Ready for Review',
           color: 'bg-emerald-100 text-emerald-800 border-emerald-300',
           icon: <CheckCircle2 className="w-3 h-3" />,
           progress: 100,
@@ -60,7 +64,7 @@ export const SessionVideosDrawer: React.FC = () => {
       }
       if (jobState.status === 'failed') {
         return {
-          label: 'Failed',
+          label: jobState.stage === 'voice' ? 'Voice Failed' : 'Failed',
           color: 'bg-rose-100 text-rose-800 border-rose-300',
           icon: <AlertCircle className="w-3 h-3" />,
           progress: 0,
@@ -77,8 +81,9 @@ export const SessionVideosDrawer: React.FC = () => {
     }
 
     if (sub.stage >= 2 || sub.status === 'completed') {
+      const isStage3or4 = sub.stage >= 3;
       return {
-        label: sub.stage >= 4 ? 'Completed' : `Stage ${sub.stage} Ready`,
+        label: sub.stage >= 4 ? 'Completed' : isStage3or4 ? 'Voice Ready' : 'Ready for Review',
         color: 'bg-emerald-100 text-emerald-800 border-emerald-300',
         icon: <CheckCircle2 className="w-3 h-3" />,
         progress: 100,

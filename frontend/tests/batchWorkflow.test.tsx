@@ -7,6 +7,7 @@ import { SessionVideosDrawer } from '../src/components/SessionVideosDrawer';
 import { Stage1Prepare } from '../src/screens/Stage1Prepare';
 import { StatusFooter } from '../src/components/StatusFooter';
 import { ProjectsScreen } from '../src/screens/ProjectsScreen';
+import { Header } from '../src/components/Header';
 
 describe('Batch Video Workflow & Multi-Video Session', () => {
   beforeEach(() => {
@@ -291,6 +292,193 @@ describe('Batch Video Workflow & Multi-Video Session', () => {
       expect(state.sessionDrawerOpen).toBe(true);
       expect(state.batchModeActive).toBe(true);
       expect(state.activeProjectId).toBe('sub_1');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('Navbar Session Bar in Header displays all session videos with running and completed voice badges', () => {
+    useDubDubStore.setState({
+      activeProjectId: 'sub_1',
+      sessionSubprojects: [
+        {
+          id: 'sub_1',
+          name: 'intro_lesson.mp4',
+          stage: 3,
+          status: 'idle',
+        },
+        {
+          id: 'sub_2',
+          name: 'deep_dive.mp4',
+          stage: 3,
+          status: 'idle',
+        },
+        {
+          id: 'sub_3',
+          name: 'summary.mp4',
+          stage: 2,
+          status: 'idle',
+        },
+      ],
+      projectJobStatuses: {
+        sub_1: {
+          status: 'running',
+          stage: 'voice',
+          progress: 50,
+          message: 'Creating voice…',
+        },
+        sub_2: {
+          status: 'completed',
+          stage: 'voice',
+          progress: 100,
+          message: 'Voice completed',
+        },
+      },
+    });
+
+    const html = renderToStaticMarkup(<Header />);
+    expect(html).toContain('data-testid="navbar-session-bar"');
+    expect(html).toContain('data-testid="session-bar-item-sub_1"');
+    expect(html).toContain('data-testid="session-bar-item-sub_2"');
+    expect(html).toContain('data-testid="session-bar-item-sub_3"');
+    expect(html).toContain('intro_lesson.mp4');
+    expect(html).toContain('deep_dive.mp4');
+    expect(html).toContain('summary.mp4');
+
+    // Video 1 shows running voice status badge
+    expect(html).toContain('data-testid="session-bar-badge-sub_1"');
+    expect(html).toContain('50%');
+
+    // Video 2 shows completed voice status badge
+    expect(html).toContain('data-testid="session-bar-badge-sub_2"');
+    expect(html).toContain('Voice Ready');
+
+    // Video 3 shows ready for review status
+    expect(html).toContain('data-testid="session-bar-badge-sub_3"');
+    expect(html).toContain('Ready');
+  });
+
+  test('switchSessionVideo allows switching to another video while voice dubbing is running without disrupting background voice state', async () => {
+    const originalFetch = globalThis.fetch;
+    const subprojects = [
+      { id: 'sub_1', name: 'video_1.mp4', stage: 3, status: 'processing', state: { dubbingStatus: 'running' } },
+      { id: 'sub_2', name: 'video_2.mp4', stage: 2, status: 'completed', state: { dubbingStatus: 'idle', currentStep: 2 } },
+    ];
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const urlStr = String(url);
+      if (urlStr.includes('/api/projects/sub_2')) {
+        return new Response(JSON.stringify({ project: subprojects[1] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (urlStr.includes('/api/projects/sub_1')) {
+        return new Response(JSON.stringify({ project: subprojects[0] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }) as any;
+
+    try {
+      useDubDubStore.setState({
+        activeProjectId: 'sub_1',
+        dubbingStatus: 'running',
+        sessionSubprojects: subprojects as any,
+        projectJobStatuses: {
+          sub_1: {
+            status: 'running',
+            stage: 'voice',
+            progress: 30,
+            message: 'Creating voice (1/3)…',
+          },
+        },
+      });
+
+      // User clicks video 2 in Navbar Session Bar
+      await useDubDubStore.getState().switchSessionVideo('sub_2');
+
+      const state = useDubDubStore.getState();
+      // Active project successfully switches to sub_2
+      expect(state.activeProjectId).toBe('sub_2');
+      // dubbingStatus on sub_2 is idle
+      expect(state.dubbingStatus).toBe('idle');
+      // Background voice job on sub_1 continues running in projectJobStatuses
+      expect(state.projectJobStatuses['sub_1'].status).toBe('running');
+      expect(state.projectJobStatuses['sub_1'].stage).toBe('voice');
+      expect(state.projectJobStatuses['sub_1'].progress).toBe(30);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('runFullDubbing updates projectJobStatuses and isolates background updates when user switches project', async () => {
+    const originalFetch = globalThis.fetch;
+    let savedBackgroundPayload: any = null;
+
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = String(url);
+      if (urlStr.includes('/api/projects/sub_1') && init?.method === 'PUT') {
+        savedBackgroundPayload = JSON.parse(String(init?.body || '{}'));
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+      if (urlStr.includes('/api/projects/sub_1')) {
+        return new Response(JSON.stringify({ project: { id: 'sub_1', stage: 3, state: { segments: [] } } }), { status: 200 });
+      }
+      if (urlStr.includes('/api/tts/preview') || urlStr.includes('/api/voices/preview')) {
+        return new Response(
+          JSON.stringify({
+            audio_url: '/audio/preview_1.mp3',
+            id: 'prev_1',
+            applied_speed: 1.0,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }) as any;
+
+    try {
+      useDubDubStore.setState({
+        activeProjectId: 'sub_1',
+        segments: [
+          { id: 1, sourceText: 'Hello', targetText: 'Xin chào', startSec: 0, endSec: 2 },
+        ] as any,
+        sessionSubprojects: [
+          { id: 'sub_1', name: 'v1.mp4', stage: 3, status: 'idle' },
+          { id: 'sub_2', name: 'v2.mp4', stage: 2, status: 'idle' },
+        ] as any,
+        projectJobStatuses: {},
+      });
+
+      // Start runFullDubbing on sub_1
+      const dubbingPromise = useDubDubStore.getState().runFullDubbing();
+
+      // Verify that sub_1 immediately registered in projectJobStatuses
+      expect(useDubDubStore.getState().projectJobStatuses['sub_1']?.status).toBe('running');
+      expect(useDubDubStore.getState().projectJobStatuses['sub_1']?.stage).toBe('voice');
+
+      // User immediately switches to sub_2 before dubbing finishes
+      useDubDubStore.setState({
+        activeProjectId: 'sub_2',
+        segments: [
+          { id: 10, sourceText: 'Video 2 segment', targetText: 'Đoạn video 2', startSec: 0, endSec: 3 },
+        ] as any,
+      });
+
+      // Wait for background dubbing of sub_1 to complete
+      await dubbingPromise;
+
+      const state = useDubDubStore.getState();
+      // Active video (sub_2) segments were NOT clobbered by sub_1's dubbing
+      expect(state.activeProjectId).toBe('sub_2');
+      expect(state.segments[0].id).toBe(10);
+      expect(state.segments[0].targetText).toBe('Đoạn video 2');
+
+      // sub_1 in projectJobStatuses is marked as completed
+      expect(state.projectJobStatuses['sub_1']?.status).toBe('completed');
+      expect(state.projectJobStatuses['sub_1']?.stage).toBe('voice');
+
+      // sub_1's state was saved to backend
+      expect(savedBackgroundPayload).not.toBeNull();
+      expect(savedBackgroundPayload.state?.dubbingStatus).toBe('completed');
+      expect(savedBackgroundPayload.state?.segments[0].previewAudioUrl).toBe('/audio/preview_1.mp3');
     } finally {
       globalThis.fetch = originalFetch;
     }

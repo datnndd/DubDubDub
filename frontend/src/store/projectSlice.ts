@@ -161,6 +161,9 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
     }
   },
   switchSessionVideo: async (projectId: string) => {
+    if (get().isCreateVoiceModalOpen) {
+      set({ isCreateVoiceModalOpen: false });
+    }
     await get().triggerAutosave();
     await get().selectProject(projectId, false);
     const pStatuses = get().projectJobStatuses || {};
@@ -171,6 +174,13 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
         jobProgress: ps.progress ?? null,
         jobMessage: ps.message || '',
         jobStage: ps.stage || null,
+      });
+    } else {
+      set({
+        jobStatus: 'idle',
+        jobProgress: null,
+        jobMessage: 'Ready to process',
+        jobStage: null,
       });
     }
   },
@@ -256,6 +266,12 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
         }
       });
 
+      const pStatuses = get().projectJobStatuses || {};
+      const jobForThisProj = pStatuses[id];
+      const isVoiceRunning = jobForThisProj?.stage === 'voice' && jobForThisProj?.status === 'running';
+      const isVoiceCompleted = jobForThisProj?.stage === 'voice' && jobForThisProj?.status === 'completed';
+      const resolvedDubbingStatus = isVoiceRunning ? 'running' : isVoiceCompleted ? 'completed' : (stateData?.dubbingStatus || 'idle');
+
       set((state: any) => ({
         ...state,
         selectedFile: null,
@@ -271,7 +287,7 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
         speakers: normalizedSpeakers,
         speakerVoiceMap: stateData?.speakerVoiceMap || {},
         segmentVoiceOverrides: mergedOverrides,
-        dubbingStatus: stateData?.dubbingStatus || 'idle',
+        dubbingStatus: resolvedDubbingStatus,
         dubbingError: null,
         assemblingDubbing: false,
         assembledDubUrl: targetStep >= 4 ? `/api/projects/${encodeURIComponent(id)}/dubbing/audio` : null,

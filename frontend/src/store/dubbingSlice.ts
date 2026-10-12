@@ -2,7 +2,7 @@ import { StateCreator } from 'zustand';
 import type { Speaker, VoiceOption, DubbingTuning } from '../types/dubbing';
 import type { Segment } from '../types/segment';
 import { fetchVoices } from '../api/settings';
-import { assembleProjectDubbing } from '../api/projects';
+import { assembleProjectDubbing, fetchProject, updateProjectState } from '../api/projects';
 import {
   type CustomVoice,
   type CreateVoicePayload,
@@ -321,14 +321,36 @@ export const createDubbingSlice: StateCreator<any, [], [], DubbingSlice> = (set,
   },
 
   runFullDubbing: async () => {
-    set({ dubbingStatus: 'running', dubbingError: null });
+    let targetProjectId = get().activeProjectId;
     try {
-      if (!get().activeProjectId && get().createNewProject) {
+      if (!targetProjectId && get().createNewProject) {
         const projName = get().project?.filename || 'Untitled Video Project';
         const mediaId = get().backend?.mediaId;
         const dur = get().project?.durationSec;
-        await get().createNewProject(projName, mediaId, dur);
+        targetProjectId = await get().createNewProject(projName, mediaId, dur);
       }
+      if (!targetProjectId) {
+        targetProjectId = get().activeProjectId;
+      }
+
+      if (get().activeProjectId === targetProjectId) {
+        set({ dubbingStatus: 'running', dubbingError: null });
+      }
+
+      if (targetProjectId) {
+        set((s: any) => ({
+          projectJobStatuses: {
+            ...s.projectJobStatuses,
+            [targetProjectId!]: {
+              status: 'running',
+              progress: 0,
+              message: 'Creating voice…',
+              stage: 'voice',
+            },
+          },
+        }));
+      }
+
       const segments: Segment[] = get().segments || [];
       const ttsType = get().backend?.config?.ttsType ?? 2;
       const lang = get().languages?.target?.code || 'vi';
@@ -336,6 +358,9 @@ export const createDubbingSlice: StateCreator<any, [], [], DubbingSlice> = (set,
       const autoFit = get().autoFitVoiceSpeed ?? true;
       const maxRate = get().maxSpeedRate ?? 1.35;
       const totalDur = get().project?.durationSec || 0;
+
+      let completedCount = 0;
+      const totalCount = segments.length;
 
       const updated = await Promise.all(
         segments.map(async (seg, idx) => {
@@ -371,6 +396,23 @@ export const createDubbingSlice: StateCreator<any, [], [], DubbingSlice> = (set,
           if (!(res.audio_url || res.preview_url)) {
             throw new Error(`No preview audio was returned for segment ${seg.id}`);
           }
+
+          completedCount++;
+          if (targetProjectId) {
+            const pct = totalCount > 0 ? Math.round((completedCount / totalCount) * 100) : 100;
+            set((s: any) => ({
+              projectJobStatuses: {
+                ...s.projectJobStatuses,
+                [targetProjectId!]: {
+                  status: 'running',
+                  progress: pct,
+                  message: `Creating voice (${completedCount}/${totalCount})…`,
+                  stage: 'voice',
+                },
+              },
+            }));
+          }
+
           return {
               ...seg,
               previewAudioUrl: res.preview_url || res.audio_url,
@@ -381,16 +423,68 @@ export const createDubbingSlice: StateCreator<any, [], [], DubbingSlice> = (set,
         })
       );
 
-      set({
-        segments: updated,
-        stage3Baseline: updated.map((segment) => ({ ...segment })),
-        dubbingStatus: 'completed',
-        maxUnlockedStep: Math.max(get().maxUnlockedStep || 1, 4),
-      });
-      get().triggerAutosave();
+      if (targetProjectId) {
+        set((s: any) => ({
+          projectJobStatuses: {
+            ...s.projectJobStatuses,
+            [targetProjectId!]: {
+              status: 'completed',
+              progress: 100,
+              message: 'Voice completed',
+              stage: 'voice',
+            },
+          },
+        }));
+      }
+
+      if (get().activeProjectId === targetProjectId) {
+        set({
+          segments: updated,
+          stage3Baseline: updated.map((segment) => ({ ...segment })),
+          dubbingStatus: 'completed',
+          maxUnlockedStep: Math.max(get().maxUnlockedStep || 1, 4),
+        });
+        get().triggerAutosave();
+      } else if (targetProjectId) {
+        // User switched to another video while voice generation was running in background.
+        // Update background project in backend without corrupting the newly selected video's store state!
+        try {
+          const bgProj = await fetchProject(targetProjectId);
+          let bgState: any = (bgProj as any)?.state || null;
+          if (!bgState && bgProj?.state_json) {
+            try {
+              bgState = typeof bgProj.state_json === 'string' ? JSON.parse(bgProj.state_json) : bgProj.state_json;
+            } catch (_) {}
+          }
+          const mergedState = {
+            ...(bgState || {}),
+            segments: updated,
+            stage3Baseline: updated.map((segment) => ({ ...segment })),
+            dubbingStatus: 'completed',
+          };
+          await updateProjectState(targetProjectId, mergedState, Math.max(bgProj?.stage || 1, 3));
+        } catch (saveErr) {
+          console.warn('Failed to update background project state after voice generation:', saveErr);
+        }
+      }
     } catch (err: any) {
       console.error('Full dubbing failed:', err);
-      set({ dubbingStatus: 'failed', dubbingError: err instanceof Error ? err.message : 'Voice dubbing failed' });
+      if (targetProjectId) {
+        set((s: any) => ({
+          projectJobStatuses: {
+            ...s.projectJobStatuses,
+            [targetProjectId!]: {
+              status: 'failed',
+              progress: 0,
+              message: err instanceof Error ? err.message : 'Voice dubbing failed',
+              stage: 'voice',
+            },
+          },
+        }));
+      }
+      if (get().activeProjectId === targetProjectId) {
+        set({ dubbingStatus: 'failed', dubbingError: err instanceof Error ? err.message : 'Voice dubbing failed' });
+      }
     }
   },
 
@@ -408,12 +502,18 @@ export const createDubbingSlice: StateCreator<any, [], [], DubbingSlice> = (set,
     set({ assemblingDubbing: true, dubbingError: null });
     try {
       const result = await assembleProjectDubbing(id, get().segments || []);
-      set({ assembledDubUrl: `${result.audio_url}?v=${Date.now()}` });
-      await get().setStep(4);
+      if (get().activeProjectId === id) {
+        set({ assembledDubUrl: `${result.audio_url}?v=${Date.now()}` });
+        await get().setStep(4);
+      }
     } catch (error) {
-      set({ dubbingError: error instanceof Error ? error.message : 'Could not assemble dubbing audio' });
+      if (get().activeProjectId === id) {
+        set({ dubbingError: error instanceof Error ? error.message : 'Could not assemble dubbing audio' });
+      }
     } finally {
-      set({ assemblingDubbing: false });
+      if (get().activeProjectId === id) {
+        set({ assemblingDubbing: false });
+      }
     }
   },
 });

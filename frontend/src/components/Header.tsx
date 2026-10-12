@@ -1,6 +1,115 @@
 import React from 'react';
 import { useDubDubStore } from '../store';
-import { Waves, Video, Mic, FolderOpen, Sparkles, Settings as SettingsIcon, ArrowLeft, Layers } from 'lucide-react';
+import {
+  Waves,
+  Video,
+  Mic,
+  FolderOpen,
+  Sparkles,
+  Settings as SettingsIcon,
+  ArrowLeft,
+  Layers,
+  CheckCircle2,
+  Loader2,
+  AlertCircle,
+  Clock,
+} from 'lucide-react';
+import type { ProjectRecord } from '../types/project';
+
+export interface SubprojectStatusInfo {
+  label: string;
+  badgeText: string;
+  pillClasses: string;
+  icon: React.ReactNode;
+  status: 'running' | 'completed' | 'failed' | 'queued' | 'pending';
+  isVoice?: boolean;
+}
+
+export function getSubprojectStatusInfo(
+  sub: { id: string; stage?: number; status?: string; name?: string },
+  projectJobStatuses: Record<string, any> = {}
+): SubprojectStatusInfo {
+  const jobState = projectJobStatuses[sub.id];
+
+  if (jobState) {
+    if (jobState.status === 'running') {
+      const isVoice = jobState.stage === 'voice';
+      const label = isVoice
+        ? (jobState.progress != null && jobState.progress > 0
+            ? `Voice: ${jobState.progress}%`
+            : 'Creating Voice…')
+        : `ASR: ${jobState.progress != null ? jobState.progress.toFixed(0) : '0'}%`;
+      return {
+        label,
+        badgeText: isVoice
+          ? (jobState.progress != null && jobState.progress > 0 ? `${jobState.progress}%` : 'Voice…')
+          : (jobState.progress != null ? `${jobState.progress.toFixed(0)}%` : 'ASR…'),
+        pillClasses: 'bg-amber-100 text-[#8D4B00] border-amber-300 animate-pulse',
+        icon: <Loader2 className="w-2.5 h-2.5 animate-spin text-amber-600" />,
+        status: 'running',
+        isVoice,
+      };
+    }
+    if (jobState.status === 'completed') {
+      const isVoice = jobState.stage === 'voice';
+      return {
+        label: isVoice ? 'Voice Ready' : 'Ready for Review',
+        badgeText: isVoice ? 'Voice Ready' : 'Ready',
+        pillClasses: 'bg-emerald-100 text-emerald-800 border-emerald-300',
+        icon: <CheckCircle2 className="w-2.5 h-2.5 text-emerald-600" />,
+        status: 'completed',
+        isVoice,
+      };
+    }
+    if (jobState.status === 'failed') {
+      return {
+        label: jobState.stage === 'voice' ? 'Voice Failed' : 'Failed',
+        badgeText: 'Failed',
+        pillClasses: 'bg-rose-100 text-rose-800 border-rose-300',
+        icon: <AlertCircle className="w-2.5 h-2.5 text-rose-600" />,
+        status: 'failed',
+      };
+    }
+    if (jobState.status === 'queued') {
+      return {
+        label: 'Queued',
+        badgeText: 'Queued',
+        pillClasses: 'bg-stone-100 text-stone-700 border-stone-300',
+        icon: <Clock className="w-2.5 h-2.5 text-stone-500" />,
+        status: 'queued',
+      };
+    }
+  }
+
+  const stage = sub.stage || 1;
+  if (stage >= 2 || sub.status === 'completed') {
+    const isStage3or4 = stage >= 3;
+    return {
+      label: stage >= 4 ? 'Completed' : isStage3or4 ? 'Voice Ready' : 'Ready for Review',
+      badgeText: stage >= 4 ? 'Done' : isStage3or4 ? 'Voice Ready' : 'Ready',
+      pillClasses: 'bg-emerald-100 text-emerald-800 border-emerald-300',
+      icon: <CheckCircle2 className="w-2.5 h-2.5 text-emerald-600" />,
+      status: 'completed',
+    };
+  }
+  if (sub.status === 'processing') {
+    return {
+      label: 'Processing…',
+      badgeText: 'Working…',
+      pillClasses: 'bg-amber-100 text-[#8D4B00] border-amber-300 animate-pulse',
+      icon: <Loader2 className="w-2.5 h-2.5 animate-spin text-amber-600" />,
+      status: 'running',
+    };
+  }
+
+  return {
+    label: 'Pending',
+    badgeText: 'Pending',
+    pillClasses: 'bg-stone-100 text-stone-600 border-stone-200',
+    icon: <Clock className="w-2.5 h-2.5 text-stone-400" />,
+    status: 'pending',
+  };
+}
 
 export const Header: React.FC = () => {
   const activeView = useDubDubStore((s) => s.activeView);
@@ -12,6 +121,9 @@ export const Header: React.FC = () => {
   const sessionSubprojects = useDubDubStore((s) => s.sessionSubprojects || []);
   const sessionDrawerOpen = useDubDubStore((s) => s.sessionDrawerOpen);
   const setSessionDrawerOpen = useDubDubStore((s) => s.setSessionDrawerOpen);
+  const activeProjectId = useDubDubStore((s) => s.activeProjectId);
+  const switchSessionVideo = useDubDubStore((s) => s.switchSessionVideo);
+  const projectJobStatuses = useDubDubStore((s) => s.projectJobStatuses || {});
 
   return (
     <header className="h-[50px] flex-shrink-0 bg-white border-b border-[#E7E4DC] px-4 flex items-center justify-between gap-4 z-30 shadow-2xs">
@@ -89,13 +201,60 @@ export const Header: React.FC = () => {
         </nav>
       </div>
 
-      {/* Center-Right: Active Project Indicator */}
-      <div className="hidden lg:flex items-center gap-2 text-[11px] text-stone-600 min-w-0">
-        <span className="w-2 h-2 rounded-full bg-[#8D4B00] shrink-0" />
-        <span className="font-medium text-stone-700 truncate max-w-xs">
-          Project: <strong className="text-stone-900">{project?.filename || 'Untitled'}</strong>
-        </span>
-      </div>
+      {/* Center: Navbar Session Bar when session videos are present, or Standalone Project Indicator */}
+      {sessionSubprojects.length > 0 ? (
+        <div
+          data-testid="navbar-session-bar"
+          className="flex items-center gap-1.5 min-w-0 max-w-[48%] lg:max-w-[55%] overflow-x-auto py-1 px-2 bg-stone-100/90 rounded-lg border border-stone-200/90 shadow-2xs no-scrollbar"
+        >
+          <div className="flex items-center gap-1 text-[11px] font-bold text-stone-500 shrink-0 mr-0.5">
+            <Layers className="w-3.5 h-3.5 text-[#8D4B00]" />
+            <span className="hidden xl:inline">Session:</span>
+          </div>
+
+          <div className="flex items-center gap-1.5 min-w-0">
+            {sessionSubprojects.map((sub, idx) => {
+              const isActive = sub.id === activeProjectId;
+              const statusInfo = getSubprojectStatusInfo(sub, projectJobStatuses);
+
+              return (
+                <button
+                  key={sub.id}
+                  data-testid={`session-bar-item-${sub.id}`}
+                  onClick={() => switchSessionVideo(sub.id)}
+                  title={`${sub.name || `Video #${idx + 1}`} • Status: ${statusInfo.label}`}
+                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] transition-all cursor-pointer shrink-0 border ${
+                    isActive
+                      ? 'bg-white text-[#8D4B00] font-bold border-amber-300 shadow-2xs ring-1 ring-amber-300/60'
+                      : 'text-stone-600 hover:text-stone-900 hover:bg-stone-200/60 border-stone-200/60'
+                  }`}
+                >
+                  <span className="font-mono text-[10px] font-semibold text-stone-400">
+                    #{idx + 1}
+                  </span>
+                  <span className="truncate max-w-[80px] sm:max-w-[100px] lg:max-w-[130px]">
+                    {sub.name || `Video ${idx + 1}`}
+                  </span>
+                  <span
+                    data-testid={`session-bar-badge-${sub.id}`}
+                    className={`inline-flex items-center gap-1 text-[9px] font-semibold px-1.5 py-0.2 rounded-full border ${statusInfo.pillClasses}`}
+                  >
+                    {statusInfo.icon}
+                    <span>{statusInfo.badgeText}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ) : (
+        <div className="hidden lg:flex items-center gap-2 text-[11px] text-stone-600 min-w-0">
+          <span className="w-2 h-2 rounded-full bg-[#8D4B00] shrink-0" />
+          <span className="font-medium text-stone-700 truncate max-w-xs">
+            Project: <strong className="text-stone-900">{project?.filename || 'Untitled'}</strong>
+          </span>
+        </div>
+      )}
 
       {/* Right: Back to Projects, Settings, Auto-save status */}
       <div className="flex items-center gap-2.5 flex-shrink-0">
