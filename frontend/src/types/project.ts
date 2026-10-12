@@ -19,7 +19,7 @@ export interface ProjectRecord {
   id: string;
   name: string;
   stage: number;
-  status: 'pending' | 'processing' | 'completed' | 'failed' | 'paused';
+  status: 'pending' | 'processing' | 'completed' | 'failed' | 'paused' | 'active';
   parent_id?: string | null;
   parentId?: string | null;
   media_path?: string;
@@ -27,6 +27,8 @@ export interface ProjectRecord {
   created_at?: string;
   updated_at?: string;
   state_json?: string;
+  state?: any;
+  subprojects?: ProjectRecord[];
 }
 
 export interface BackendOptionItem {

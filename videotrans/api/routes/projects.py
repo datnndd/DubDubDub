@@ -85,8 +85,17 @@ async def list_projects_handler(
     limit: int = Query(100),
     parentId: Optional[str] = Query(None, alias="parent_id"),
 ) -> JSONResponse:
+    # Ensure today's date parent project exists so it is always available for grouping
+    get_or_create_date_parent_project()
     projects = list_projects(limit=limit, parent_id=parentId)
     return JSONResponse({"projects": projects})
+
+
+@router.get("/api/projects/today-parent")
+async def get_today_parent_project_handler() -> JSONResponse:
+    parent = get_or_create_date_parent_project()
+    subprojects = list_subprojects(parent["id"])
+    return JSONResponse({"parent": parent, "subprojects": subprojects})
 
 
 @router.post("/api/projects/batch-create", status_code=201)
@@ -195,8 +204,15 @@ async def create_project_handler(
 
     status = str(payload.status or "pending")
     state = payload.state if isinstance(payload.state, dict) else {}
-    if payload.parentId:
-        state["parent_id"] = payload.parentId
+
+    # Auto-assign to today's date parent project if parentId not provided and not a parent project itself
+    parent_id = payload.parentId
+    if not parent_id and not state.get("is_parent"):
+        parent = get_or_create_date_parent_project()
+        parent_id = parent["id"]
+        state["parent_id"] = parent_id
+    elif parent_id:
+        state["parent_id"] = parent_id
 
     if audio_hash and not state.get("segments"):
         cached_proj = find_project_by_audio_hash(audio_hash)
@@ -208,7 +224,7 @@ async def create_project_handler(
     project = create_project(
         project_id=str(payload.id or "") or None,
         name=name,
-        parent_id=payload.parentId,
+        parent_id=parent_id,
         media_id=media_id,
         media_path=media_path,
         duration=duration,

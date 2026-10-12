@@ -13,6 +13,10 @@
 .agree.txt
 .idea
 .venv
+.env
+.env.*
+!.env.example
+*.env
 .pytest_cache
 .mimocode
 .ruff_cache

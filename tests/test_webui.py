@@ -29,6 +29,20 @@ from videotrans.task.orchestrator import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolate_test_db_and_env(tmp_path):
+    from videotrans.core.db import get_db_path, init_db, set_db_path
+    from videotrans.core import secret_store
+    test_db = tmp_path / "test_webui.db"
+    orig_db = get_db_path()
+    set_db_path(test_db)
+    init_db(test_db)
+    secret_store.invalidate()
+    yield
+    set_db_path(orig_db)
+    secret_store.invalidate()
+
+
 def test_new_frontend_is_the_only_webui():
     app = create_app()
     routes = {route.resource.canonical for route in app.router.routes()}

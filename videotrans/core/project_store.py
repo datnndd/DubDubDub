@@ -249,10 +249,20 @@ def update_project_state(
 def delete_project(project_id: str, delete_files: bool = True) -> bool:
     """Delete project from database and optionally remove artifact directory."""
     with db_conn() as conn:
+        sub_rows = conn.execute("SELECT id FROM projects WHERE parent_id = ?", (project_id,)).fetchall()
+        sub_ids = [r["id"] for r in sub_rows]
+        conn.execute("DELETE FROM projects WHERE parent_id = ?", (project_id,))
         cur = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-        deleted = cur.rowcount > 0
+        deleted = cur.rowcount > 0 or len(sub_ids) > 0
 
     if deleted and delete_files:
+        for sid in sub_ids:
+            sdir = get_project_dir(sid)
+            if sdir.exists() and sdir.is_dir():
+                try:
+                    shutil.rmtree(sdir)
+                except Exception as exc:
+                    logger.warning("Failed to remove subproject dir %s: %s", sdir, exc)
         pdir = get_project_dir(project_id)
         if pdir.exists() and pdir.is_dir():
             try:

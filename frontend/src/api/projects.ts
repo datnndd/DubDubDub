@@ -20,12 +20,18 @@ export async function createProject(payload: {
   duration?: number;
   stage?: number;
   state?: any;
+  parentId?: string;
+  parent_id?: string;
 }): Promise<ProjectRecord> {
   const data = await apiRequest<any>('/api/projects', {
     method: 'POST',
     body: JSON.stringify(payload),
   });
   return data?.project || data;
+}
+
+export async function fetchTodayParentProject(): Promise<{ parent: ProjectRecord; subprojects: ProjectRecord[] }> {
+  return apiRequest('/api/projects/today-parent');
 }
 
 export async function updateProjectState(id: string, state: any, stage?: number, mediaId?: string): Promise<void> {

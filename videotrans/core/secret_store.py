@@ -57,6 +57,15 @@ ENV_KEY_MAP: dict[str, list[str]] = {
     "hf_token": ["HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"],
 }
 
+PRIMARY_ENV_KEY_MAP: dict[str, str] = {
+    "deepgram_apikey": "DEEPGRAM_API_KEY",
+    "chatgpt_key": "OPENAI_API_KEY",
+    "deepseek_key": "DEEPSEEK_API_KEY",
+    "gemini_key": "GEMINI_API_KEY",
+    "elevenlabstts_key": "ELEVENLABS_API_KEY",
+    "hf_token": "HF_TOKEN",
+}
+
 
 def _read_machine_id() -> bytes:
     """Best-effort cross-platform machine identifier."""
@@ -199,12 +208,12 @@ def get_secret(key: str) -> Optional[str]:
         return None
 
 
-def set_secret(key: str, value: Optional[str]) -> None:
-    """Encrypt and store secret. Clears secret if value is empty or None."""
+def set_secret(key: str, value: Optional[str], persist_to_env: bool = True) -> None:
+    """Encrypt and store secret in SQLite, and persist to private .env file."""
     if not key:
         return
     if not value or not str(value).strip():
-        delete_secret(key)
+        delete_secret(key, persist_to_env=persist_to_env)
         return
     val_str = str(value).strip()
     cipher = _fernet()
@@ -216,9 +225,20 @@ def set_secret(key: str, value: Optional[str]) -> None:
             (db_k, blob, time.time()),
         )
 
+    clean_k = _clean_key(key)
+    env_var_name = PRIMARY_ENV_KEY_MAP.get(clean_k)
+    if persist_to_env and env_var_name:
+        try:
+            from videotrans.configure._env_loader import save_env_var
+            save_env_var(env_var_name, val_str)
+        except Exception as exc:
+            logger.warning("Failed to persist %s to .env: %s", env_var_name, exc)
+    elif env_var_name:
+        os.environ[env_var_name] = val_str
 
-def delete_secret(key: str) -> None:
-    """Delete encrypted secret from database."""
+
+def delete_secret(key: str, persist_to_env: bool = True) -> None:
+    """Delete encrypted secret from database and .env."""
     if not key:
         return
     db_k = _db_key(key)
@@ -227,6 +247,17 @@ def delete_secret(key: str) -> None:
             conn.execute("DELETE FROM settings WHERE key = ?", (db_k,))
     except Exception as exc:
         logger.warning("Failed to delete secret '%s': %s", key, exc)
+
+    clean_k = _clean_key(key)
+    env_var_name = PRIMARY_ENV_KEY_MAP.get(clean_k)
+    if persist_to_env and env_var_name:
+        try:
+            from videotrans.configure._env_loader import delete_env_var
+            delete_env_var(env_var_name)
+        except Exception as exc:
+            logger.warning("Failed to delete %s from .env: %s", env_var_name, exc)
+    elif env_var_name:
+        os.environ.pop(env_var_name, None)
 
 
 def has_secret(key: str) -> bool:
@@ -348,3 +379,25 @@ def migrate_plaintext_secrets() -> dict[str, int]:
             logger.warning("Error migrating hf_token.txt: %s", exc)
 
     return stats
+
+
+def sync_env_and_db_secrets() -> None:
+    """Synchronize secrets between private .env file and encrypted SQLite store.
+
+    1. Loads .env file into os.environ.
+    2. If a secret exists in .env, ensure it is also saved to DB (if missing).
+    3. If a secret exists in DB but is missing from .env, sync it into .env so restarts never lose it.
+    """
+    try:
+        from videotrans.configure._env_loader import load_env, save_env_var
+        load_env(override=True)
+        for secret_k, env_k in PRIMARY_ENV_KEY_MAP.items():
+            env_val = os.environ.get(env_k, "").strip()
+            db_val = get_secret(secret_k)
+            if env_val:
+                if not db_val or db_val != env_val:
+                    set_secret(secret_k, env_val, persist_to_env=False)
+            elif db_val and db_val.strip():
+                save_env_var(env_k, db_val.strip())
+    except Exception as exc:
+        logger.warning("Failed to sync secrets between .env and DB: %s", exc)

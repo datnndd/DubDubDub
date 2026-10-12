@@ -73,3 +73,42 @@ async def test_batch_create_projects_endpoint():
         assert len(sub_data["subprojects"]) == 2
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_auto_parenting_and_today_parent_endpoint():
+    app = create_app()
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        # 1. Fetch today's parent
+        res_today = await client.get("/api/projects/today-parent")
+        assert res_today.status == 200
+        today_data = await res_today.json()
+        parent_id = today_data["parent"]["id"]
+        assert "parent_" in parent_id
+        assert today_data["parent"]["state"]["is_parent"] is True
+
+        # 2. Create project without parentId -> auto-assigned to today's parent
+        res_create = await client.post("/api/projects", json={
+            "name": "Single Upload Video.mp4",
+            "duration": 50.0,
+        })
+        assert res_create.status == 201
+        created = await res_create.json()
+        assert created["parent_id"] == parent_id
+
+        # 3. Verify subprojects list on today's parent includes the new video
+        res_subs = await client.get(f"/api/projects/{parent_id}/subprojects")
+        assert res_subs.status == 200
+        subs_data = await res_subs.json()
+        assert any(s["id"] == created["id"] for s in subs_data["subprojects"])
+
+        # 4. Verify cascading delete
+        from videotrans.core.project_store import delete_project, get_project
+        delete_project(parent_id)
+        assert get_project(parent_id) is None
+        assert get_project(created["id"]) is None
+    finally:
+        await client.close()
+

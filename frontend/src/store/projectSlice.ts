@@ -36,7 +36,8 @@ export interface ProjectSlice {
   switchSessionVideo: (projectId: string) => Promise<void>;
   loadProjects: () => Promise<void>;
   selectProject: (id: string, autoNavigate?: boolean) => Promise<void>;
-  createNewProject: (name?: string, mediaId?: string, duration?: number) => Promise<string>;
+  createNewProject: (name?: string, mediaId?: string, duration?: number, parentId?: string) => Promise<string>;
+  openDateParentSession: (parentId: string, parentName?: string) => Promise<void>;
   deleteProjectById: (id: string) => Promise<void>;
   deleteProjectsByIds: (ids: string[]) => Promise<void>;
   triggerAutosave: (reportFailure?: boolean) => Promise<void>;
@@ -205,6 +206,19 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
           stateData = null;
         }
       }
+
+      const projId = String(project?.id || id || '');
+      if (stateData?.is_parent || (projId && projId.startsWith('parent_'))) {
+        set({ activeParentProjectId: projId, activeParentProjectName: project?.name || projId });
+        try {
+          const subs = await fetchSubprojects(projId);
+          set({ sessionSubprojects: subs, batchModeActive: subs.length > 0 });
+          if (subs.length > 0) {
+            return await get().selectProject(subs[0].id, autoNavigate);
+          }
+        } catch (_) {}
+      }
+
       const targetStep = stateData?.currentStep || project.stage || 1;
       const mediaId = (project as any).media_id || stateData?.backend?.mediaId || null;
       let resolvedPreviewUrl: string | undefined = undefined;
@@ -308,6 +322,15 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
           verified: isVerified,
         },
       }));
+
+      const parentId = project?.parent_id || project?.parentId;
+      if (parentId) {
+        set({ activeParentProjectId: parentId });
+        try {
+          const subs = await fetchSubprojects(parentId);
+          set({ sessionSubprojects: subs, batchModeActive: subs.length > 0 });
+        } catch (_) {}
+      }
     } catch (err) {
       console.error('Failed to select project:', err);
       if (typeof localStorage !== 'undefined') {
@@ -317,9 +340,11 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
     }
   },
 
-  createNewProject: async (name: string = 'Untitled Video Project', mediaId?: string, duration?: number) => {
+  createNewProject: async (name: string = 'Untitled Video Project', mediaId?: string, duration?: number, parentId?: string) => {
     try {
-      const proj = await createProject({ name, mediaId, duration });
+      const today = new Date().toISOString().split('T')[0];
+      const effectiveParentId = parentId || get().activeParentProjectId || `parent_${today}`;
+      const proj = await createProject({ name, mediaId, duration, parentId: effectiveParentId });
       const newId = proj?.id;
       if (newId) {
         await get().selectProject(newId, true);
@@ -330,10 +355,36 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
         currentStep: 1,
       }));
       await get().loadProjects();
+      if (effectiveParentId) {
+        try {
+          const subs = await fetchSubprojects(effectiveParentId);
+          set({ sessionSubprojects: subs, activeParentProjectId: effectiveParentId, batchModeActive: subs.length > 0 });
+        } catch (_) {}
+      }
       return newId || '';
     } catch (err) {
       console.error('Failed to create new project:', err);
       return '';
+    }
+  },
+
+  openDateParentSession: async (parentId: string, parentName?: string) => {
+    try {
+      const subs = await fetchSubprojects(parentId);
+      set({
+        activeParentProjectId: parentId,
+        activeParentProjectName: parentName || parentId,
+        sessionSubprojects: subs,
+        batchModeActive: subs.length > 0,
+        activeView: 'dubbing' as MainView,
+        currentStep: 1,
+        sessionDrawerOpen: true,
+      });
+      if (subs.length > 0) {
+        await get().selectProject(subs[0].id, false);
+      }
+    } catch (err) {
+      console.error('Failed to open date parent session:', err);
     }
   },
 

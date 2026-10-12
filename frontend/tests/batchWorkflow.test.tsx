@@ -6,6 +6,7 @@ import { FolderScanModal } from '../src/components/FolderScanModal';
 import { SessionVideosDrawer } from '../src/components/SessionVideosDrawer';
 import { Stage1Prepare } from '../src/screens/Stage1Prepare';
 import { StatusFooter } from '../src/components/StatusFooter';
+import { ProjectsScreen } from '../src/screens/ProjectsScreen';
 
 describe('Batch Video Workflow & Multi-Video Session', () => {
   beforeEach(() => {
@@ -208,4 +209,91 @@ describe('Batch Video Workflow & Multi-Video Session', () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  test('ProjectsScreen renders Date Parent Project containers with subprojects grouped inside', () => {
+    const today = new Date().toISOString().split('T')[0];
+    useDubDubStore.setState({
+      projectsList: [
+        {
+          id: `parent_${today}`,
+          name: today,
+          stage: 1,
+          status: 'active',
+          state: { is_parent: true, date: today },
+        },
+        {
+          id: 'sub_video_1',
+          name: 'Morning Lecture.mp4',
+          parent_id: `parent_${today}`,
+          stage: 2,
+          status: 'completed',
+          duration: 180.5,
+        },
+        {
+          id: 'sub_video_2',
+          name: 'Afternoon Lab.mp4',
+          parent_id: `parent_${today}`,
+          stage: 1,
+          status: 'processing',
+          duration: 95.0,
+        },
+      ],
+    });
+
+    const html = renderToStaticMarkup(<ProjectsScreen />);
+    // Check parent project date container and badges
+    expect(html).toContain(`data-date-group="${today}"`);
+    expect(html).toContain(today);
+    expect(html).toContain('Today');
+    expect(html).toContain('2 Videos');
+    expect(html).toContain('1 Ready');
+    expect(html).toContain(`open-session-${today}`);
+
+    // Check subproject video cards rendered inside
+    expect(html).toContain('Morning Lecture.mp4');
+    expect(html).toContain('Afternoon Lab.mp4');
+    expect(html).toContain('Stage 2: Review Transcript');
+    expect(html).toContain('Stage 1: Prepare &amp; ASR');
+    expect(html).toContain('data-testid="toggle-group-by-date"');
+    expect(html).toContain('Grouped by Day');
+  });
+
+  test('openDateParentSession loads subprojects into sessionSubprojects and transitions to dubbing view', async () => {
+    const originalFetch = globalThis.fetch;
+    const today = new Date().toISOString().split('T')[0];
+    const parentId = `parent_${today}`;
+    const subprojects = [
+      { id: 'sub_1', name: 'clip_a.mp4', parent_id: parentId, stage: 1, status: 'pending' },
+      { id: 'sub_2', name: 'clip_b.mp4', parent_id: parentId, stage: 2, status: 'completed' },
+    ];
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const urlStr = String(url);
+      if (urlStr.includes('/subprojects')) {
+        return new Response(JSON.stringify({ subprojects }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (urlStr.includes('/api/projects/sub_1')) {
+        return new Response(JSON.stringify(subprojects[0]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ projects: [] }), { status: 200 });
+    }) as any;
+
+    try {
+      useDubDubStore.setState({ activeView: 'projects', sessionSubprojects: [], activeParentProjectId: null });
+      await useDubDubStore.getState().openDateParentSession(parentId, today);
+
+      const state = useDubDubStore.getState();
+      expect(state.activeView).toBe('dubbing');
+      expect(state.currentStep).toBe(1);
+      expect(state.activeParentProjectId).toBe(parentId);
+      expect(state.activeParentProjectName).toBe(today);
+      expect(state.sessionSubprojects.length).toBe(2);
+      expect(state.sessionDrawerOpen).toBe(true);
+      expect(state.batchModeActive).toBe(true);
+      expect(state.activeProjectId).toBe('sub_1');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
+

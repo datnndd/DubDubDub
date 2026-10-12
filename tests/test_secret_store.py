@@ -148,3 +148,28 @@ def test_migrate_plaintext_secrets(tmp_path, monkeypatch):
     c_data = json.loads(cfg_file.read_text(encoding="utf-8"))
     assert c_data["hf_token"] == ""
     assert c_data["crf"] == 23
+
+
+def test_set_secret_persists_to_env_and_sync(tmp_path, monkeypatch):
+    test_env = tmp_path / "custom.env"
+    monkeypatch.setenv("VIDEOTRANS_ENV_FILE", str(test_env))
+
+    # 1. Setting secret writes to custom.env
+    secret_store.set_secret("chatgpt_key", "sk-custom-env-test-key")
+    assert secret_store.get_secret("chatgpt_key") == "sk-custom-env-test-key"
+    assert test_env.is_file()
+    content = test_env.read_text(encoding="utf-8")
+    assert "OPENAI_API_KEY=sk-custom-env-test-key" in content
+
+    # 2. Deleting secret removes from custom.env
+    secret_store.delete_secret("chatgpt_key")
+    assert secret_store.get_secret("chatgpt_key") is None
+    content_after = test_env.read_text(encoding="utf-8")
+    assert "OPENAI_API_KEY" not in content_after
+
+    # 3. sync_env_and_db_secrets bidirectional test
+    test_env.write_text("DEEPSEEK_API_KEY=ds-synced-from-env\n", encoding="utf-8")
+    secret_store.sync_env_and_db_secrets()
+    assert secret_store.get_secret("deepseek_key") == "ds-synced-from-env"
+    assert secret_store.resolve_secret("deepseek_key") == "ds-synced-from-env"
+

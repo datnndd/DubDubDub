@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,12 @@ class TestSettingsAPI(unittest.IsolatedAsyncioTestCase):
         init_db(db_path)
         secret_store.invalidate()
 
+        self._orig_env = {}
+        for aliases in secret_store.ENV_KEY_MAP.values():
+            for env_name in aliases:
+                if env_name in os.environ:
+                    self._orig_env[env_name] = os.environ.pop(env_name)
+
         self.app = FastAPI()
         settings_routes.register_routes(self.app)
         self.transport = httpx.ASGITransport(app=self.app)
@@ -29,6 +36,10 @@ class TestSettingsAPI(unittest.IsolatedAsyncioTestCase):
         if self.tmp_dir:
             self.tmp_dir.cleanup()
         secret_store.invalidate()
+        from videotrans.core.db import DEFAULT_DB_PATH
+        set_db_path(DEFAULT_DB_PATH)
+        for k, v in getattr(self, "_orig_env", {}).items():
+            os.environ[k] = v
 
     async def test_get_settings_snapshot_returns_saved_api_keys(self):
         secret_store.set_secret("deepgram_apikey", "super-secret-key-123")

@@ -158,8 +158,9 @@ def create_app(
     # Initialize DB, secrets, and voice stores early for synchronous and test environments
     init_db()
     try:
-        from videotrans.core.secret_store import migrate_plaintext_secrets
+        from videotrans.core.secret_store import migrate_plaintext_secrets, sync_env_and_db_secrets
         migrate_plaintext_secrets()
+        sync_env_and_db_secrets()
     except Exception:
         pass
     sweep_orphans_on_startup()
