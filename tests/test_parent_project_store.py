@@ -112,3 +112,60 @@ async def test_auto_parenting_and_today_parent_endpoint():
     finally:
         await client.close()
 
+
+def test_subprojects_have_isolated_target_dirs_and_do_not_share_srt(tmp_path):
+    from pathlib import Path
+    from videotrans.core.project_store import (
+        get_or_create_date_parent_project,
+        create_project,
+        get_project_dir,
+    )
+    from videotrans.api.task_params import build_task_params
+    from videotrans.task.taskcfg import InputFile
+
+    parent = get_or_create_date_parent_project("2026-10-12")
+    sub1 = create_project(name="Video 1.mp4", parent_id=parent["id"])
+    sub2 = create_project(name="Video 2.mp4", parent_id=parent["id"])
+
+    dummy_video1 = tmp_path / "video1.mp4"
+    dummy_video1.write_bytes(b"dummy video 1 content")
+    dummy_video2 = tmp_path / "video2.mp4"
+    dummy_video2.write_bytes(b"dummy video 2 content")
+
+    def mock_format_video(p):
+        path = Path(p)
+        return InputFile(
+            name=str(path),
+            dirname=str(path.parent),
+            basename=path.name,
+            noextname=path.stem,
+            ext=path.suffix.lstrip("."),
+            uuid=f"uuid-{path.stem}",
+        )
+
+    base_options = {
+        "recognType": 0,
+        "sourceLanguage": "zh-cn",
+        "targetLanguage": "vi",
+    }
+
+    params1 = build_task_params(dummy_video1, base_options, job_type="asr", project_id=sub1["id"], format_video_fn=mock_format_video)
+    params2 = build_task_params(dummy_video2, base_options, job_type="asr", project_id=sub2["id"], format_video_fn=mock_format_video)
+
+    # 1. target_dir must be isolated per subproject, not shared parent folder
+    assert params1["target_dir"] != params2["target_dir"]
+    sub1_dir = get_project_dir(sub1["id"])
+    sub2_dir = get_project_dir(sub2["id"])
+    assert Path(params1["target_dir"]).is_relative_to(sub1_dir)
+    assert Path(params2["target_dir"]).is_relative_to(sub2_dir)
+
+    # 2. Placing an SRT in subproject 1's target directory does not leak to subproject 2
+    sub1_target = Path(params1["target_dir"])
+    sub2_target = Path(params2["target_dir"])
+    sub1_srt = sub1_target / "zh-cn.srt"
+    sub1_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\nSub 1 subtitle\n", encoding="utf-8")
+
+    sub2_srt = sub2_target / "zh-cn.srt"
+    assert not sub2_srt.exists()
+
+

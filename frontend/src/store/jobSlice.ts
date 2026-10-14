@@ -23,12 +23,15 @@ export interface JobSlice {
 }
 
 export function buildPrepareJobRequest(state: any) {
+  const config = state.backend?.config || {};
   return {
     mediaId: state.backend?.mediaId,
     projectId: state.activeProjectId,
     jobType: 'asr',
     options: {
-      ...(state.backend?.config || {}),
+      ...config,
+      recognType: Number(config.recognType ?? 1),
+      modelName: String(config.modelName || 'nova-3'),
       projectId: state.activeProjectId,
       sourceLanguage: state.languages?.source?.code || 'zh-cn',
       targetLanguage: state.languages?.target?.code || 'vi',
@@ -116,6 +119,8 @@ export const createJobSlice: StateCreator<any, [], [], JobSlice> = (set, get) =>
         jobType: 'asr',
         options: {
           ...config,
+          recognType: Number(config.recognType ?? 1),
+          modelName: String(config.modelName || 'nova-3'),
           projectId: pid,
           sourceLanguage: languages?.source?.code || 'zh-cn',
           targetLanguage: languages?.target?.code || 'vi',

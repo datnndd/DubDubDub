@@ -50,7 +50,7 @@ class RecognMixin:
             self.source_srt_list = srt_items
             self._recogn_succeed()
             return
-        if vail_file(self.cfg.source_sub):
+        if vail_file(self.cfg.source_sub) and not self.cfg.force_recogn:
             self.source_srt_list = get_subtitle_from_srt(self.cfg.source_sub, is_file=True)
             if Path(self.cfg.target_dir + "/speaker.json").exists():
                 shutil.copy2(self.cfg.target_dir + "/speaker.json", self.cfg.cache_folder + "/speaker.json")

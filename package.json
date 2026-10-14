@@ -2,7 +2,7 @@
   "name": "pyvideotrans-workspace",
   "private": true,
   "scripts": {
-    "dev": "bunx concurrently -n api,fe -c green,cyan --kill-others-on-fail \"uv run python webui.py --reload\" \"cd frontend && bun run dev\"",
+    "dev": "bunx concurrently -n api,fe -c green,cyan --kill-others-on-fail \"uv run python webui.py --reload\" \"bun scripts/wait-for-backend.js && cd frontend && bun run dev\"",
     "build": "cd frontend && bun run build"
   },
   "devDependencies": {

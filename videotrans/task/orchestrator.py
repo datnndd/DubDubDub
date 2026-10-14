@@ -439,6 +439,18 @@ def _persist_stage_artifacts(task: Any, stage_name: str) -> None:
         elif stage_name in ("assembling", "task_done"):
             p = get_project(pid)
             cur_state = dict(p.get("state") or {}) if p else {}
+            parent_id = p.get("parent_id") if p else None
+            if parent_id:
+                from videotrans.core.project_store import get_parent_project_dir
+                import re
+                parent = get_project(parent_id)
+                parent_name = (parent.get("name") if parent else None) or parent_id
+                parent_dir = get_parent_project_dir(parent_name)
+                safe_stem = re.sub(r"[^\w.-]+", "-", Path(p.get("name") or pid).stem, flags=re.UNICODE).strip("-")
+                if getattr(task.cfg, "targetdir_mp4", None) and Path(task.cfg.targetdir_mp4).is_file():
+                    shutil.copy2(task.cfg.targetdir_mp4, parent_dir / f"{safe_stem}.mp4")
+                if getattr(task.cfg, "target_sub", None) and Path(task.cfg.target_sub).is_file():
+                    shutil.copy2(task.cfg.target_sub, parent_dir / f"{safe_stem}.srt")
             update_project_state(pid, cur_state, stage=4, status="completed")
 
     except Exception as exc:

@@ -701,6 +701,14 @@ async def update_provider_settings_handler(
                     settings_store["stt_model_name"] = model_str
                 except Exception:
                     pass
+            cur_models = [m.strip() for m in str(global_settings.get("deepgram_model", "")).split(",") if m.strip()]
+            if model_str and model_str not in cur_models:
+                cur_models.insert(0, model_str)
+                global_settings["deepgram_model"] = ",".join(cur_models)
+                try:
+                    global_settings.save()
+                except Exception:
+                    pass
         elif provider_id in ("openai", "chatgpt"):
             global_params["chatgpt_model"] = model_str
             if settings_store is not None:

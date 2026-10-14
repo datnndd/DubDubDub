@@ -20,6 +20,24 @@ export default defineConfig({
       '/api': {
         target: 'http://127.0.0.1:7860',
         changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on('error', (err, _req, res) => {
+            if ((err as any).code === 'ECONNREFUSED') {
+              if (res && 'writeHead' in res && !(res as any).headersSent) {
+                (res as any).writeHead(503, {
+                  'Content-Type': 'application/json',
+                  'Retry-After': '1',
+                });
+                (res as any).end(
+                  JSON.stringify({
+                    error: 'Backend API is still starting up. Please wait a moment...',
+                    code: 'BACKEND_STARTING',
+                  })
+                );
+              }
+            }
+          });
+        },
       },
     },
   },

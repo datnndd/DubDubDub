@@ -160,8 +160,14 @@ def find_voice_by_name(
     db_path: Optional[str | Path] = None,
 ) -> Optional[dict[str, Any]]:
     """Look up a voice by case-insensitive name, optionally filtered by provider."""
+    clean_name = " ".join(str(name).split())
+    if clean_name.startswith("Custom: "):
+        clean_name = clean_name[len("Custom: "):].strip()
+    if not clean_name:
+        return None
+
     query = "SELECT * FROM voices WHERE LOWER(name) = LOWER(?)"
-    params: list[Any] = [" ".join(str(name).split())]
+    params: list[Any] = [clean_name]
     if provider is not None:
         query += " AND provider = ?"
         params.append(int(provider))
@@ -423,9 +429,17 @@ def resolve_voice_params(
     if not voice_id_or_name:
         return None
 
-    voice = get_voice(voice_id_or_name, db_path=db_path)
+    clean_id_or_name = str(voice_id_or_name).strip()
+    if clean_id_or_name.startswith("Custom: "):
+        clean_id_or_name = clean_id_or_name[len("Custom: "):].strip()
+
+    voice = get_voice(clean_id_or_name, db_path=db_path)
     if not voice:
-        voice = find_voice_by_name(voice_id_or_name, provider=provider, db_path=db_path)
+        voice = find_voice_by_name(clean_id_or_name, provider=provider, db_path=db_path)
+    if not voice and clean_id_or_name != str(voice_id_or_name).strip():
+        voice = get_voice(str(voice_id_or_name).strip(), db_path=db_path) or find_voice_by_name(str(voice_id_or_name).strip(), provider=provider, db_path=db_path)
+    if not voice and provider is not None:
+        voice = find_voice_by_name(clean_id_or_name, provider=None, db_path=db_path)
     if not voice:
         return None
 

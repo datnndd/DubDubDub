@@ -261,3 +261,93 @@ def test_deepgram_extracts_utterances_and_paragraphs_options(tmp_path):
     assert len(normalized["paragraphs"]) == 1
     assert normalized["paragraphs"][0]["startSec"] == 0.5
     assert normalized["paragraphs"][0]["endSec"] == 5.0
+
+
+def test_deepgram_custom_model_build_task_params(tmp_path):
+    from videotrans import recognition
+    from videotrans.api.task_params import build_task_params
+
+    dummy_media = tmp_path / "test.mp4"
+    dummy_media.write_bytes(b"dummy")
+
+    # A custom model like nova-3-general, nova-2-meeting, etc. should be accepted without raising ValueError
+    params = build_task_params(
+        dummy_media,
+        {
+            "recognType": recognition.Deepgram,
+            "modelName": "nova-3-general",
+            "sourceLanguage": "zh-cn",
+            "targetLanguage": "vi",
+        },
+        job_type="asr",
+        output_dir=tmp_path,
+        temp_dir=tmp_path,
+    )
+    assert params["model_name"] == "nova-3-general"
+    assert params["recogn_type"] == recognition.Deepgram
+
+
+def test_build_task_params_source_language_fallback(tmp_path):
+    from videotrans import recognition
+    from videotrans.api.task_params import build_task_params
+
+    dummy_media = tmp_path / "test.mp4"
+    dummy_media.write_bytes(b"dummy")
+
+    # 'auto' or invalid language code should gracefully fallback to 'zh-cn'
+    params = build_task_params(
+        dummy_media,
+        {
+            "recognType": recognition.Deepgram,
+            "modelName": "nova-3",
+            "sourceLanguage": "auto",
+        },
+        job_type="asr",
+        output_dir=tmp_path,
+        temp_dir=tmp_path,
+    )
+    assert params["source_language_code"] == "zh-cn"
+
+
+@pytest.mark.asyncio
+async def test_jobs_post_deepgram_custom_model_and_media_recovery(tmp_path):
+    import httpx
+    from videotrans.api.app import create_app
+    from videotrans.core.project_store import create_project
+    from videotrans import recognition
+
+    dummy_media = tmp_path / "recovered_video.mp4"
+    dummy_media.write_bytes(b"fake-video-data")
+
+    # Create project in DB with media_path
+    proj = create_project(
+        name="Batch Test Video",
+        media_path=str(dummy_media),
+        duration=10.0,
+    )
+
+    app = create_app(
+        upload_dir=tmp_path / "uploads",
+        media_probe=lambda p: {"time": 10.0, "width": 1920, "height": 1080},
+        asr_validator=lambda *_: None,
+        translation_validator=lambda *_: None,
+    )
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        # Submit job with projectId pointing to project whose media is not yet in in-memory media_store
+        res = await client.post(
+            "/api/jobs",
+            json={
+                "mediaId": "unknown-memory-id",
+                "projectId": proj["id"],
+                "jobType": "asr",
+                "options": {
+                    "recognType": recognition.Deepgram,
+                    "modelName": "nova-3-general",
+                    "sourceLanguage": "zh-cn",
+                },
+            },
+        )
+        assert res.status_code == 202, f"Expected 202 Accepted, got {res.status_code}: {res.text}"
+        data = res.json()
+        assert data["id"]

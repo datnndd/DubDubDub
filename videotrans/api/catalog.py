@@ -73,6 +73,13 @@ def asr_models(provider: dict[str, Any]) -> list[str]:
     if provider["id"] == "deepgram":
         loaded = [model.strip() for model in str(settings.get("deepgram_model", "")).split(",")]
         models.extend(model for model in loaded if model and model not in models)
+        from videotrans.configure.config import params as global_params
+        cur = str(global_params.get("model_name", "")).strip()
+        if cur and cur not in models:
+            models.append(cur)
+        cur_stt = str(global_params.get("stt_model_name", "")).strip()
+        if cur_stt and cur_stt not in models:
+            models.append(cur_stt)
     return models
 
 

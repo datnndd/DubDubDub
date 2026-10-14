@@ -298,9 +298,10 @@ describe('Batch Video Workflow & Multi-Video Session', () => {
     }
   });
 
-  test('Navbar Session Bar in Header displays all session videos with running and completed voice badges', () => {
+  test('Header stays clean without cramped navbar session bar while SessionVideosDrawer displays status badges', () => {
     useDubDubStore.setState({
       activeProjectId: 'sub_1',
+      sessionDrawerOpen: true,
       sessionSubprojects: [
         {
           id: 'sub_1',
@@ -337,26 +338,21 @@ describe('Batch Video Workflow & Multi-Video Session', () => {
       },
     });
 
-    const html = renderToStaticMarkup(<Header />);
-    expect(html).toContain('data-testid="navbar-session-bar"');
-    expect(html).toContain('data-testid="session-bar-item-sub_1"');
-    expect(html).toContain('data-testid="session-bar-item-sub_2"');
-    expect(html).toContain('data-testid="session-bar-item-sub_3"');
-    expect(html).toContain('intro_lesson.mp4');
-    expect(html).toContain('deep_dive.mp4');
-    expect(html).toContain('summary.mp4');
+    const headerHtml = renderToStaticMarkup(<Header />);
+    // Intrusive navbar session bar is removed from Header
+    expect(headerHtml).not.toContain('data-testid="navbar-session-bar"');
+    // Header retains Session Drawer toggle button
+    expect(headerHtml).toContain('data-testid="header-session-drawer-toggle"');
+    expect(headerHtml).toContain('Session Videos');
+    expect(headerHtml).toContain('>3</span>');
 
-    // Video 1 shows running voice status badge
-    expect(html).toContain('data-testid="session-bar-badge-sub_1"');
-    expect(html).toContain('50%');
-
-    // Video 2 shows completed voice status badge
-    expect(html).toContain('data-testid="session-bar-badge-sub_2"');
-    expect(html).toContain('Voice Ready');
-
-    // Video 3 shows ready for review status
-    expect(html).toContain('data-testid="session-bar-badge-sub_3"');
-    expect(html).toContain('Ready');
+    // Session videos and badges are cleanly hosted in SessionVideosDrawer
+    const drawerHtml = renderToStaticMarkup(<SessionVideosDrawer />);
+    expect(drawerHtml).toContain('intro_lesson.mp4');
+    expect(drawerHtml).toContain('deep_dive.mp4');
+    expect(drawerHtml).toContain('summary.mp4');
+    expect(drawerHtml).toContain('Voice Dubbing');
+    expect(drawerHtml).toContain('Process Batch ASR (All Videos)');
   });
 
   test('switchSessionVideo allows switching to another video while voice dubbing is running without disrupting background voice state', async () => {

@@ -182,10 +182,15 @@ export const createDubbingSlice: StateCreator<any, [], [], DubbingSlice> = (set,
     if (!idStr || idStr === '__proto__' || idStr === 'constructor' || idStr === 'prototype') return;
     set((state: any) => {
       const map = { ...(state.speakerVoiceMap || {}) };
+      const oldVoice = map[idStr];
       map[idStr] = voiceId;
+      if (oldVoice === voiceId) {
+        return { speakerVoiceMap: map };
+      }
       return {
         speakerVoiceMap: map,
-        dubbingStatus: state.dubbingStatus === 'completed' ? 'idle' : state.dubbingStatus,
+        dubbingStatus: 'idle',
+        assembledDubUrl: null,
       };
     });
     get().triggerAutosave();
@@ -195,6 +200,7 @@ export const createDubbingSlice: StateCreator<any, [], [], DubbingSlice> = (set,
     if (isNaN(segmentId)) return;
     set((state: any) => {
       const overrides = { ...(state.segmentVoiceOverrides || {}) };
+      const oldOverride = overrides[segmentId];
       if (!voiceId) {
         delete overrides[segmentId];
       } else {
@@ -206,10 +212,14 @@ export const createDubbingSlice: StateCreator<any, [], [], DubbingSlice> = (set,
         }
         return seg;
       });
+      if (oldOverride === voiceId) {
+        return { segmentVoiceOverrides: overrides, segments: segs };
+      }
       return {
         segmentVoiceOverrides: overrides,
         segments: segs,
-        dubbingStatus: state.dubbingStatus === 'completed' ? 'idle' : state.dubbingStatus,
+        dubbingStatus: 'idle',
+        assembledDubUrl: null,
       };
     });
     get().triggerAutosave();
@@ -230,7 +240,8 @@ export const createDubbingSlice: StateCreator<any, [], [], DubbingSlice> = (set,
       return {
         segmentVoiceOverrides: overrides,
         segments: segs,
-        dubbingStatus: state.dubbingStatus === 'completed' ? 'idle' : state.dubbingStatus,
+        dubbingStatus: 'idle',
+        assembledDubUrl: null,
       };
     });
     get().triggerAutosave();
@@ -422,11 +433,18 @@ export const createDubbingSlice: StateCreator<any, [], [], DubbingSlice> = (set,
             }
           }
 
+          const customVoices = get().customVoices || [];
+          const matchedCustom = customVoices.find(
+            (cv: any) => cv.id === activeVoice || cv.name === activeVoice || `Custom: ${cv.name}` === activeVoice
+          );
+          const targetProvider = matchedCustom?.provider ?? ttsType;
+          const resolvedVoice = matchedCustom ? matchedCustom.id : activeVoice;
+
           try {
             const res = await previewTTS({
               text,
-              voice: activeVoice,
-              provider: ttsType,
+              voice: resolvedVoice,
+              provider: targetProvider,
               language: lang,
               speed,
               segment_id: seg.id,
@@ -564,6 +582,22 @@ export const createDubbingSlice: StateCreator<any, [], [], DubbingSlice> = (set,
       set({ dubbingError: 'Save this project before opening Stage 4' });
       return;
     }
+
+    const segments: Segment[] = get().segments || [];
+    const hasMismatchedOrMissingVoice = get().dubbingStatus !== 'completed' && segments.some((seg) => {
+      const text = (seg.targetText || seg.sourceText || '').trim();
+      if (!text) return false;
+      const activeVoice = get().getResolvedVoiceForSegment(seg);
+      return !seg.previewAudioId || seg.previewVoice !== activeVoice;
+    });
+
+    if (hasMismatchedOrMissingVoice) {
+      await get().runFullDubbing();
+      if (get().dubbingStatus === 'failed') {
+        return;
+      }
+    }
+
     set({ assemblingDubbing: true, dubbingError: null });
     try {
       const result = await assembleProjectDubbing(id, get().segments || []);

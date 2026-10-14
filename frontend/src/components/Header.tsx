@@ -121,9 +121,6 @@ export const Header: React.FC = () => {
   const sessionSubprojects = useDubDubStore((s) => s.sessionSubprojects || []);
   const sessionDrawerOpen = useDubDubStore((s) => s.sessionDrawerOpen);
   const setSessionDrawerOpen = useDubDubStore((s) => s.setSessionDrawerOpen);
-  const activeProjectId = useDubDubStore((s) => s.activeProjectId);
-  const switchSessionVideo = useDubDubStore((s) => s.switchSessionVideo);
-  const projectJobStatuses = useDubDubStore((s) => s.projectJobStatuses || {});
 
   return (
     <header className="h-[50px] flex-shrink-0 bg-white border-b border-[#E7E4DC] px-4 flex items-center justify-between gap-4 z-30 shadow-2xs">
@@ -201,60 +198,13 @@ export const Header: React.FC = () => {
         </nav>
       </div>
 
-      {/* Center: Navbar Session Bar when session videos are present, or Standalone Project Indicator */}
-      {sessionSubprojects.length > 0 ? (
-        <div
-          data-testid="navbar-session-bar"
-          className="flex items-center gap-1.5 min-w-0 max-w-[48%] lg:max-w-[55%] overflow-x-auto py-1 px-2 bg-stone-100/90 rounded-lg border border-stone-200/90 shadow-2xs no-scrollbar"
-        >
-          <div className="flex items-center gap-1 text-[11px] font-bold text-stone-500 shrink-0 mr-0.5">
-            <Layers className="w-3.5 h-3.5 text-[#8D4B00]" />
-            <span className="hidden xl:inline">Session:</span>
-          </div>
-
-          <div className="flex items-center gap-1.5 min-w-0">
-            {sessionSubprojects.map((sub, idx) => {
-              const isActive = sub.id === activeProjectId;
-              const statusInfo = getSubprojectStatusInfo(sub, projectJobStatuses);
-
-              return (
-                <button
-                  key={sub.id}
-                  data-testid={`session-bar-item-${sub.id}`}
-                  onClick={() => switchSessionVideo(sub.id)}
-                  title={`${sub.name || `Video #${idx + 1}`} • Status: ${statusInfo.label}`}
-                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] transition-all cursor-pointer shrink-0 border ${
-                    isActive
-                      ? 'bg-white text-[#8D4B00] font-bold border-amber-300 shadow-2xs ring-1 ring-amber-300/60'
-                      : 'text-stone-600 hover:text-stone-900 hover:bg-stone-200/60 border-stone-200/60'
-                  }`}
-                >
-                  <span className="font-mono text-[10px] font-semibold text-stone-400">
-                    #{idx + 1}
-                  </span>
-                  <span className="truncate max-w-[80px] sm:max-w-[100px] lg:max-w-[130px]">
-                    {sub.name || `Video ${idx + 1}`}
-                  </span>
-                  <span
-                    data-testid={`session-bar-badge-${sub.id}`}
-                    className={`inline-flex items-center gap-1 text-[9px] font-semibold px-1.5 py-0.2 rounded-full border ${statusInfo.pillClasses}`}
-                  >
-                    {statusInfo.icon}
-                    <span>{statusInfo.badgeText}</span>
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      ) : (
-        <div className="hidden lg:flex items-center gap-2 text-[11px] text-stone-600 min-w-0">
-          <span className="w-2 h-2 rounded-full bg-[#8D4B00] shrink-0" />
-          <span className="font-medium text-stone-700 truncate max-w-xs">
-            Project: <strong className="text-stone-900">{project?.filename || 'Untitled'}</strong>
-          </span>
-        </div>
-      )}
+      {/* Center: Clean Project Indicator */}
+      <div className="hidden lg:flex items-center gap-2 text-[11px] text-stone-600 min-w-0">
+        <span className="w-2 h-2 rounded-full bg-[#8D4B00] shrink-0" />
+        <span className="font-medium text-stone-700 truncate max-w-xs">
+          Project: <strong className="text-stone-900">{project?.filename || 'Untitled'}</strong>
+        </span>
+      </div>
 
       {/* Right: Back to Projects, Settings, Auto-save status */}
       <div className="flex items-center gap-2.5 flex-shrink-0">

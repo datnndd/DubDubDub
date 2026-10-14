@@ -663,9 +663,12 @@ async def synthesize_unified_tts_preview(
         return preview_id, path, applied_speed
 
     # 1. Check if voice refers to an existing custom voice
-    cv = voice_store.get_voice(voice_str, db_path=db_path) if voice_str else None
-    if not cv and voice_str:
-        cv = voice_store.find_voice_by_name(voice_str, provider=provider, db_path=db_path)
+    clean_voice = voice_str[len("Custom: "):].strip() if voice_str.startswith("Custom: ") else voice_str
+    cv = voice_store.get_voice(clean_voice, db_path=db_path) if clean_voice else None
+    if not cv and clean_voice:
+        cv = voice_store.find_voice_by_name(clean_voice, provider=provider, db_path=db_path)
+    if not cv and clean_voice and provider is not None:
+        cv = voice_store.find_voice_by_name(clean_voice, provider=None, db_path=db_path)
 
     cv_resolved = None
     cv_ref_path: Optional[Path] = None

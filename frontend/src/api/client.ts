@@ -7,23 +7,36 @@ export async function apiRequest<T = any>(url: string, options: RequestInit = {}
     headers.set('Content-Type', 'application/json');
   }
 
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      ...options,
-      headers,
-    });
-    if ((response.status === 502 || response.status === 504) && (!options.method || options.method.toUpperCase() === 'GET')) {
-      await new Promise((r) => setTimeout(r, 400));
-      response = await fetch(url, { ...options, headers });
-    }
-  } catch (err) {
-    if (!options.method || options.method.toUpperCase() === 'GET') {
-      await new Promise((r) => setTimeout(r, 400));
-      response = await fetch(url, { ...options, headers });
-    } else {
+  const isIdempotent = !options.method || ['GET', 'HEAD'].includes(options.method.toUpperCase());
+  const maxRetries = isIdempotent ? 4 : 0;
+  const retryDelays = [400, 800, 1200, 1600];
+
+  let response: Response | undefined;
+  let lastError: any = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      response = await fetch(url, {
+        ...options,
+        headers,
+      });
+      if (response && [502, 503, 504].includes(response.status) && attempt < maxRetries) {
+        await new Promise((r) => setTimeout(r, retryDelays[attempt] || 1000));
+        continue;
+      }
+      break;
+    } catch (err) {
+      lastError = err;
+      if (attempt < maxRetries) {
+        await new Promise((r) => setTimeout(r, retryDelays[attempt] || 1000));
+        continue;
+      }
       throw err;
     }
+  }
+
+  if (!response) {
+    throw lastError || new Error(`Network request failed for ${url}`);
   }
 
   if (!response.ok) {

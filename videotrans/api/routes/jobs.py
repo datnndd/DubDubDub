@@ -65,6 +65,26 @@ async def create_job_handler(
     default_job_type = "render" if request.url.path in {"/api/render", "/api/export"} else "full"
     job_type = str(payload.jobType or options.get("jobType") or default_job_type).lower()
 
+    project_id = str(payload.projectId or options.get("projectId") or options.get("project_id") or "") or None
+    if project_id:
+        options["projectId"] = project_id
+
+    if (media is None or not media.path.is_file()) and project_id:
+        try:
+            from videotrans.core.project_store import get_project
+            proj = get_project(project_id)
+            if proj:
+                p_path = proj.get("media_path")
+                if p_path and Path(p_path).is_file():
+                    p_file = Path(p_path)
+                    media = media_store.inspect(
+                        p_file,
+                        filename=proj.get("name") or p_file.name,
+                        media_id=media_id or proj.get("media_id"),
+                    )
+        except Exception:
+            pass
+
     if job_type == "translation" and (media is None or not media.path.is_file()):
         fallback_path = Path(TEMP_DIR) / f"webui-trans-{uuid.uuid4().hex}.mp4"
         fallback_path.touch(exist_ok=True)
@@ -82,10 +102,6 @@ async def create_job_handler(
         if asset_path is None or not asset_path.is_file():
             raise HTTPException(status_code=400, detail=f"Unknown or expired {option_key}")
         options[path_key] = asset_path.resolve().as_posix()
-
-    project_id = str(payload.projectId or options.get("projectId") or options.get("project_id") or "") or None
-    if project_id:
-        options["projectId"] = project_id
 
     try:
         task_params_builder = getattr(request.app.state, "task_params_builder", None)

@@ -102,15 +102,8 @@ def build_task_params(
     safe_stem = re.sub(r"[^\w.-]+", "-", file_info.basename, flags=re.UNICODE).strip("-")
     pid = project_id or options.get("projectId") or options.get("project_id")
     if pid:
-        from videotrans.core.project_store import get_project, get_project_dir, get_parent_project_dir
-        proj = get_project(str(pid))
-        parent_id = proj.get("parent_id") if proj else None
-        if parent_id:
-            parent = get_project(parent_id)
-            parent_name = (parent.get("name") if parent else None) or parent_id
-            target_dir = get_parent_project_dir(parent_name)
-        else:
-            target_dir = get_project_dir(str(pid)) / "exports"
+        from videotrans.core.project_store import get_project_dir
+        target_dir = get_project_dir(str(pid)) / "exports"
         target_dir.mkdir(parents=True, exist_ok=True)
     else:
         target_dir = Path(output_dir) / (safe_stem or file_info.uuid)
@@ -126,12 +119,19 @@ def build_task_params(
         if asr_provider is None:
             raise ValueError(f"Unsupported ASR engine: {recogn_type}")
         model_name = str(options.get("modelName") or asr_provider["models"][0])
-        if model_name not in asr_models(asr_provider):
-            raise ValueError(f"Model {model_name} is not supported by {asr_provider['label']}")
+        if recogn_type == recognition.Deepgram:
+            if not model_name.strip():
+                model_name = "nova-3"
+        elif asr_provider.get("thirdParty"):
+            if not model_name.strip():
+                model_name = asr_provider["models"][0]
+        else:
+            if model_name not in asr_models(asr_provider):
+                raise ValueError(f"Model {model_name} is not supported by {asr_provider['label']}")
 
-    source_language = str(options.get("sourceLanguage") or "zh-cn")
-    if source_language not in translator.LANGNAME_DICT:
-        raise ValueError(f"Unknown source language: {source_language or 'missing'}")
+    source_language = str(options.get("sourceLanguage") or "zh-cn").strip()
+    if source_language.lower() in ("auto", "detect") or source_language not in translator.LANGNAME_DICT:
+        source_language = "zh-cn"
 
     is_asr_only = (job_type == "asr")
     if is_asr_only or job_type == "render":
@@ -194,11 +194,13 @@ def build_task_params(
     for index, segment in enumerate(segments, 1):
         if not isinstance(segment, dict):
             continue
+        raw_spk = segment.get("speakerId")
         voice = (
             segment.get("voiceOverride")
             or segment_voice_overrides.get(str(segment.get("id")))
             or segment_voice_overrides.get(segment.get("id"))
-            or speaker_voice_map.get(segment.get("speakerId"))
+            or (speaker_voice_map.get(raw_spk) if raw_spk is not None else None)
+            or (speaker_voice_map.get(str(raw_spk)) if raw_spk is not None else None)
         )
         if voice:
             line_roles[str(index)] = _resolve_voice_id_to_role(str(voice), tts_type)
