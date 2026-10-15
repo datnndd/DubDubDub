@@ -39,5 +39,6 @@ jobs:
 
       - name: Run tests
         env:
+          HF_HUB_OFFLINE: "1"
           PYTHONUNBUFFERED: "1"
         run: uv run --frozen pytest -vv --timeout=180 --timeout-method=thread -o faulthandler_timeout=120
