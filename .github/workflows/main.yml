@@ -43,6 +43,7 @@ jobs:
           HF_HUB_OFFLINE: "1"
           PYTHONUNBUFFERED: "1"
         run: |
+          uv run --frozen pytest -vv -x --timeout=60 --timeout-method=thread tests/test_parent_project_store.py
           mapfile -t files < <(find tests -type f -name 'test_*.py' | sort)
           for ((i = 0; i < ${#files[@]}; i += 8)); do
             echo "Running test files $((i + 1))-$((i + 8)) of ${#files[@]}"
