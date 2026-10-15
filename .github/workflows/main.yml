@@ -38,4 +38,6 @@ jobs:
         run: uv sync --frozen
 
       - name: Run tests
-        run: uv run --frozen pytest
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: uv run --frozen pytest -vv --timeout=180 --timeout-method=thread -o faulthandler_timeout=120
