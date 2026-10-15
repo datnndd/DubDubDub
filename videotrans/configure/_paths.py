@@ -83,7 +83,8 @@ def _set_env():
     if Path(f'{ROOT_DIR}/netoffline.txt').is_file():
         os.environ['HF_HUB_OFFLINE'] = '1'
 
-    if sys.platform == 'win32' and IS_FROZEN:
-        os.environ['PATH'] = f'{ROOT_DIR}/_internal/torch/lib;' + os.environ.get("PATH", "")
-    os.environ['PATH'] = ROOT_DIR + os.pathsep + f'{ROOT_DIR}/ffmpeg' + os.pathsep + f'{ROOT_DIR}/ffmpeg/sox' + os.pathsep + os.environ.get(
-        "PATH", "")
+    if sys.platform == 'win32':
+        if IS_FROZEN:
+            os.environ['PATH'] = f'{ROOT_DIR}/_internal/torch/lib;' + os.environ.get("PATH", "")
+        os.environ['PATH'] = ROOT_DIR + os.pathsep + f'{ROOT_DIR}/ffmpeg' + os.pathsep + f'{ROOT_DIR}/ffmpeg/sox' + os.pathsep + os.environ.get(
+            "PATH", "")
