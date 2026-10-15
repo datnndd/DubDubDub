@@ -9,6 +9,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -41,4 +42,4 @@ jobs:
         env:
           HF_HUB_OFFLINE: "1"
           PYTHONUNBUFFERED: "1"
-        run: uv run --frozen pytest -vv --timeout=180 --timeout-method=thread -o faulthandler_timeout=120
+        run: uv run --frozen pytest -vv -x --timeout=180 --timeout-method=thread -o faulthandler_timeout=120
