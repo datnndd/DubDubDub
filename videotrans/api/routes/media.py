@@ -54,7 +54,7 @@ async def scan_folders_handler(payload: ScanFoldersRequest) -> JSONResponse:
             if p.suffix.lower() == ".mp4":
                 found_map[str(p.resolve())] = p.resolve()
         elif p.is_dir():
-            pattern = "**/*.mp4" if recursive else "*.mp4"
+            pattern = "**/*" if recursive else "*"
             try:
                 for match in p.glob(pattern):
                     if match.is_file() and match.suffix.lower() == ".mp4":
