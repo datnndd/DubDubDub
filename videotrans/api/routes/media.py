@@ -54,7 +54,7 @@ async def scan_folders_handler(payload: ScanFoldersRequest) -> JSONResponse:
             if p.suffix.lower() == ".mp4":
                 found_map[str(p.resolve())] = p.resolve()
         elif p.is_dir():
-            pattern = "**/*.mp4" if recursive else "*.mp4"
+            pattern = "**/*" if recursive else "*"
             try:
                 for match in p.glob(pattern):
                     if match.is_file() and match.suffix.lower() == ".mp4":
@@ -234,7 +234,7 @@ async def edit_asset_handler(
                 raise HTTPException(status_code=400, detail=f"An asset file is required: {exc}") from exc
 
         if isinstance(file_obj, (UploadFile, StarletteUploadFile)) and file_obj.filename:
-            filename = Path(unquote(file_obj.filename)).name
+            filename = Path(unquote(file_obj.filename).replace("\\", "/")).name
             extension = Path(filename).suffix.lower().lstrip(".")
             if extension not in set(allowed[kind]):
                 raise HTTPException(status_code=400, detail=f"Unsupported {kind} type: .{extension or 'unknown'}")
@@ -246,7 +246,7 @@ async def edit_asset_handler(
         raw_name = request.headers.get("X-Filename") or request.query_params.get("filename") or ""
         if not raw_name:
             raise HTTPException(status_code=400, detail="An asset file is required")
-        filename = Path(unquote(raw_name)).name
+        filename = Path(unquote(raw_name).replace("\\", "/")).name
         if not filename:
             raise HTTPException(status_code=400, detail="A valid filename is required")
         extension = Path(filename).suffix.lower().lstrip(".")

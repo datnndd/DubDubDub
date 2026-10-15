@@ -9,6 +9,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +25,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsndfile1
+          sudo apt-get install -y ffmpeg libsndfile1
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -38,4 +39,12 @@ jobs:
         run: uv sync --frozen
 
       - name: Run tests
-        run: uv run --frozen pytest
+        env:
+          HF_HUB_OFFLINE: "1"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          mapfile -t files < <(find tests -type f -name 'test_*.py' | sort)
+          for ((i = 0; i < ${#files[@]}; i += 4)); do
+            echo "Running test files $((i + 1))-$((i + 4)) of ${#files[@]}"
+            timeout --signal=TERM --kill-after=10s 300s uv run --frozen pytest -q -x --disable-warnings --timeout=120 --timeout-method=signal -o faulthandler_timeout=90 "${files[@]:i:4}"
+          done

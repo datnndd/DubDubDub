@@ -3,6 +3,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import wave
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
@@ -122,6 +123,16 @@ def test_api_voice_design_assist():
 
 
 def test_api_create_designed_voice(temp_db, monkeypatch):
+    from videotrans.services import voice_preview
+
+    def fake_synthesizer(voice, preview_path, sample_text):
+        with wave.open(str(preview_path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(24000)
+            wav.writeframes(b"\x01\x00" * 24000)
+
+    monkeypatch.setattr(voice_preview, "_preview_synthesizer", fake_synthesizer)
     client = TestClient(app)
     monkeypatch.setattr(voice_store, "db_conn", lambda p=None: db.db_conn(temp_db))
 
