@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import logging
-import os
-import signal
 import subprocess
-import sys
 import threading
 from contextvars import ContextVar
 from typing import Optional
+
+import psutil
 
 logger = logging.getLogger("videotrans.proc_registry")
 
@@ -59,31 +58,19 @@ def kill_process_tree(proc: subprocess.Popen) -> None:
     """Terminate a process and all its spawned child processes cross-platform."""
     if proc.poll() is not None:
         return
-    pid = proc.pid
-    if sys.platform == "win32":
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
-            )
-        except Exception as e:
-            logger.debug("taskkill failed for PID %s: %s", pid, e)
+    try:
+        for child in psutil.Process(proc.pid).children(recursive=True):
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                pass
+    except psutil.NoSuchProcess:
+        pass
+    finally:
         try:
             proc.kill()
-        except Exception:
+        except ProcessLookupError:
             pass
-    else:
-        try:
-            pgid = os.getpgid(pid)
-            os.killpg(pgid, signal.SIGKILL)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
 
 
 def kill_job_procs(job_id: str) -> None:
