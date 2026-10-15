@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import shutil
 import time
 from typing import Any, Optional
@@ -35,7 +35,10 @@ def get_voice_audio_path(filename_or_path: str | Path, base_dir: Optional[Path] 
         raise ValueError("Audio filename or path cannot be empty")
 
     target_base = (base_dir or VOICES_DIR).resolve()
-    candidate = Path(filename_or_path)
+    raw_path = str(filename_or_path)
+    candidate = Path(raw_path.replace("\\", "/"))
+    if PureWindowsPath(raw_path).drive and not candidate.is_absolute():
+        raise ValueError(f"Path traversal detected: {filename_or_path} is outside {target_base}")
     if not candidate.is_absolute():
         candidate = target_base / candidate
     resolved = candidate.resolve()
@@ -57,7 +60,10 @@ def get_preview_audio_path(filename_or_path: str | Path, base_dir: Optional[Path
         raise ValueError("Preview audio filename or path cannot be empty")
 
     target_base = (base_dir or PREVIEWS_DIR).resolve()
-    candidate = Path(filename_or_path)
+    raw_path = str(filename_or_path)
+    candidate = Path(raw_path.replace("\\", "/"))
+    if PureWindowsPath(raw_path).drive and not candidate.is_absolute():
+        raise ValueError(f"Path traversal detected: {filename_or_path} is outside {target_base}")
     if not candidate.is_absolute():
         candidate = target_base / candidate
     resolved = candidate.resolve()
