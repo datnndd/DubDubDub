@@ -53,6 +53,15 @@ def voice_api_env(tmp_path, monkeypatch):
 
     voice_preview.set_preview_synthesizer(fake_synthesizer)
 
+    class FakeVieNeuEngine:
+        def encode_reference(self, path, *, denoise):
+            return [0.25], [1]
+
+    monkeypatch.setattr(
+        "videotrans.services.model_cache.get_cached_vieneu_engine",
+        lambda **kwargs: FakeVieNeuEngine(),
+    )
+
     app = create_app(upload_dir=uploads_dir)
     yield {
         "app": app,
