@@ -22,7 +22,14 @@ class AlignMixin:
             self.signal(text=tr("Sound & video speed alignment stage"))
 
         if self.cfg.video_autorate:
-            is_novoice_mp4(self.cfg.novoice_mp4, self.uuid)
+            ready = is_novoice_mp4(
+                self.cfg.novoice_mp4,
+                self.uuid,
+                event_sink=getattr(self, "event_sink", None),
+                cancellation_token=getattr(self, "cancellation_token", None),
+            )
+            if self._exit() or not ready:
+                return
         if vail_file(self.cfg.novoice_mp4):
             self.video_time = get_video_duration(self.cfg.novoice_mp4)
         from videotrans.task._rate import SpeedRate

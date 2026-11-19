@@ -58,11 +58,12 @@ export const createPlaybackSlice: StateCreator<any, [], [], PlaybackSlice> = (se
       },
     }));
 
-    // Find and activate segment corresponding to clamped time
+    // Find and activate segment corresponding to clamped time (clear in silent gaps)
     const segments = get().segments || [];
     const active = segments.find((s: any) => clamped >= s.startSec && clamped <= s.endSec);
-    if (active && active.id !== get().activeSegmentId) {
-      set({ activeSegmentId: active.id });
+    const nextActiveId = active ? active.id : null;
+    if (nextActiveId !== get().activeSegmentId) {
+      set({ activeSegmentId: nextActiveId });
     }
   },
 
@@ -136,8 +137,9 @@ export const createPlaybackSlice: StateCreator<any, [], [], PlaybackSlice> = (se
 
     const segments = get().segments || [];
     const active = segments.find((s: any) => currentTime >= s.startSec && currentTime <= s.endSec);
-    if (active && active.id !== get().activeSegmentId) {
-      set({ activeSegmentId: active.id });
+    const nextActiveId = active ? active.id : null;
+    if (nextActiveId !== get().activeSegmentId) {
+      set({ activeSegmentId: nextActiveId });
     }
   },
 });

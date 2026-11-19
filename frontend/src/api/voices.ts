@@ -272,3 +272,97 @@ export async function previewTTS(
 export function getTTSPreviewAudioUrl(id: string): string {
   return `/api/tts/preview/${encodeURIComponent(id)}/audio`;
 }
+
+export interface BatchTTSSegmentPayload {
+  segmentId: number | string;
+  text: string;
+  voice: string;
+  provider: number | string;
+  language?: string;
+  speed?: number;
+  style?: string;
+  tuningParams?: Record<string, any>;
+  forceRefresh?: boolean;
+  autoSpeed?: boolean;
+  slotDuration?: number;
+  maxSpeedRate?: number;
+}
+
+export interface BatchTTSPayload {
+  batchId?: string;
+  segments: BatchTTSSegmentPayload[];
+  language?: string;
+  speed?: number;
+  autoSpeed?: boolean;
+  maxSpeedRate?: number;
+}
+
+export interface BatchTTSResultItem {
+  segmentId: number | string;
+  ok: boolean;
+  id?: string | null;
+  preview_id?: string | null;
+  previewUrl?: string | null;
+  preview_url?: string | null;
+  audio_url?: string | null;
+  durationSec?: number;
+  appliedSpeed?: number;
+  applied_speed?: number;
+  voice?: string | null;
+  provider?: number | null;
+  error?: string | null;
+}
+
+export interface BatchTTSResponse {
+  ok: boolean;
+  batch_id?: string;
+  succeeded?: number;
+  failed?: number;
+  results: BatchTTSResultItem[];
+}
+
+export async function batchTTS(
+  payload: BatchTTSPayload,
+  options?: RequestInit
+): Promise<BatchTTSResponse> {
+  const headers = new Headers(options?.headers || {});
+  if (!headers.has('Accept')) headers.set('Accept', 'application/json');
+  if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+
+  const response = await fetch('/api/tts/batch', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    ...options,
+    headers,
+  });
+
+  if (!response.ok) {
+    let errorMsg = `Request failed: ${response.status} ${response.statusText}`;
+    try {
+      const text = await response.text();
+      if (text && text.trim()) {
+        try {
+          const errJson = JSON.parse(text);
+          if (errJson.detail) errorMsg = errJson.detail;
+          else if (errJson.message) errorMsg = errJson.message;
+          else if (errJson.error) errorMsg = errJson.error;
+          else errorMsg = text.trim();
+        } catch (_) {
+          errorMsg = text.trim();
+        }
+      }
+    } catch (_) {}
+    const err = new Error(errorMsg) as Error & { status?: number };
+    err.status = response.status;
+    throw err;
+  }
+
+  return response.json();
+}
+
+export async function cancelBatchTTS(batchId: string): Promise<{ ok: boolean; batch_id: string; cancelled: boolean }> {
+  return apiRequest<{ ok: boolean; batch_id: string; cancelled: boolean }>(
+    `/api/tts/batch/${encodeURIComponent(batchId)}/cancel`,
+    { method: 'POST' }
+  );
+}

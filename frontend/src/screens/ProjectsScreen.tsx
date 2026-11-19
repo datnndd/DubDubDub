@@ -27,6 +27,8 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import type { ProjectRecord } from '../types/project';
+import { formatLocalDateYmd, getYesterdayLocalDateYmd, parseProjectDate } from '../utils/date';
+import { isParentProject } from '../utils/project';
 
 export type SortOption = 'last-modified' | 'date-created' | 'alphabetical';
 export type ViewMode = 'grid' | 'table';
@@ -76,9 +78,8 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
   const effectiveGroupByDate = groupByDate && sortBy !== 'alphabetical';
 
   const now = new Date();
-  const todayDateStr = now.toISOString().split('T')[0];
-  const yesterdayDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-  const yesterdayDateStr = yesterdayDate.toISOString().split('T')[0];
+  const todayDateStr = formatLocalDateYmd(now);
+  const yesterdayDateStr = getYesterdayLocalDateYmd(now);
 
   const stageLabels: Record<number, string> = {
     1: '1. Prepare & ASR',
@@ -92,16 +93,15 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
       type === 'updated'
         ? p.updated_at || (p as any).updatedAt || p.created_at || (p as any).createdAt
         : p.created_at || (p as any).createdAt || p.updated_at || (p as any).updatedAt;
-    if (!raw) return 0;
-    const time = new Date(raw).getTime();
-    return isNaN(time) ? 0 : time;
+    const d = parseProjectDate(raw);
+    return d ? d.getTime() : 0;
   };
 
-  const formatDate = (rawStr?: string): string => {
-    if (!rawStr) return '—';
+  const formatDate = (rawStr?: string | number): string => {
+    if (rawStr === undefined || rawStr === null || rawStr === '') return '—';
     try {
-      const d = new Date(rawStr);
-      if (isNaN(d.getTime())) return rawStr;
+      const d = parseProjectDate(rawStr);
+      if (!d) return String(rawStr);
       return d.toLocaleDateString(undefined, {
         month: 'short',
         day: 'numeric',
@@ -110,7 +110,7 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
         minute: '2-digit',
       });
     } catch {
-      return rawStr;
+      return String(rawStr);
     }
   };
 
@@ -122,18 +122,23 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
     return `${m}m ${s}s`;
   };
 
-  // 1. Search Filtering for Flat List
+  const videoProjects = useMemo(
+    () => projectsList.filter((p) => !isParentProject(p)),
+    [projectsList]
+  );
+
+  // 1. Search Filtering for Flat List (excluding parent containers)
   const filteredProjects = useMemo(() => {
-    if (!searchQuery.trim()) return projectsList;
+    if (!searchQuery.trim()) return videoProjects;
     const q = searchQuery.trim().toLowerCase();
-    return projectsList.filter((p) => {
+    return videoProjects.filter((p) => {
       const name = (p.name || '').toLowerCase();
       const stage = (stageLabels[p.stage] || `Stage ${p.stage}`).toLowerCase();
       const status = (p.status || '').toLowerCase();
       const mediaInfo = (p.media_path || (p as any).mediaId || (p as any).media_id || '').toLowerCase();
       return name.includes(q) || stage.includes(q) || status.includes(q) || mediaInfo.includes(q);
     });
-  }, [projectsList, searchQuery]);
+  }, [videoProjects, searchQuery]);
 
   // 2. Chronological & Alphabetical Sorting for Flat List
   const sortedProjects = useMemo(() => {
@@ -177,15 +182,15 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
 
     // Identify parent projects and pre-seed their groups
     for (const p of projectsList) {
-      const isParent = Boolean((p as any).state?.is_parent || (p as any).is_parent || p.id.startsWith('parent_'));
-      if (isParent) {
+      if (isParentProject(p)) {
+        const parsedCreated = parseProjectDate(p.created_at);
         const dateKey =
           p.name && /^\d{4}-\d{2}-\d{2}$/.test(p.name)
             ? p.name
             : p.id.startsWith('parent_')
             ? p.id.replace('parent_', '')
-            : p.created_at
-            ? new Date(p.created_at).toISOString().split('T')[0]
+            : parsedCreated
+            ? formatLocalDateYmd(parsedCreated)
             : todayDateStr;
         if (!groupMap.has(dateKey)) {
           groupMap.set(dateKey, {
@@ -209,8 +214,7 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
 
     // Populate subprojects into their parent date group
     for (const p of projectsList) {
-      const isParent = Boolean((p as any).state?.is_parent || (p as any).is_parent || p.id.startsWith('parent_'));
-      if (isParent) continue;
+      if (isParentProject(p)) continue;
 
       let dateKey = todayDateStr;
       const pid = p.parent_id || p.parentId;
@@ -224,10 +228,10 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
           }
         }
       } else if (p.created_at) {
-        try {
-          const parsed = new Date(p.created_at).toISOString().split('T')[0];
-          if (/^\d{4}-\d{2}-\d{2}$/.test(parsed)) dateKey = parsed;
-        } catch (_) {}
+        const parsedCreated = parseProjectDate(p.created_at);
+        if (parsedCreated) {
+          dateKey = formatLocalDateYmd(parsedCreated);
+        }
       }
 
       if (!groupMap.has(dateKey)) {
@@ -245,14 +249,13 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
 
       const g = groupMap.get(dateKey)!;
       g.subprojects.push(p);
-      g.totalDuration += p.duration || 0;
-      if (p.stage >= 2 || p.status === 'completed') {
-        g.completedCount += 1;
-      }
-      if (p.status === 'processing') {
-        g.processingCount += 1;
-      }
     }
+
+    const computeGroupTotals = (subs: ProjectRecord[]) => ({
+      totalDuration: subs.reduce((acc, item) => acc + (item.duration || 0), 0),
+      completedCount: subs.filter((item) => item.stage >= 2 || item.status === 'completed').length,
+      processingCount: subs.filter((item) => item.status === 'processing').length,
+    });
 
     // Sort each group's subprojects according to sortBy
     const groups = Array.from(groupMap.values());
@@ -272,12 +275,13 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
       } else if (sortBy === 'alphabetical') {
         g.subprojects.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
       }
+      Object.assign(g, computeGroupTotals(g.subprojects));
     }
 
     // Sort groups chronologically descending (newest day first)
     groups.sort((a, b) => b.date.localeCompare(a.date));
 
-    // Filter by searchQuery if present
+    // Filter by searchQuery if present and recompute totals on matched subprojects
     if (!searchQuery.trim()) return groups;
 
     const q = searchQuery.trim().toLowerCase();
@@ -295,7 +299,11 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
           const mediaInfo = (p.media_path || (p as any).mediaId || (p as any).media_id || '').toLowerCase();
           return name.includes(q) || stage.includes(q) || status.includes(q) || mediaInfo.includes(q);
         });
-        return { ...g, subprojects: matchingSubs };
+        return {
+          ...g,
+          subprojects: matchingSubs,
+          ...computeGroupTotals(matchingSubs),
+        };
       })
       .filter((g) => g.subprojects.length > 0 || g.date.toLowerCase().includes(q));
   }, [projectsList, searchQuery, sortBy]);
@@ -675,7 +683,7 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
               <div className="flex items-center gap-2">
                 <h1 className="font-bold text-sm text-stone-900 tracking-tight">Project Management</h1>
                 <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-[#8D4B00]">
-                  {projectsList.length}
+                  {videoProjects.length}
                 </span>
               </div>
               <p className="text-[10px] text-stone-500 font-medium">
@@ -908,7 +916,7 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
 
       {/* Main Content Area: Card Grid or Table List */}
       <div className="flex-1 overflow-y-auto p-6">
-        {projectsList.length === 0 ? (
+        {videoProjects.length === 0 ? (
           <div className="h-96 flex flex-col items-center justify-center text-center p-8 max-w-md mx-auto">
             <div className="w-16 h-16 rounded-2xl bg-amber-500/10 text-[#8D4B00] flex items-center justify-center mb-4 border border-amber-500/20 shadow-2xs">
               <Film className="w-8 h-8" />
@@ -1137,13 +1145,33 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
                 {effectiveGroupByDate ? (
                   /* Grouped by Date Table */
                   dateGroups.map((group) => {
+                    const groupIds = group.subprojects.map((p) => p.id);
+                    const isGroupAllSelected =
+                      groupIds.length > 0 && groupIds.every((id) => selectedIds.has(id));
+                    const isGroupSomeSelected =
+                      groupIds.some((id) => selectedIds.has(id)) && !isGroupAllSelected;
                     const isCollapsed = collapsedDates.has(group.date);
                     return (
                       <React.Fragment key={group.date}>
-                        <tr className="bg-amber-50/60 font-semibold border-y border-amber-200/60">
+                        <tr data-date-group={group.date} className="bg-amber-50/60 font-semibold border-y border-amber-200/60">
                           <td colSpan={7} className="py-2 px-4">
-                            <div className="flex items-center justify-between">
+                            <div className="flex items-center justify-between gap-2 flex-wrap">
                               <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  data-testid={`checkbox-date-${group.date}`}
+                                  onClick={(e) => toggleSelectDateGroup(group, e)}
+                                  className="p-0.5 rounded text-stone-400 hover:text-stone-700 cursor-pointer"
+                                  title="Select all videos in this date"
+                                >
+                                  {isGroupAllSelected ? (
+                                    <CheckSquare className="w-4 h-4 text-[#8D4B00]" />
+                                  ) : isGroupSomeSelected ? (
+                                    <MinusSquare className="w-4 h-4 text-[#8D4B00]" />
+                                  ) : (
+                                    <Square className="w-4 h-4 text-stone-400" />
+                                  )}
+                                </button>
                                 <FolderTree className="w-3.5 h-3.5 text-[#8D4B00]" />
                                 <span className="font-bold text-stone-900">{group.date}</span>
                                 {group.isToday && (
@@ -1151,20 +1179,44 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
                                     Today
                                   </span>
                                 )}
+                                {group.isYesterday && (
+                                  <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-stone-200 text-stone-700">
+                                    Yesterday
+                                  </span>
+                                )}
                                 <span className="text-[11px] text-stone-500 font-normal">
-                                  ({group.subprojects.length} videos • {formatDuration(group.totalDuration)})
+                                  ({group.subprojects.length} {group.subprojects.length === 1 ? 'video' : 'videos'} • {formatDuration(group.totalDuration)})
                                 </span>
                               </div>
                               <div className="flex items-center gap-2">
                                 {group.subprojects.length > 0 && (
                                   <button
                                     type="button"
+                                    data-testid={`open-session-${group.date}`}
                                     onClick={() => openDateParentSession(group.parentId, group.date)}
                                     className="px-2 py-0.5 text-[11px] font-bold bg-[#8D4B00] text-white rounded hover:bg-[#743D00] transition cursor-pointer"
                                   >
                                     Open Session
                                   </button>
                                 )}
+                                <button
+                                  type="button"
+                                  data-testid={`add-video-${group.date}`}
+                                  onClick={() => handleCreateNewProjectInDate(group.parentId)}
+                                  className="px-2 py-0.5 text-[11px] font-semibold bg-white border border-stone-200 text-stone-700 rounded hover:border-amber-400 hover:text-[#8D4B00] flex items-center gap-1 cursor-pointer"
+                                >
+                                  <Plus className="w-3 h-3" />
+                                  <span>Add Video</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  data-testid={`scan-folders-date-${group.date}`}
+                                  onClick={() => setScanModalOpen(true)}
+                                  className="px-2 py-0.5 text-[11px] font-semibold bg-white border border-stone-200 text-stone-700 rounded hover:border-amber-300 flex items-center gap-1 cursor-pointer"
+                                >
+                                  <FolderSearch className="w-3 h-3 text-amber-700" />
+                                  <span>Scan Folders</span>
+                                </button>
                                 <button
                                   type="button"
                                   onClick={(e) => toggleCollapseDate(group.date, e)}
@@ -1176,7 +1228,35 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
                             </div>
                           </td>
                         </tr>
-                        {!isCollapsed && group.subprojects.map((p) => renderProjectRow(p))}
+                        {!isCollapsed && (
+                          group.subprojects.length === 0 ? (
+                            <tr>
+                              <td colSpan={7} className="py-5 px-4 text-center text-xs text-stone-500 bg-stone-50/30">
+                                <div className="flex items-center justify-center gap-3 flex-wrap">
+                                  <span>No videos in this date group yet.</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleCreateNewProjectInDate(group.parentId)}
+                                    className="px-2.5 py-1 text-xs font-bold bg-[#8D4B00] text-white rounded-md inline-flex items-center gap-1 cursor-pointer"
+                                  >
+                                    <Plus className="w-3 h-3" />
+                                    <span>Add Video</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setScanModalOpen(true)}
+                                    className="px-2.5 py-1 text-xs font-semibold bg-white border border-stone-200 text-stone-700 rounded-md inline-flex items-center gap-1 hover:border-amber-300 cursor-pointer"
+                                  >
+                                    <FolderSearch className="w-3 h-3 text-amber-700" />
+                                    <span>Scan Folders</span>
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          ) : (
+                            group.subprojects.map((p) => renderProjectRow(p))
+                          )
+                        )}
                       </React.Fragment>
                     );
                   })
@@ -1193,7 +1273,7 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
       <div className="h-9 px-6 bg-white border-t border-[#E7E4DC] flex items-center justify-between text-xs text-stone-500 shrink-0">
         <div className="flex items-center gap-3">
           <span>
-            Total: <strong>{projectsList.length}</strong> {projectsList.length === 1 ? 'project' : 'projects'}
+            Total: <strong>{videoProjects.length}</strong> {videoProjects.length === 1 ? 'project' : 'projects'}
           </span>
           {searchQuery && (
             <span className="text-amber-800 font-medium">

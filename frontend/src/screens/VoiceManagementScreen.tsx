@@ -49,6 +49,42 @@ export interface VoiceManagementScreenProps {
   initialGenderFilter?: string;
 }
 
+export function matchesGenderFilter(voice: any, genderFilter: string): boolean {
+  if (!genderFilter || genderFilter === 'all') return true;
+  const gen = String(voice?.gender || voice?.tuning_params?.gender || '').trim().toLowerCase();
+  if (gen) {
+    if (genderFilter === 'female') {
+      return gen === 'female' || gen === 'f' || gen === 'nữ' || gen === 'nu';
+    }
+    if (genderFilter === 'male') {
+      return gen === 'male' || gen === 'm' || gen === 'nam';
+    }
+    return true;
+  }
+
+  const haystack = [
+    voice?.name,
+    voice?.description,
+    voice?.external_voice_id,
+    voice?.tuning_params?.base_voice,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  if (genderFilter === 'female') {
+    return (
+      /(?:^|[\s(,/])(female|woman|girl|nữ|mai anh|rachel|sarah|alice|jessica|bella|lily|matilda|laura|ly|ngọc|ngoc|đoan|doan)(?:$|[\s),./])/i.test(haystack)
+    );
+  }
+  if (genderFilter === 'male') {
+    return (
+      /(?:^|[\s(,/])(male|man|boy|nam|roger|george|charlie|callum|harry|liam|will|eric|chris|brian|daniel|adam|bill|bình|binh|tuyên|tuyen|vĩnh|vinh)(?:$|[\s),./])/i.test(haystack)
+    );
+  }
+  return true;
+}
+
 export const VoiceManagementScreen: React.FC<VoiceManagementScreenProps> = ({
   initialTab = 'custom',
   initialGenderFilter = 'all',
@@ -82,8 +118,9 @@ export const VoiceManagementScreen: React.FC<VoiceManagementScreenProps> = ({
   const [editingName, setEditingName] = useState('');
   const [editingDesc, setEditingDesc] = useState('');
 
-  // Delete Confirmation
+  // Delete Confirmation & Library Errors
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [libraryError, setLibraryError] = useState<string | null>(null);
 
   // Audition Coordinator
   const { isKeyPlaying, isKeyLoading, stop: stopAudition } = useVoiceAudition();
@@ -142,6 +179,7 @@ export const VoiceManagementScreen: React.FC<VoiceManagementScreenProps> = ({
   }, [customVoices, presetVoices, selectedLabVoiceId]);
 
   const handleStartEdit = (v: CustomVoice) => {
+    setLibraryError(null);
     setEditingVoiceId(v.id);
     setEditingName(v.name);
     setEditingDesc(v.description || '');
@@ -149,19 +187,25 @@ export const VoiceManagementScreen: React.FC<VoiceManagementScreenProps> = ({
 
   const handleSaveEdit = async (voiceId: string) => {
     const clean = editingName.trim();
-    if (!clean) return;
+    if (!clean) {
+      setLibraryError('Voice name cannot be empty.');
+      return;
+    }
+    setLibraryError(null);
     try {
       await updateVoice(voiceId, {
         name: clean,
         description: editingDesc.trim(),
       });
       setEditingVoiceId(null);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to update voice:', err);
+      setLibraryError(err instanceof Error ? err.message : 'Failed to update voice.');
     }
   };
 
   const handleDeleteCustomVoice = async (voiceId: string) => {
+    setLibraryError(null);
     try {
       await deleteVoice(voiceId, false);
       setConfirmDeleteId(null);
@@ -173,8 +217,9 @@ export const VoiceManagementScreen: React.FC<VoiceManagementScreenProps> = ({
       if (selectedLabVoiceId === voiceId) {
         setSelectedLabVoiceId('');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to delete voice:', err);
+      setLibraryError(err instanceof Error ? err.message : 'Failed to delete voice.');
     }
   };
 
@@ -218,17 +263,20 @@ export const VoiceManagementScreen: React.FC<VoiceManagementScreenProps> = ({
       const targetLanguage = customMatch?.language ?? storeLanguage;
 
       const targetVoice = customMatch ? customMatch.id : selectedLabVoiceId;
+      const isVieNeuTarget = targetProvider === 2;
       const ttsRes = await previewTTS({
         text: testPhrase.trim(),
         voice: targetVoice,
         provider: targetProvider,
         language: targetLanguage,
         speed: testSpeed,
-        style: labStyle,
-        tuningParams: {
+        ...(isVieNeuTarget ? {
           style: labStyle,
-          temperature: labTemperature,
-        },
+          tuningParams: {
+            style: labStyle,
+            temperature: labTemperature,
+          },
+        } : {}),
         force_refresh: true,
       });
       const generatedAudioUrl = ttsRes.preview_url || ttsRes.audio_url;
@@ -285,9 +333,10 @@ export const VoiceManagementScreen: React.FC<VoiceManagementScreenProps> = ({
       }
       if (providerFilter !== 'all' && String(v.provider) !== providerFilter) return false;
       if (languageFilter !== 'all' && v.language && !v.language.toLowerCase().includes(languageFilter.toLowerCase())) return false;
+      if (!matchesGenderFilter(v, genderFilter)) return false;
       return true;
     });
-  }, [customVoices, kindFilter, search, providerFilter, languageFilter]);
+  }, [customVoices, kindFilter, search, providerFilter, languageFilter, genderFilter]);
 
   const allFilteredCustomSelected =
     filteredCustomVoices.length > 0 && filteredCustomVoices.every((v) => selectedVoiceIds.has(v.id));
@@ -318,6 +367,7 @@ export const VoiceManagementScreen: React.FC<VoiceManagementScreenProps> = ({
   const handleBulkDeleteCustomVoices = async () => {
     if (selectedVoiceIds.size === 0) return;
     setIsBulkDeleting(true);
+    setLibraryError(null);
     try {
       const idsToDelete = Array.from(selectedVoiceIds);
       await deleteVoices(idsToDelete);
@@ -326,8 +376,9 @@ export const VoiceManagementScreen: React.FC<VoiceManagementScreenProps> = ({
       }
       setSelectedVoiceIds(new Set());
       setConfirmBulkDeleteOpen(false);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to bulk delete voices:', err);
+      setLibraryError(err instanceof Error ? err.message : 'Failed to bulk delete voices.');
     } finally {
       setIsBulkDeleting(false);
     }
@@ -340,36 +391,7 @@ export const VoiceManagementScreen: React.FC<VoiceManagementScreenProps> = ({
         return false;
       }
       if (providerFilter !== 'all' && String(v.provider) !== providerFilter) return false;
-      if (genderFilter !== 'all') {
-        const gen = (v.gender || '').toLowerCase();
-        const name = v.name.toLowerCase();
-        if (genderFilter === 'female') {
-          const isFemale =
-            gen === 'female' ||
-            gen === 'f' ||
-            (!gen &&
-              (name.includes('female') ||
-                name.includes('girl') ||
-                name.includes('woman') ||
-                name.includes('mai anh') ||
-                name.includes('rachel') ||
-                name.includes('sarah')));
-          if (!isFemale) return false;
-        }
-        if (genderFilter === 'male') {
-          const isMale =
-            gen === 'male' ||
-            gen === 'm' ||
-            (!gen &&
-              (name.includes('male') ||
-                name.includes('man') ||
-                name.includes('boy') ||
-                name.includes('nam') ||
-                name.includes('roger') ||
-                name.includes('george')));
-          if (!isMale) return false;
-        }
-      }
+      if (!matchesGenderFilter(v, genderFilter)) return false;
       return true;
     });
   }, [presetVoices, search, providerFilter, genderFilter]);
@@ -599,6 +621,26 @@ export const VoiceManagementScreen: React.FC<VoiceManagementScreenProps> = ({
 
           {/* Voice List Content */}
           <div className="flex-1 overflow-y-auto p-4 space-y-3">
+            {libraryError && (
+              <div
+                role="alert"
+                data-testid="voice-library-error"
+                className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-center justify-between gap-2"
+              >
+                <div className="flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>{libraryError}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setLibraryError(null)}
+                  className="p-0.5 rounded hover:bg-rose-100 text-rose-600 cursor-pointer"
+                  aria-label="Dismiss error"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
             {/* 1. Custom Voices Section */}
             {(activeTab === 'custom' || activeTab === 'all') && (
               <div className="space-y-2">
@@ -1023,24 +1065,36 @@ export const VoiceManagementScreen: React.FC<VoiceManagementScreenProps> = ({
                 className="w-full text-xs px-2.5 py-1.5 bg-white rounded-lg border border-amber-200 text-stone-900 font-bold focus:outline-none focus:border-[#8D4B00] cursor-pointer shadow-2xs"
               >
                 {!selectedLabVoiceId && <option value="">Select a voice to test...</option>}
-                {filteredCustomVoices.length > 0 && (
-                  <optgroup label="Custom Cloned Voices">
-                    {filteredCustomVoices.map((cv) => (
-                      <option key={cv.id} value={cv.id}>
-                        {cv.name} ({cv.kind === 'design' ? 'Designed' : 'Cloned'})
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
-                {filteredPresetVoices.length > 0 && (
-                  <optgroup label="Preset Voices">
-                    {filteredPresetVoices.map((pv) => (
-                      <option key={pv.id} value={pv.id}>
-                        {pv.name}
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
+                {(() => {
+                  const labCustomVoices = genderFilter === 'all'
+                    ? customVoices
+                    : customVoices.filter((cv) => matchesGenderFilter(cv, genderFilter));
+                  const labPresetVoices = genderFilter === 'all'
+                    ? presetVoices
+                    : presetVoices.filter((pv) => matchesGenderFilter(pv, genderFilter));
+                  return (
+                    <>
+                      {labCustomVoices.length > 0 && (
+                        <optgroup label="Custom Cloned Voices">
+                          {labCustomVoices.map((cv) => (
+                            <option key={cv.id} value={cv.id}>
+                              {cv.name} ({cv.kind === 'design' ? 'Designed' : 'Cloned'})
+                            </option>
+                          ))}
+                        </optgroup>
+                      )}
+                      {labPresetVoices.length > 0 && (
+                        <optgroup label="Preset Voices">
+                          {labPresetVoices.map((pv) => (
+                            <option key={pv.id} value={pv.id}>
+                              {pv.name}
+                            </option>
+                          ))}
+                        </optgroup>
+                      )}
+                    </>
+                  );
+                })()}
               </select>
 
               <div className="text-[10px] text-stone-500">
@@ -1078,76 +1132,81 @@ export const VoiceManagementScreen: React.FC<VoiceManagementScreenProps> = ({
                 placeholder="Type or paste any test sentence to evaluate voice pronunciation and tone..."
                 className="w-full text-xs p-2.5 bg-stone-50 rounded-xl border border-stone-200 focus:bg-white focus:outline-none focus:border-[#8D4B00] transition-colors"
               />
-              {/* Emotion Tag Shortcuts */}
-              <div className="flex items-center gap-1.5 flex-wrap pt-1">
-                <span className="text-[10px] text-stone-400 font-medium">Emotion tags:</span>
-                <button
-                  type="button"
-                  onClick={() => setTestPhrase((prev) => `${prev.trim()} [cười] `)}
-                  className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 transition-colors cursor-pointer"
-                >
-                  + [cười]
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setTestPhrase((prev) => `${prev.trim()} [thở dài] `)}
-                  className="px-2 py-0.5 rounded text-[10px] font-semibold bg-sky-50 text-sky-700 border border-sky-200 hover:bg-sky-100 transition-colors cursor-pointer"
-                >
-                  + [thở dài]
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setTestPhrase((prev) => `${prev.trim()} [hắng giọng] `)}
-                  className="px-2 py-0.5 rounded text-[10px] font-semibold bg-purple-50 text-purple-700 border border-purple-200 hover:bg-purple-100 transition-colors cursor-pointer"
-                >
-                  + [hắng giọng]
-                </button>
-              </div>
+              {/* Emotion Tag Shortcuts (VieNeu only) */}
+              {(selectedVoiceMeta?.provider ?? storeProvider) === 2 && (
+                <div className="flex items-center gap-1.5 flex-wrap pt-1" data-testid="lab-vieneu-emotion-tags">
+                  <span className="text-[10px] text-stone-400 font-medium">Emotion tags:</span>
+                  <button
+                    type="button"
+                    onClick={() => setTestPhrase((prev) => `${prev.trim()} [cười] `)}
+                    className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 transition-colors cursor-pointer"
+                  >
+                    + [cười]
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setTestPhrase((prev) => `${prev.trim()} [thở dài] `)}
+                    className="px-2 py-0.5 rounded text-[10px] font-semibold bg-sky-50 text-sky-700 border border-sky-200 hover:bg-sky-100 transition-colors cursor-pointer"
+                  >
+                    + [thở dài]
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setTestPhrase((prev) => `${prev.trim()} [hắng giọng] `)}
+                    className="px-2 py-0.5 rounded text-[10px] font-semibold bg-purple-50 text-purple-700 border border-purple-200 hover:bg-purple-100 transition-colors cursor-pointer"
+                  >
+                    + [hắng giọng]
+                  </button>
+                </div>
+              )}
             </div>
 
-            {/* Speaking Style (VieNeu) */}
-            <div className="space-y-1 bg-stone-50 p-2.5 rounded-xl border border-stone-200">
-              <div className="flex items-center justify-between text-xs font-semibold text-stone-700">
-                <div className="flex items-center gap-1">
-                  <Sliders className="w-3.5 h-3.5 text-stone-400" />
-                  <span>VieNeu Speaking Style</span>
+            {/* Speaking Style & Expressiveness (VieNeu only) */}
+            {(selectedVoiceMeta?.provider ?? storeProvider) === 2 && (
+              <>
+                <div className="space-y-1 bg-stone-50 p-2.5 rounded-xl border border-stone-200" data-testid="lab-vieneu-style-control">
+                  <div className="flex items-center justify-between text-xs font-semibold text-stone-700">
+                    <div className="flex items-center gap-1">
+                      <Sliders className="w-3.5 h-3.5 text-stone-400" />
+                      <span>VieNeu Speaking Style</span>
+                    </div>
+                  </div>
+                  <select
+                    value={labStyle}
+                    onChange={(e) => setLabStyle(e.target.value as any)}
+                    className="w-full text-xs px-2 py-1.5 bg-white rounded-lg border border-stone-200 text-stone-800 font-medium focus:outline-none focus:border-[#8D4B00] cursor-pointer"
+                  >
+                    <option value="tu_nhien">Tự nhiên (Natural Dialogue)</option>
+                    <option value="tin_tuc">Tin tức (News Broadcast)</option>
+                    <option value="doc_truyen">Đọc truyện (Storytelling / Drama)</option>
+                  </select>
                 </div>
-              </div>
-              <select
-                value={labStyle}
-                onChange={(e) => setLabStyle(e.target.value as any)}
-                className="w-full text-xs px-2 py-1.5 bg-white rounded-lg border border-stone-200 text-stone-800 font-medium focus:outline-none focus:border-[#8D4B00] cursor-pointer"
-              >
-                <option value="tu_nhien">Tự nhiên (Natural Dialogue)</option>
-                <option value="tin_tuc">Tin tức (News Broadcast)</option>
-                <option value="doc_truyen">Đọc truyện (Storytelling / Drama)</option>
-              </select>
-            </div>
 
-            {/* Expressiveness (Temperature) */}
-            <div className="space-y-1 bg-stone-50 p-2.5 rounded-xl border border-stone-200">
-              <div className="flex items-center justify-between text-xs font-semibold text-stone-700">
-                <div className="flex items-center gap-1">
-                  <Sliders className="w-3.5 h-3.5 text-stone-400" />
-                  <span>Expressiveness (Temp)</span>
+                <div className="space-y-1 bg-stone-50 p-2.5 rounded-xl border border-stone-200" data-testid="lab-vieneu-temp-control">
+                  <div className="flex items-center justify-between text-xs font-semibold text-stone-700">
+                    <div className="flex items-center gap-1">
+                      <Sliders className="w-3.5 h-3.5 text-stone-400" />
+                      <span>Expressiveness (Temp)</span>
+                    </div>
+                    <span className="font-mono text-[11px] text-[#8D4B00] font-bold">{labTemperature.toFixed(2)}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0.5"
+                    max="1.2"
+                    step="0.05"
+                    value={labTemperature}
+                    onChange={(e) => setLabTemperature(parseFloat(e.target.value))}
+                    className="w-full h-1 bg-stone-200 rounded-lg appearance-none cursor-pointer accent-[#8D4B00]"
+                  />
+                  <div className="flex items-center justify-between text-[9px] text-stone-400">
+                    <span>0.5 Calm</span>
+                    <span>0.8 Normal</span>
+                    <span>1.2 Expressive</span>
+                  </div>
                 </div>
-                <span className="font-mono text-[11px] text-[#8D4B00] font-bold">{labTemperature.toFixed(2)}</span>
-              </div>
-              <input
-                type="range"
-                min="0.5"
-                max="1.2"
-                step="0.05"
-                value={labTemperature}
-                onChange={(e) => setLabTemperature(parseFloat(e.target.value))}
-                className="w-full h-1 bg-stone-200 rounded-lg appearance-none cursor-pointer accent-[#8D4B00]"
-              />
-              <div className="flex items-center justify-between text-[9px] text-stone-400">
-                <span>0.5 Calm</span>
-                <span>0.8 Normal</span>
-                <span>1.2 Expressive</span>
-              </div>
-            </div>
+              </>
+            )}
 
             {/* Speed / Pace Slider */}
             <div className="space-y-1 bg-stone-50 p-2.5 rounded-xl border border-stone-200">

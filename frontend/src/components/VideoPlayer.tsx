@@ -24,8 +24,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const [dubPlaybackError, setDubPlaybackError] = useState<string | null>(null);
 
   const project = useDubDubStore((s) => s.project);
+  const languages = useDubDubStore((s) => s.languages);
   const playback = useDubDubStore((s) => s.playback);
-  const activeSegmentId = useDubDubStore((s) => s.activeSegmentId);
   const segments = useDubDubStore((s) => s.segments);
   const subtitleStyles = useDubDubStore((s) => s.subtitleStyles);
   const editVideo = useDubDubStore((s) => s.editVideo);
@@ -38,24 +38,39 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const seekRequest = useDubDubStore((s) => s.playback.seekRequest);
   const playbackSpeed = useDubDubStore((s) => s.playback.playbackSpeed);
 
-  const currentSegment = segments.find((s) => s.id === activeSegmentId) || segments[0];
+  const hasDubPreviews = segments.some((s) => Boolean(s.previewAudioUrl));
+  const currentSegment =
+    segments.find((s) => playback.currentTime >= s.startSec && playback.currentTime <= s.endSec) ?? null;
   const previewUrl = project.previewUrl || '';
+  const sourceCode = (languages?.source?.code ? String(languages.source.code).split('-')[0] : 'SRC').toUpperCase();
+  const targetCode = (languages?.target?.code ? String(languages.target.code).split('-')[0] : 'DUB').toUpperCase();
+  const isOrigChannel = playback.audioChannel === 'orig';
 
-  // Synchronize audio mix and volume
+  // Synchronize audio mix and channel selection
   useEffect(() => {
     if (!videoRef.current) return;
     if (currentStep === 3) {
-      videoRef.current.muted = true;
-      videoRef.current.volume = 0;
+      videoRef.current.muted = !isOrigChannel;
+      videoRef.current.volume = isOrigChannel ? 1 : 0;
+    } else if (currentStep === 2) {
+      const muteForDub = !isOrigChannel && hasDubPreviews;
+      videoRef.current.muted = muteForDub;
+      videoRef.current.volume = muteForDub ? 0 : 1;
     } else if (currentStep === 4 && editVideo?.audioMix) {
-      const origVol = Number(editVideo.audioMix.original) || 0;
-      videoRef.current.volume = Math.max(0, Math.min(1, origVol / 100));
-      videoRef.current.muted = origVol === 0;
+      if (isOrigChannel) {
+        videoRef.current.muted = false;
+        videoRef.current.volume = 1;
+      } else {
+        const origVol = Number(editVideo.audioMix.original) || 0;
+        videoRef.current.volume = Math.max(0, Math.min(1, origVol / 100));
+        videoRef.current.muted = origVol === 0;
+      }
     }
-  }, [currentStep, editVideo?.audioMix]);
+  }, [currentStep, editVideo?.audioMix, isOrigChannel, hasDubPreviews]);
 
   useEffect(() => {
-    if ((currentStep !== 3 && currentStep !== 4) || typeof Audio === 'undefined') return;
+    const shouldMountDubAudio = currentStep === 3 || currentStep === 4 || (currentStep === 2 && hasDubPreviews);
+    if (!shouldMountDubAudio || typeof Audio === 'undefined') return;
     dubAudioRef.current = new Audio();
     dubAudioRef.current.onerror = () => setDubPlaybackError('Generated dubbing audio could not be loaded. Regenerate its preview.');
     return () => {
@@ -64,13 +79,19 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       dubAudioRef.current = null;
       setDubPlaybackError(null);
     };
-  }, [currentStep, assembledDubUrl]);
+  }, [currentStep, assembledDubUrl, hasDubPreviews]);
 
   useEffect(() => {
-    if (dubAudioRef.current && currentStep === 4) {
+    if (!dubAudioRef.current) return;
+    if (isOrigChannel) {
+      dubAudioRef.current.volume = 0;
+      dubAudioRef.current.pause();
+    } else if (currentStep === 4) {
       dubAudioRef.current.volume = Math.max(0, Math.min(1, Number(editVideo?.audioMix?.dubbed || 0) / 100));
+    } else {
+      dubAudioRef.current.volume = 1;
     }
-  }, [currentStep, editVideo?.audioMix?.dubbed]);
+  }, [currentStep, editVideo?.audioMix?.dubbed, isOrigChannel]);
 
   useEffect(() => {
     if (dubAudioRef.current) dubAudioRef.current.playbackRate = playbackSpeed || 1.0;
@@ -79,7 +100,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const syncDubAudio = () => {
     const video = videoRef.current;
     const audio = dubAudioRef.current;
-    if ((currentStep !== 3 && currentStep !== 4) || !video || !audio) return;
+    if (!video || !audio) return;
+    const shouldPlayDub = currentStep === 3 || currentStep === 4 || (currentStep === 2 && hasDubPreviews);
+    if (!shouldPlayDub || isOrigChannel) {
+      audio.pause();
+      return;
+    }
     if (currentStep === 4) {
       if (!assembledDubUrl || video.paused || Number(editVideo?.audioMix?.dubbed || 0) <= 0) {
         audio.pause();
@@ -93,10 +119,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       ));
       return;
     }
-    const segments = useDubDubStore.getState().segments || [];
-    const segment = segments.find((item, index) => {
+    const curSegments = useDubDubStore.getState().segments || [];
+    const segment = curSegments.find((item, index) => {
       if (!item.previewAudioUrl) return false;
-      const nextSeg = segments.slice(index + 1).find((s) => typeof s.startSec === 'number' && s.startSec > item.startSec);
+      const nextSeg = curSegments.slice(index + 1).find((s) => typeof s.startSec === 'number' && s.startSec > item.startSec);
       const effectiveEnd = nextSeg && typeof nextSeg.startSec === 'number'
         ? Math.min(Math.max(item.endSec, nextSeg.startSec - 0.03), Math.max(item.startSec, nextSeg.startSec - 0.03))
         : (item.endSec + 3.0);
@@ -119,6 +145,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       ));
     }
   };
+
+  useEffect(() => {
+    syncDubAudio();
+  }, [playback.audioChannel]);
 
   // Synchronize seek & play commands from store
   useEffect(() => {
@@ -268,7 +298,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 }`}
                 onClick={() => setAudioChannel('orig')}
               >
-                EN Orig
+                {sourceCode} Orig
               </button>
               <button
                 className={`px-2 py-0.5 rounded transition-colors ${
@@ -278,7 +308,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 }`}
                 onClick={() => setAudioChannel('dub')}
               >
-                ES Dub ★
+                {targetCode} Dub ★
               </button>
             </div>
           )}
@@ -300,11 +330,16 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             data-source-preview="true"
             className="w-full h-full object-contain bg-black"
             src={previewUrl}
-            muted={currentStep === 3}
+            muted={currentStep === 3 && playback.audioChannel !== 'orig'}
             controls
             preload="metadata"
             onTimeUpdate={handleTimeUpdate}
-            onSeeked={syncDubAudio}
+            onSeeked={() => {
+              if (videoRef.current) {
+                updatePlaybackTime(videoRef.current.currentTime, videoRef.current.duration);
+              }
+              syncDubAudio();
+            }}
             onLoadedMetadata={handleTimeUpdate}
             onPlay={handlePlay}
             onPause={handlePause}
@@ -318,7 +353,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         )}
 
         {/* Subtitles Overlay */}
-        {subtitleVariant !== 'none' && subtitlesVisible && (
+        {subtitleVariant !== 'none' && subtitlesVisible && currentSegment && (currentSegment.targetText || currentSegment.sourceText) && (
           <div className="absolute inset-x-3 bottom-4 z-20 flex justify-center text-center pointer-events-none">
             {subtitleVariant === 'capcut' ? (
               <div className="w-full max-w-2xl px-4 py-1 flex flex-col items-center">

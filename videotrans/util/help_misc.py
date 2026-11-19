@@ -75,42 +75,60 @@ def shutdown_system():
 def is_novoice_mp4(novoice_mp4, noextname, uuid=None, *, event_sink=None, cancellation_token=None):
     # Pre-created
     # Check if novoice_mp4 is completed
-    t = 0
     job_uuid = uuid or noextname
 
-    if cancellation_token and cancellation_token.is_cancelled():
+    def _is_aborted() -> bool:
+        if app_cfg.exit_soft:
+            return True
+        if cancellation_token is not None:
+            return bool(cancellation_token.is_cancelled())
+        return bool(noextname and noextname in app_cfg.stoped_uuid_set)
+
+    if _is_aborted():
         return False
 
-    if noextname not in app_cfg.queue_novice and vail_file(novoice_mp4):
+    status = app_cfg.queue_novice.get(noextname)
+    if status is None and vail_file(novoice_mp4):
         return True
-    if noextname in app_cfg.queue_novice and app_cfg.queue_novice[noextname] == 'end':
+    if status == 'end':
         return True
+    if status == 'cancelled':
+        return False
+    if isinstance(status, str) and status.startswith('error:'):
+        raise RuntimeError(f"{noextname} split no voice {status}")
+
+    start_t = time.monotonic()
+    last_emit_t = None
     last_size = 0
     while True:
-        if cancellation_token and cancellation_token.is_cancelled():
+        if _is_aborted():
             return False
-        if app_cfg.current_status != 'ing' or app_cfg.exit_soft:
+        if noextname not in app_cfg.queue_novice:
+            raise RuntimeError(f"{noextname} split no voice videoerror-1")
+        status = app_cfg.queue_novice[noextname]
+        if status == 'end':
+            return True
+        if status == 'cancelled':
             return False
+        if isinstance(status, str) and status.startswith('error:'):
+            raise RuntimeError(f"{noextname} split no voice {status}")
+
         if vail_file(novoice_mp4):
             current_size = os.path.getsize(novoice_mp4)
-            if 0 < last_size == current_size and t > 1200:
+            if 0 < last_size == current_size and (time.monotonic() - start_t) > 1200:
                 return True
             last_size = current_size
 
-        if noextname not in app_cfg.queue_novice:
-            raise RuntimeError(f"{noextname} split no voice videoerror-1")
-        if app_cfg.queue_novice[noextname].startswith('error:'):
-            raise RuntimeError(f"{noextname} split no voice {app_cfg.queue_novice[noextname]}")
-
-        if app_cfg.queue_novice[noextname] == 'ing':
-            size = f'{round(last_size / 1024 / 1024, 2)}MB' if last_size > 0 else ""
-            msg = f"{noextname} {tr('spilt audio and video')} {size}"
-            if event_sink:
+        if status == 'ing':
+            now = time.monotonic()
+            if event_sink and (last_emit_t is None or (now - last_emit_t) >= 1.0):
+                size = f'{round(last_size / 1024 / 1024, 2)}MB' if last_size > 0 else ""
+                msg = f"{noextname} {tr('spilt audio and video')} {size}"
                 event_sink({"uuid": job_uuid, "text": msg, "action": "novoice_wait"})
-            time.sleep(1)
-            t += 1
+                last_emit_t = now
+            time.sleep(0.2)
             continue
-        return True
+        return False
 
 
 # Process string with MD5 hashing

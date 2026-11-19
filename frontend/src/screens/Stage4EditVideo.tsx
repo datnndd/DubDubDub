@@ -1,4 +1,4 @@
-import React, { useRef } from 'react';
+import React, { useRef, useEffect } from 'react';
 import { useDubDubStore } from '../store';
 import { VideoPlayer } from '../components/VideoPlayer';
 import {
@@ -20,6 +20,7 @@ import {
 export const Stage4EditVideo: React.FC = () => {
   const bgmInputRef = useRef<HTMLInputElement | null>(null);
   const thumbInputRef = useRef<HTMLInputElement | null>(null);
+  const bgmAudioRef = useRef<HTMLAudioElement | null>(null);
 
   const segments = useDubDubStore((s) => s.segments);
   const project = useDubDubStore((s) => s.project);
@@ -43,6 +44,51 @@ export const Stage4EditVideo: React.FC = () => {
   const activeTab = editVideo.activeTab || 'audio';
   const duration = project.durationSec || 1;
   const playheadPercent = Math.min(100, Math.max(0, (playback.currentTime / duration) * 100));
+  const bgmUrl = editVideo.backgroundAudio?.url || '';
+  const bgmMixPercent = Number(editVideo.audioMix?.background ?? 0);
+
+  useEffect(() => {
+    const audio = bgmAudioRef.current;
+    if (!audio) return;
+    if (!bgmUrl) {
+      audio.pause();
+      return;
+    }
+    const clampedVol = Math.max(0, Math.min(1, bgmMixPercent / 100));
+    audio.volume = clampedVol;
+    audio.muted = clampedVol <= 0;
+    audio.playbackRate = playback.playbackSpeed || 1.0;
+
+    if (playback.isPlaying && clampedVol > 0) {
+      if (Number.isFinite(audio.duration) && audio.duration > 0) {
+        const expectedTime = playback.currentTime % audio.duration;
+        if (Math.abs(audio.currentTime - expectedTime) > 0.35) {
+          audio.currentTime = expectedTime;
+        }
+      }
+      if (audio.paused) {
+        audio.play().catch(() => {});
+      }
+    } else {
+      audio.pause();
+    }
+  }, [bgmUrl, bgmMixPercent, playback.isPlaying, playback.playbackSpeed, playback.currentTime]);
+
+  useEffect(() => {
+    const audio = bgmAudioRef.current;
+    if (!audio || !bgmUrl || !playback.seekRequest) return;
+    if (Number.isFinite(audio.duration) && audio.duration > 0) {
+      audio.currentTime = playback.seekRequest.time % audio.duration;
+    } else {
+      audio.currentTime = playback.seekRequest.time;
+    }
+  }, [bgmUrl, playback.seekRequest]);
+
+  useEffect(() => {
+    return () => {
+      bgmAudioRef.current?.pause();
+    };
+  }, []);
 
   const handleBgmChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -80,6 +126,18 @@ export const Stage4EditVideo: React.FC = () => {
         className="hidden"
         onChange={handleThumbChange}
       />
+      <audio
+        id="stage4-bgm-preview"
+        ref={bgmAudioRef}
+        src={bgmUrl || undefined}
+        loop
+        className="hidden"
+      />
+      {editVideo.error && (
+        <div role="alert" data-testid="stage4-error-alert" className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs text-rose-800 shrink-0">
+          {editVideo.error}
+        </div>
+      )}
 
       {/* UPPER DECK: Preview (7-8 cols) and Inspector (4-5 cols) */}
       <section className="flex-1 min-h-0 w-full grid grid-cols-12 gap-2.5 overflow-hidden">
@@ -406,7 +464,6 @@ export const Stage4EditVideo: React.FC = () => {
                       <span className="text-xs font-semibold">Upload Background Music</span>
                     </button>
                   )}
-                  <audio id="stage4-bgm-preview" src={editVideo.backgroundAudio?.url} className="hidden" />
                 </div>
 
                 {/* Thumbnail Upload & Preview */}

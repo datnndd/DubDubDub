@@ -33,27 +33,56 @@ class RecognMixin:
             if not roi:
                 raise SpeechToTextError(tr("No ROI configured for video OCR"))
             self.signal(text=tr("Hard-subtitle OCR scanning"))
+            from videotrans.core.proc_registry import get_current_job_id
+
+            ocr_opts = getattr(self.cfg, "ocr_options", None) or {}
+            coarse_interval_ms = int(ocr_opts.get("coarse_interval_ms", 500) or 500)
+            use_angle_cls = bool(ocr_opts.get("use_angle_cls", False))
+            paragraph_mode = str(ocr_opts.get("paragraph_mode") or "preserve_lines")
+            job_id = get_current_job_id() or self.uuid
+
+            def _emit_ocr_progress(p: dict) -> None:
+                self.signal(
+                    text=p.get("latest_text", ""),
+                    type="ocr_progress",
+                    progress=p.get("percent"),
+                    percent=p.get("percent"),
+                    timestamp_ms=p.get("timestamp_ms"),
+                    duration_ms=p.get("duration_ms"),
+                    segments=p.get("segments"),
+                    ocr_calls=p.get("ocr_calls"),
+                    skipped_frames=p.get("skipped_frames"),
+                    device=p.get("device"),
+                )
+
             srt_items, segments = scan_video_to_srt(
                 self.cfg.name,
                 roi=roi,
                 language=self.cfg.detect_language,
                 device="cuda" if self.cfg.is_cuda else "cpu",
                 checkpoint_path=f"{self.cfg.cache_folder}/ocr_ckpt.json",
-                on_progress=lambda p: self.signal(text=p.get("latest_text",""), type="ocr_progress"),
+                progress_callback=_emit_ocr_progress,
+                stop_event=self._exit,
+                job_id=job_id,
                 duration_ms=self.video_time,
-                coarse_interval_ms=500,
+                coarse_interval_ms=coarse_interval_ms,
+                use_angle_cls=use_angle_cls,
+                paragraph_mode=paragraph_mode,
             )
             if self._exit(): return
             if not srt_items:
                 raise SpeechToTextError(self.cfg.basename + tr("OCR found no subtitles"))
             self._save_srt_target(srt_items, self.cfg.source_sub)
             self.source_srt_list = srt_items
+            self.asr_duration = round(time.time() - _st, 2)
+            logger.debug(f'[视频OCR识别阶段结束耗时]:{self.asr_duration}s')
             self._recogn_succeed()
             return
         if vail_file(self.cfg.source_sub) and not self.cfg.force_recogn:
             self.source_srt_list = get_subtitle_from_srt(self.cfg.source_sub, is_file=True)
             if Path(self.cfg.target_dir + "/speaker.json").exists():
                 shutil.copy2(self.cfg.target_dir + "/speaker.json", self.cfg.cache_folder + "/speaker.json")
+            self.asr_duration = round(time.time() - _st, 2)
             self._recogn_succeed()
             return
 
@@ -112,7 +141,8 @@ class RecognMixin:
         self._save_srt_target(raw_subtitles, self.cfg.source_sub)
         self.source_srt_list = raw_subtitles
 
-        if self.cfg.fix_punc==1 and self.cfg.detect_language[:2] in ['zh', 'en']:
+        detect_lang_prefix = (self.cfg.detect_language or "")[:2].lower()
+        if self.cfg.fix_punc==1 and detect_lang_prefix in ['zh', 'en']:
             try:
                 down_file_from_hf(f'{ROOT_DIR}/models/puntc', PUNC_RESTORE_MS if not is_connect_hf() else PUNC_RESTORE_HF, callback=self._process_callback)
                 from videotrans.process.prepare_audio import fix_punc
@@ -126,7 +156,7 @@ class RecognMixin:
                     text_dict_obj=json.loads(Path(text_dict_file).read_text(encoding='utf-8'))
                     for it in self.source_srt_list:
                         it['text'] = text_dict_obj.get(f'{it["line"]}', it['text'])
-                        if self.cfg.detect_language[:2] == 'en':
+                        if detect_lang_prefix == 'en':
                             it['text'] = it['text'].replace('，', ',').replace('。', '. ').replace('？', '?').replace('！','!')
                     self._save_srt_target(self.source_srt_list, self.cfg.source_sub)
                 else:
@@ -136,6 +166,8 @@ class RecognMixin:
 
         self.signal(text=Path(self.cfg.source_sub).read_text(encoding='utf-8'), type='replace_subtitle')
         if Path(self.cfg.cache_folder + "/speaker.json").exists():
+            self.asr_duration = round(time.time() - _st, 2)
+            logger.debug(f'[语音识别阶段结束耗时]:{self.asr_duration}s')
             self._recogn_succeed()
             self.signal(text=tr('endtiquzimu'))
             return

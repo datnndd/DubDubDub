@@ -14,6 +14,7 @@ export interface Segment {
   sourceText: string;
   text?: string;
   targetText: string;
+  rawTranslation?: string;
   speakerColor?: string;
   voiceOverride?: string;
   previewAudioUrl?: string;
@@ -43,4 +44,22 @@ export interface OcrCropState {
   roi: [number, number, number, number]; // [x, y, width, height] normalized 0-1
   loading: boolean;
   error: string | null;
+}
+
+export type SubtitleSource = 'audio_asr' | 'video_ocr';
+
+export interface OcrOptions {
+  coarseIntervalMs: number;
+  useAngleCls: boolean;
+  paragraphMode: 'preserve_lines' | 'unwrap';
+}
+
+export interface Stage1OcrTestState {
+  loading: boolean;
+  error: string | null;
+  text: string | null;
+  confidence?: number;
+  startSec?: number;
+  endSec?: number;
+  entries?: OcrSubtitleEntry[];
 }

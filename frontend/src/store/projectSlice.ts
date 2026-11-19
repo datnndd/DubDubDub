@@ -3,8 +3,22 @@ import type { ProjectRecord } from '../types/project';
 import type { Segment } from '../types/segment';
 import { fetchProjects, fetchProject, createProject, deleteProject as apiDeleteProject, bulkDeleteProjects, updateProjectState, resetProjectStage, fetchSubprojects } from '../api/projects';
 import { DEFAULT_EDIT_VIDEO, DEFAULT_SUBTITLE_STYLES } from './editVideoSlice';
+import { formatTimecode } from './playbackSlice';
+import { formatLocalDateYmd } from '../utils/date';
 
 let pendingProjectSave: Promise<void> = Promise.resolve();
+
+function normalizeSavedAsset(asset: any) {
+  if (!asset || typeof asset !== 'object') return null;
+  const cleanUrl = typeof asset.url === 'string' && !asset.url.startsWith('blob:') ? asset.url : '';
+  if (!asset.id && !cleanUrl) return null;
+  return {
+    id: String(asset.id || ''),
+    name: String(asset.name || ''),
+    url: cleanUrl,
+    file: null,
+  };
+}
 
 export type MainView = 'projects' | 'dubbing' | 'voices';
 
@@ -31,12 +45,12 @@ export interface ProjectSlice {
   setSessionDrawerOpen: (open: boolean) => void;
   setScanModalOpen: (open: boolean) => void;
   setBatchModeActive: (active: boolean) => void;
-  setSessionSubprojects: (projects: ProjectRecord[], parentId?: string, parentName?: string) => void;
+  setSessionSubprojects: (projects: ProjectRecord[], parentId?: string, parentName?: string, options?: { merge?: boolean }) => void;
   loadSubprojects: (parentId: string) => Promise<void>;
   switchSessionVideo: (projectId: string) => Promise<void>;
   loadProjects: () => Promise<void>;
-  selectProject: (id: string, autoNavigate?: boolean) => Promise<void>;
-  createNewProject: (name?: string, mediaId?: string, duration?: number, parentId?: string) => Promise<string>;
+  selectProject: (id: string, autoNavigate?: boolean, options?: { signal?: AbortSignal }) => Promise<void>;
+  createNewProject: (name?: string, mediaId?: string, duration?: number, parentId?: string, options?: { signal?: AbortSignal; initialState?: Record<string, any> }) => Promise<string>;
   openDateParentSession: (parentId: string, parentName?: string) => Promise<void>;
   deleteProjectById: (id: string) => Promise<void>;
   deleteProjectsByIds: (ids: string[]) => Promise<void>;
@@ -144,23 +158,39 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
   setSessionDrawerOpen: (open: boolean) => set({ sessionDrawerOpen: open }),
   setScanModalOpen: (open: boolean) => set({ scanModalOpen: open }),
   setBatchModeActive: (active: boolean) => set({ batchModeActive: active }),
-  setSessionSubprojects: (projects: ProjectRecord[], parentId?: string, parentName?: string) => {
-    set((state: any) => ({
-      sessionSubprojects: projects,
-      activeParentProjectId: parentId !== undefined ? parentId : state.activeParentProjectId,
-      activeParentProjectName: parentName !== undefined ? parentName : state.activeParentProjectName,
-      batchModeActive: projects.length > 0,
-    }));
+  setSessionSubprojects: (projects: ProjectRecord[], parentId?: string, parentName?: string, options?: { merge?: boolean }) => {
+    set((state: any) => {
+      let nextProjects = projects;
+      if (options?.merge) {
+        const merged = new Map<string, ProjectRecord>();
+        for (const existing of state.sessionSubprojects || []) {
+          if (existing?.id) merged.set(existing.id, existing);
+        }
+        for (const incoming of projects || []) {
+          if (incoming?.id) merged.set(incoming.id, incoming);
+        }
+        nextProjects = Array.from(merged.values());
+      }
+      return {
+        sessionSubprojects: nextProjects,
+        activeParentProjectId: parentId !== undefined ? parentId : state.activeParentProjectId,
+        activeParentProjectName: parentName !== undefined ? parentName : state.activeParentProjectName,
+        batchModeActive: nextProjects.length > 0,
+      };
+    });
   },
   loadSubprojects: async (parentId: string) => {
     try {
       const subs = await fetchSubprojects(parentId);
-      set({ sessionSubprojects: subs, activeParentProjectId: parentId });
+      if (Array.isArray(subs) && (subs.length > 0 || get().activeParentProjectId !== parentId)) {
+        set({ sessionSubprojects: subs, activeParentProjectId: parentId, batchModeActive: subs.length > 0 });
+      }
     } catch (e) {
       console.warn('Failed to load subprojects:', e);
     }
   },
   switchSessionVideo: async (projectId: string) => {
+    if (!projectId || projectId === get().activeProjectId) return;
     if (get().isCreateVoiceModalOpen) {
       set({ isCreateVoiceModalOpen: false });
     }
@@ -169,7 +199,16 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
     const pStatuses = get().projectJobStatuses || {};
     if (pStatuses[projectId]) {
       const ps = pStatuses[projectId];
+      const isRunningOrQueued = ps.status === 'running' || ps.status === 'queued';
       set({
+        activeJob: ps.jobId && isRunningOrQueued ? {
+          jobId: ps.jobId,
+          projectId,
+          stage: ps.stage || ps.status || 'running',
+          status: (ps.status as any) || 'idle',
+          progress: ps.progress ?? null,
+          message: ps.message || '',
+        } : null,
         jobStatus: ps.status || 'idle',
         jobProgress: ps.progress ?? null,
         jobMessage: ps.message || '',
@@ -177,6 +216,7 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
       });
     } else {
       set({
+        activeJob: null,
         jobStatus: 'idle',
         jobProgress: null,
         jobMessage: 'Ready to process',
@@ -194,9 +234,12 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
     }
   },
 
-  selectProject: async (id: string, autoNavigate: boolean = true) => {
+  selectProject: async (id: string, autoNavigate: boolean = true, options?: { signal?: AbortSignal }) => {
+    const signal = options?.signal;
+    if (signal?.aborted) return;
     try {
       const project = await fetchProject(id);
+      if (signal?.aborted) return;
       if (!project) {
         if (typeof localStorage !== 'undefined') {
           localStorage.removeItem('dubdub_active_project_id');
@@ -219,15 +262,18 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
 
       const projId = String(project?.id || id || '');
       if (stateData?.is_parent || (projId && projId.startsWith('parent_'))) {
+        if (signal?.aborted) return;
         set({ activeParentProjectId: projId, activeParentProjectName: project?.name || projId });
         try {
           const subs = await fetchSubprojects(projId);
+          if (signal?.aborted) return;
           set({ sessionSubprojects: subs, batchModeActive: subs.length > 0 });
           if (subs.length > 0) {
-            return await get().selectProject(subs[0].id, autoNavigate);
+            return await get().selectProject(subs[0].id, autoNavigate, options);
           }
         } catch (_) {}
       }
+      if (signal?.aborted) return;
 
       const targetStep = stateData?.currentStep || project.stage || 1;
       const mediaId = (project as any).media_id || stateData?.backend?.mediaId || null;
@@ -271,6 +317,25 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
       const isVoiceRunning = jobForThisProj?.stage === 'voice' && jobForThisProj?.status === 'running';
       const isVoiceCompleted = jobForThisProj?.stage === 'voice' && jobForThisProj?.status === 'completed';
       const resolvedDubbingStatus = isVoiceRunning ? 'running' : isVoiceCompleted ? 'completed' : (stateData?.dubbingStatus || 'idle');
+      const isRunningOrQueued = Boolean(
+        jobForThisProj?.jobId &&
+        (jobForThisProj.status === 'running' || jobForThisProj.status === 'queued')
+      );
+      const parentId = project?.parent_id || project?.parentId;
+      const isParentContainer = Boolean(stateData?.is_parent || (projId && projId.startsWith('parent_')));
+      const isInCurrentSession = (get().sessionSubprojects || []).some((s: any) => s?.id === id);
+      const shouldClearBatchSession = !parentId && !isParentContainer && !isInCurrentSession;
+
+      const fallbackDurSec = Number(project.duration || 0);
+      const savedDurSec = Number(stateData?.project?.durationSec || 0);
+      const resolvedDurSec = savedDurSec > 0 ? savedDurSec : fallbackDurSec;
+      const savedDurationStr = stateData?.project?.duration;
+      const resolvedDurationStr =
+        savedDurationStr && savedDurationStr !== '00:00.000'
+          ? savedDurationStr
+          : resolvedDurSec > 0
+          ? formatTimecode(resolvedDurSec)
+          : savedDurationStr || '00:00.000';
 
       set((state: any) => ({
         ...state,
@@ -282,6 +347,10 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
         drawerOpen: false,
         segments: normalizedSegments,
         ocrCrop: { active: false, segmentId: null, roi: stateData?.ocrCrop?.roi || [0.05, 0.75, 0.9, 0.2], loading: false, error: null },
+        subtitleSource: stateData?.subtitleSource === 'video_ocr' ? 'video_ocr' : 'audio_asr',
+        ocrRoiConfirmed: Boolean(stateData?.ocrRoiConfirmed),
+        ocrOptions: stateData?.ocrOptions || { coarseIntervalMs: 500, useAngleCls: false, paragraphMode: 'preserve_lines' },
+        stage1OcrTest: { loading: false, error: null, text: null },
         transcriptOptions: stateData?.transcriptOptions || null,
         selectedSegmentOption: stateData?.selectedSegmentOption || 'utterances',
         speakers: normalizedSpeakers,
@@ -289,6 +358,8 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
         segmentVoiceOverrides: mergedOverrides,
         dubbingStatus: resolvedDubbingStatus,
         dubbingError: null,
+        dubbingErrors: {},
+        failedSegmentIds: [],
         assemblingDubbing: false,
         assembledDubUrl: targetStep >= 4 ? `/api/projects/${encodeURIComponent(id)}/dubbing/audio` : null,
         tuning: stateData?.tuning || { pace: 1.0, timbreWarmth: 62, ducking: '85/15' },
@@ -297,11 +368,32 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
         forceAsr: Boolean(stateData?.forceAsr),
         stage3Baseline: stateData?.stage3Baseline || null,
         subtitleStyles: stateData?.subtitleStyles || { ...DEFAULT_SUBTITLE_STYLES },
-        editVideo: stateData?.editVideo ? { ...DEFAULT_EDIT_VIDEO, ...stateData.editVideo } : { ...DEFAULT_EDIT_VIDEO },
-        jobStatus: 'idle',
-        jobProgress: null,
-        jobStage: null,
-        jobMessage: 'Ready to process',
+        editVideo: stateData?.editVideo
+          ? {
+              ...DEFAULT_EDIT_VIDEO,
+              ...stateData.editVideo,
+              backgroundAudio: normalizeSavedAsset(stateData.editVideo.backgroundAudio),
+              thumbnail: normalizeSavedAsset(stateData.editVideo.thumbnail),
+            }
+          : { ...DEFAULT_EDIT_VIDEO },
+        activeJob: isRunningOrQueued ? {
+          jobId: jobForThisProj!.jobId!,
+          projectId: id,
+          stage: jobForThisProj!.stage || jobForThisProj!.status || 'running',
+          status: jobForThisProj!.status as any,
+          progress: jobForThisProj!.progress ?? null,
+          message: jobForThisProj!.message || '',
+        } : null,
+        jobStatus: jobForThisProj?.status || 'idle',
+        jobProgress: jobForThisProj?.progress ?? null,
+        jobStage: jobForThisProj?.stage || null,
+        jobMessage: jobForThisProj?.message || 'Ready to process',
+        ...(shouldClearBatchSession ? {
+          sessionSubprojects: [],
+          activeParentProjectId: null,
+          activeParentProjectName: null,
+          batchModeActive: false,
+        } : {}),
         backend: {
           ...state.backend,
           mediaId: mediaId,
@@ -324,8 +416,6 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
           format: '—',
           resolution: '—',
           fps: '—',
-          duration: '00:00.000',
-          durationSec: 0,
           fileSize: '—',
           videoCodec: '—',
           audioCodec: '—',
@@ -334,20 +424,40 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
           hasVideo: isVerified,
           lastSaved: 'Just now',
           ...(stateData?.project || {}),
+          duration: resolvedDurationStr,
+          durationSec: resolvedDurSec,
           previewUrl: resolvedPreviewUrl,
           verified: isVerified,
         },
+        playback: {
+          ...state.playback,
+          duration: resolvedDurSec,
+        },
       }));
 
-      const parentId = project?.parent_id || project?.parentId;
       if (parentId) {
-        set({ activeParentProjectId: parentId });
+        if (signal?.aborted) return;
+        set((state: any) => ({
+          activeParentProjectId: parentId,
+          ...(state.activeParentProjectId !== parentId ? { activeParentProjectName: null } : {}),
+        }));
         try {
           const subs = await fetchSubprojects(parentId);
-          set({ sessionSubprojects: subs, batchModeActive: subs.length > 0 });
+          if (signal?.aborted) return;
+          if (Array.isArray(subs) && subs.length > 0) {
+            set({ sessionSubprojects: subs, batchModeActive: true });
+          }
         } catch (_) {}
+      } else if (shouldClearBatchSession) {
+        set({
+          sessionSubprojects: [],
+          activeParentProjectId: null,
+          activeParentProjectName: null,
+          batchModeActive: false,
+        });
       }
-    } catch (err) {
+    } catch (err: any) {
+      if (signal?.aborted || err?.name === 'AbortError') return;
       console.error('Failed to select project:', err);
       if (typeof localStorage !== 'undefined') {
         localStorage.removeItem('dubdub_active_project_id');
@@ -356,29 +466,60 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
     }
   },
 
-  createNewProject: async (name: string = 'Untitled Video Project', mediaId?: string, duration?: number, parentId?: string) => {
+  createNewProject: async (
+    name: string = 'Untitled Video Project',
+    mediaId?: string,
+    duration?: number,
+    parentId?: string,
+    options?: { signal?: AbortSignal; initialState?: Record<string, any> }
+  ) => {
+    const signal = options?.signal;
+    if (signal?.aborted) return '';
     try {
-      const today = new Date().toISOString().split('T')[0];
+      const today = formatLocalDateYmd();
       const effectiveParentId = parentId || get().activeParentProjectId || `parent_${today}`;
-      const proj = await createProject({ name, mediaId, duration, parentId: effectiveParentId });
+      const curState = get();
+      const matchesCurrentMedia = Boolean(mediaId && curState.backend?.mediaId === mediaId);
+      const initialState = options?.initialState ?? (matchesCurrentMedia ? {
+        project: { ...curState.project, previewUrl: `/api/media/${mediaId}/file` },
+        subtitleSource: curState.subtitleSource || 'audio_asr',
+        ocrCrop: { roi: curState.ocrCrop?.roi || [0.05, 0.75, 0.9, 0.2] },
+        ocrRoiConfirmed: Boolean(curState.ocrRoiConfirmed),
+        ocrOptions: curState.ocrOptions || { coarseIntervalMs: 500, useAngleCls: false, paragraphMode: 'preserve_lines' },
+        languages: curState.languages,
+        backend: { mediaId, config: curState.backend?.config },
+      } : undefined);
+      const proj = await createProject({
+        name,
+        mediaId,
+        duration,
+        parentId: effectiveParentId,
+        ...(initialState ? { state: initialState } : {}),
+      });
+      if (signal?.aborted) return '';
       const newId = proj?.id;
       if (newId) {
-        await get().selectProject(newId, true);
+        await get().selectProject(newId, true, options);
       }
+      if (signal?.aborted) return newId || '';
       set((state: any) => ({
         ...state,
         activeView: 'dubbing' as MainView,
         currentStep: 1,
       }));
       await get().loadProjects();
+      if (signal?.aborted) return newId || '';
       if (effectiveParentId) {
         try {
           const subs = await fetchSubprojects(effectiveParentId);
-          set({ sessionSubprojects: subs, activeParentProjectId: effectiveParentId, batchModeActive: subs.length > 0 });
+          if (!signal?.aborted) {
+            set({ sessionSubprojects: subs, activeParentProjectId: effectiveParentId, batchModeActive: subs.length > 0 });
+          }
         } catch (_) {}
       }
       return newId || '';
-    } catch (err) {
+    } catch (err: any) {
+      if (signal?.aborted || err?.name === 'AbortError') return '';
       console.error('Failed to create new project:', err);
       return '';
     }
@@ -407,11 +548,34 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
   deleteProjectById: async (id: string) => {
     try {
       await apiDeleteProject(id);
-      if (get().activeProjectId === id) {
-        set({ activeProjectId: null, activeView: 'projects' as MainView });
-        if (typeof localStorage !== 'undefined') {
-          localStorage.removeItem('dubdub_active_project_id');
-        }
+      const prevActiveId = get().activeProjectId;
+      const prevParentId = get().activeParentProjectId;
+      const prevSubs = get().sessionSubprojects || [];
+      const isParentDeleted = prevParentId === id;
+      const activeWasDeleted =
+        prevActiveId === id ||
+        (isParentDeleted && prevSubs.some((p: any) => p.id === prevActiveId));
+      set((state: any) => {
+        const parentDel = state.activeParentProjectId === id;
+        const remaining = parentDel
+          ? []
+          : (state.sessionSubprojects || []).filter((p: any) => p.id !== id);
+        const nextProjectJobStatuses = { ...(state.projectJobStatuses || {}) };
+        delete nextProjectJobStatuses[id];
+        const clearParent = parentDel || remaining.length === 0;
+        const clearActive =
+          state.activeProjectId === id ||
+          (parentDel && (state.sessionSubprojects || []).some((p: any) => p.id === state.activeProjectId));
+        return {
+          sessionSubprojects: remaining,
+          batchModeActive: remaining.length > 0,
+          projectJobStatuses: nextProjectJobStatuses,
+          ...(clearParent ? { activeParentProjectId: null, activeParentProjectName: null } : {}),
+          ...(clearActive ? { activeProjectId: null, activeView: 'projects' as MainView } : {}),
+        };
+      });
+      if (activeWasDeleted && typeof localStorage !== 'undefined') {
+        localStorage.removeItem('dubdub_active_project_id');
       }
       await get().loadProjects();
     } catch (err) {
@@ -421,25 +585,52 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
 
   deleteProjectsByIds: async (ids: string[]) => {
     if (!ids || ids.length === 0) return;
+    const deletedIds: string[] = [];
     try {
       await bulkDeleteProjects(ids);
-      const activeId = get().activeProjectId;
-      if (activeId && ids.includes(activeId)) {
-        set({ activeProjectId: null, activeView: 'projects' as MainView });
-        if (typeof localStorage !== 'undefined') {
-          localStorage.removeItem('dubdub_active_project_id');
-        }
-      }
-      await get().loadProjects();
+      deletedIds.push(...ids);
     } catch (err) {
       console.error('Failed to bulk delete projects:', err);
       for (const id of ids) {
         try {
           await apiDeleteProject(id);
+          deletedIds.push(id);
         } catch (_) {}
       }
-      await get().loadProjects();
     }
+    if (deletedIds.length > 0) {
+      const deletedSet = new Set(deletedIds);
+      const prevActiveId = get().activeProjectId;
+      const prevParentId = get().activeParentProjectId;
+      const prevSubs = get().sessionSubprojects || [];
+      const isParentDeleted = Boolean(prevParentId && deletedSet.has(prevParentId));
+      const activeWasDeleted = Boolean(
+        prevActiveId &&
+          (deletedSet.has(prevActiveId) || (isParentDeleted && prevSubs.some((p: any) => p.id === prevActiveId)))
+      );
+      set((state: any) => {
+        const parentDel = Boolean(state.activeParentProjectId && deletedSet.has(state.activeParentProjectId));
+        const remaining = parentDel
+          ? []
+          : (state.sessionSubprojects || []).filter((p: any) => !deletedSet.has(p.id));
+        const nextProjectJobStatuses = { ...(state.projectJobStatuses || {}) };
+        for (const delId of deletedSet) {
+          delete nextProjectJobStatuses[delId];
+        }
+        const clearParent = parentDel || remaining.length === 0;
+        return {
+          sessionSubprojects: remaining,
+          batchModeActive: remaining.length > 0,
+          projectJobStatuses: nextProjectJobStatuses,
+          ...(clearParent ? { activeParentProjectId: null, activeParentProjectName: null } : {}),
+          ...(activeWasDeleted ? { activeProjectId: null, activeView: 'projects' as MainView } : {}),
+        };
+      });
+      if (activeWasDeleted && typeof localStorage !== 'undefined') {
+        localStorage.removeItem('dubdub_active_project_id');
+      }
+    }
+    await get().loadProjects();
   },
 
   triggerAutosave: (reportFailure = false) => {
@@ -465,6 +656,9 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
       },
       forceAsr: currentState.forceAsr,
       ocrCrop: { roi: currentState.ocrCrop?.roi },
+      subtitleSource: currentState.subtitleSource || 'audio_asr',
+      ocrRoiConfirmed: Boolean(currentState.ocrRoiConfirmed),
+      ocrOptions: currentState.ocrOptions || { coarseIntervalMs: 500, useAngleCls: false, paragraphMode: 'preserve_lines' },
       stage3Baseline: currentState.stage3Baseline,
       autoFitVoiceSpeed: currentState.autoFitVoiceSpeed,
       maxSpeedRate: currentState.maxSpeedRate,
@@ -480,6 +674,24 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
       editVideo: {
         audioMix: currentState.editVideo?.audioMix,
         activeTab: currentState.editVideo?.activeTab,
+        backgroundAudio: currentState.editVideo?.backgroundAudio
+          ? {
+              id: currentState.editVideo.backgroundAudio.id,
+              name: currentState.editVideo.backgroundAudio.name,
+              url: String(currentState.editVideo.backgroundAudio.url || '').startsWith('blob:')
+                ? ''
+                : (currentState.editVideo.backgroundAudio.url || ''),
+            }
+          : null,
+        thumbnail: currentState.editVideo?.thumbnail
+          ? {
+              id: currentState.editVideo.thumbnail.id,
+              name: currentState.editVideo.thumbnail.name,
+              url: String(currentState.editVideo.thumbnail.url || '').startsWith('blob:')
+                ? ''
+                : (currentState.editVideo.thumbnail.url || ''),
+            }
+          : null,
       },
       currentStep: currentState.currentStep,
     };

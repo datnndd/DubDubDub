@@ -62,14 +62,18 @@ def kill_process_tree(proc: subprocess.Popen) -> None:
         for child in psutil.Process(proc.pid).children(recursive=True):
             try:
                 child.kill()
-            except psutil.NoSuchProcess:
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 pass
-    except psutil.NoSuchProcess:
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
         pass
     finally:
         try:
             proc.kill()
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.wait(timeout=1.0)
+        except Exception:
             pass
 
 
@@ -81,7 +85,7 @@ def kill_job_procs(job_id: str) -> None:
     for proc in procs:
         try:
             kill_process_tree(proc)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError, OSError):
             pass
         except Exception as e:
             logger.warning("Failed to kill subprocess for job %s: %s", job_id, e)

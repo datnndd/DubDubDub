@@ -343,6 +343,16 @@ async def options_handler(request: Request) -> JSONResponse:
             "configured": is_configured,
             "testable": bool(provider.get("thirdParty")),
         })
+    gpu_count = 0
+    try:
+        gpu_fn = getattr(request.app.state, "gpu_initializer", None)
+        if gpu_fn is None:
+            from videotrans.util.gpus import getset_gpu
+            gpu_fn = getset_gpu
+        gpu_count = max(0, int(gpu_fn() or 0))
+    except Exception:
+        gpu_count = 0
+
     return JSONResponse({
         "languages": languages,
         "asrProviders": asr_providers,
@@ -355,6 +365,10 @@ async def options_handler(request: Request) -> JSONResponse:
             for mode_id, mode in TRANSLATION_MODES.items()
         ],
         "voices": list(enumerate(tts.TTS_NAME_LIST)),
+        "hardware": {
+            "cudaAvailable": gpu_count > 0,
+            "gpuCount": gpu_count,
+        },
         "defaults": {
             "sourceLanguage": str((settings_store.get("source_language", "") if settings_store else "") or global_params.get("source_language", "en")).strip() or "en",
             "targetLanguage": str((settings_store.get("target_language", "") if settings_store else "") or global_params.get("target_language", "vi")).strip() or "vi",
@@ -552,28 +566,52 @@ async def get_settings_handler(request: Request) -> JSONResponse:
     storage_metrics = storage_config.get_storage_metrics()
     settings_store = getattr(request.app.state, "settings_store", None)
 
+    _KNOWN_PLACEHOLDER_MODELS = {
+        "gpt-5.5", "gpt-5.5-pro", "gpt-5.4-pro", "gpt-5.4", "gpt-5.4-mini", "gpt-5", "gpt-5-mini", "gpt-4.1",
+        "deepseek-v4-pro", "deepseek-v4-flash",
+        "gemini-3.6-flash", "gemini-3.5-flash",
+        "gemini-3.1-flash-tts-preview",
+        "eleven_v3",
+    }
+
     deepgram_model = str((settings_store.get("model_name", "") if settings_store else "") or global_params.get("model_name", "nova-3")).strip()
     deepgram_models = [m.strip() for m in str(global_settings.get("deepgram_model", "nova-3,nova-2")).split(",") if m.strip()]
     if deepgram_model and deepgram_model not in deepgram_models:
         deepgram_models.insert(0, deepgram_model)
 
     chatgpt_model = str((settings_store.get("chatgpt_model", "") if settings_store else "") or global_params.get("chatgpt_model", "gpt-4o")).strip()
-    chatgpt_models = [m.strip() for m in str(global_settings.get("chatgpt_model", "gpt-4o,gpt-4o-mini,gpt-3.5-turbo")).split(",") if m.strip()]
+    if chatgpt_model in _KNOWN_PLACEHOLDER_MODELS:
+        chatgpt_model = "gpt-4o"
+    chatgpt_models = [m.strip() for m in str(global_settings.get("chatgpt_model", "gpt-4o,gpt-4o-mini,gpt-3.5-turbo")).split(",") if m.strip() and m.strip() not in _KNOWN_PLACEHOLDER_MODELS]
+    if not chatgpt_models:
+        chatgpt_models = ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"]
     if chatgpt_model and chatgpt_model not in chatgpt_models:
         chatgpt_models.insert(0, chatgpt_model)
 
     deepseek_model = str((settings_store.get("deepseek_model", "") if settings_store else "") or global_params.get("deepseek_model", "deepseek-chat")).strip()
-    deepseek_models = [m.strip() for m in str(global_settings.get("deepseek_model", "deepseek-chat,deepseek-reasoner")).split(",") if m.strip()]
+    if deepseek_model in _KNOWN_PLACEHOLDER_MODELS:
+        deepseek_model = "deepseek-chat"
+    deepseek_models = [m.strip() for m in str(global_settings.get("deepseek_model", "deepseek-chat,deepseek-reasoner")).split(",") if m.strip() and m.strip() not in _KNOWN_PLACEHOLDER_MODELS]
+    if not deepseek_models:
+        deepseek_models = ["deepseek-chat", "deepseek-reasoner"]
     if deepseek_model and deepseek_model not in deepseek_models:
         deepseek_models.insert(0, deepseek_model)
 
     gemini_model = str((settings_store.get("gemini_model", "") if settings_store else "") or global_params.get("gemini_model", "gemini-2.0-flash")).strip()
-    gemini_models = [m.strip() for m in str(global_settings.get("gemini_model", "gemini-2.0-flash,gemini-1.5-pro,gemini-1.5-flash")).split(",") if m.strip()]
+    if gemini_model in _KNOWN_PLACEHOLDER_MODELS:
+        gemini_model = "gemini-2.0-flash"
+    gemini_models = [m.strip() for m in str(global_settings.get("gemini_model", "gemini-2.0-flash,gemini-1.5-pro,gemini-1.5-flash")).split(",") if m.strip() and m.strip() not in _KNOWN_PLACEHOLDER_MODELS]
+    if not gemini_models:
+        gemini_models = ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"]
     if gemini_model and gemini_model not in gemini_models:
         gemini_models.insert(0, gemini_model)
 
     elevenlabs_model = str((settings_store.get("elevenlabstts_models", "") if settings_store else "") or global_params.get("elevenlabstts_models", "eleven_multilingual_v2")).strip()
-    elevenlabs_models = [m.strip() for m in str(global_settings.get("elevenlabstts_models", ELEVENLABS_TTS_MODELS)).split(",") if m.strip()]
+    if elevenlabs_model in _KNOWN_PLACEHOLDER_MODELS:
+        elevenlabs_model = "eleven_multilingual_v2"
+    elevenlabs_models = [m.strip() for m in str(global_settings.get("elevenlabstts_models", ELEVENLABS_TTS_MODELS)).split(",") if m.strip() and m.strip() not in _KNOWN_PLACEHOLDER_MODELS]
+    if not elevenlabs_models:
+        elevenlabs_models = ["eleven_multilingual_v2", "eleven_flash_v2_5", "eleven_flash_v2", "eleven_turbo_v2_5"]
     if elevenlabs_model and elevenlabs_model not in elevenlabs_models:
         elevenlabs_models.insert(0, elevenlabs_model)
 

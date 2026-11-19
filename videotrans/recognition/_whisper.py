@@ -1,7 +1,7 @@
-import time, json,datetime
+import time, json, datetime
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Union, List
+from typing import Optional, Union, List
 
 from videotrans.configure._paths import TEMP_ROOT
 from videotrans.configure.config import settings, ROOT_DIR, logger
@@ -11,24 +11,55 @@ from videotrans.task.taskcfg import SrtItem
 
 from videotrans.util.help_down import check_and_down_hf
 from videotrans.util.help_srt import get_subtitle_from_srt
-from pydub import AudioSegment
 
 
 from videotrans.configure.contants import FASTER_MODELS_DICT
 from videotrans.configure.excepts import SttTimeoutError
+
+
+def get_audio_duration_ms(audio_path: Optional[Union[str, Path]]) -> int:
+    """Return audio duration in milliseconds via header-only metadata probe."""
+    if not audio_path:
+        return 0
+    path_obj = Path(audio_path)
+    if not path_obj.is_file():
+        return 0
+    try:
+        import soundfile as sf
+        info = sf.info(str(path_obj))
+        if info.samplerate > 0:
+            return int(round(info.frames * 1000 / info.samplerate))
+    except Exception:
+        pass
+    try:
+        import wave
+        with wave.open(str(path_obj), "rb") as wf:
+            sr = wf.getframerate()
+            if sr > 0:
+                return int(round(wf.getnframes() * 1000 / sr))
+    except Exception:
+        pass
+    try:
+        from videotrans.util._ffprobe import get_audio_time
+        ms = get_audio_time(str(path_obj))
+        return int(round(ms)) if ms else 0
+    except Exception:
+        return 0
+
 
 @dataclass
 class FasterAll(BaseRecogn):
     def __post_init__(self):
         super().__post_init__()
         local_dir = f'{ROOT_DIR}/models/models--'
-        if self.model_name in FASTER_MODELS_DICT:
-            local_dir += FASTER_MODELS_DICT[self.model_name].replace('/', '--')
+        model_key = self.model_name or ''
+        if model_key in FASTER_MODELS_DICT:
+            local_dir += FASTER_MODELS_DICT[model_key].replace('/', '--')
         else:
-            local_dir += self.model_name.replace('/', '--')
+            local_dir += model_key.replace('/', '--')
         self.local_dir = local_dir
-        self.audio_duration=len(AudioSegment.from_wav(self.audio_file))
-        self.speech_timestamps_file=None
+        self.audio_duration = get_audio_duration_ms(self.audio_file)
+        self.speech_timestamps_file = None
 
 
     def _exec(self)->Union[List[SrtItem], None]:
@@ -53,13 +84,15 @@ class FasterAll(BaseRecogn):
         title=f"Model: {self.model_name}"
         self.signal(text=title)
         logs_file = f'{config.TEMP_DIR}/{self.uuid}/faster-{self.detect_language}-{time.time()}.log'
+        Path(logs_file).parent.mkdir(parents=True, exist_ok=True)
         _max_speech=max(int(float(settings.get('max_speech_duration_s', 5)) * 1000),2000)
         if self.recogn2pass:
             # Second-pass recognition, generates brief subtitles
             _max_speech = max(int(float(settings.get('max_speech_duration_s2', 2)) * 1000),500)
         
-        
-        subtitle_srt=f'{TEMP_ROOT}/faster-{datetime.datetime.now().strftime("%Y%m%d-%H_%M_%S")}.srt'
+        base_tmp = self.cache_folder or TEMP_ROOT
+        Path(base_tmp).mkdir(parents=True, exist_ok=True)
+        subtitle_srt = f'{base_tmp}/faster-{datetime.datetime.now().strftime("%Y%m%d-%H_%M_%S")}-{time.time_ns()}.srt'
         kwargs = {
             "detect_language": self.detect_language,
             "model_name": self.model_name,
@@ -92,3 +125,8 @@ class FasterAll(BaseRecogn):
                 raise
             logger.debug(f'捕获到强制抛出的 SttTimeoutError, 使用已识别的文件 {subtitle_srt}')
             return get_subtitle_from_srt(subtitle_srt, is_file=True)
+        finally:
+            try:
+                Path(subtitle_srt).unlink(missing_ok=True)
+            except OSError:
+                pass

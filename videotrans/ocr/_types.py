@@ -59,6 +59,10 @@ class OcrConfig(_DictAccessMixin):
     similarity_threshold: float = 0.85
     min_stable_samples: int = 2
     grace_gap_ms: int = 400
+    use_angle_cls: bool = False
+    paragraph_mode: str = "preserve_lines"
+    cpu_threads: Optional[int] = None
+    max_roi_width: int = 1280
 
     def is_valid_roi(self) -> bool:
         """Return True only when the ROI is a well-formed normalized box.
@@ -94,6 +98,7 @@ class OcrResult(_DictAccessMixin):
     confidence: float = 0.0
     lines: List = field(default_factory=list)
     timestamp_ms: int = 0
+    device: Optional[str] = None
 
 
 @dataclass

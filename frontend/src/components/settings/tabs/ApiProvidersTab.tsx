@@ -122,8 +122,18 @@ export const ApiProvidersTab: React.FC<ApiProvidersTabProps> = ({
         return next;
       });
 
-      if (id === 'deepgram' && selectedModel) {
-        useDubDubStore.getState().updateAsrProvider(1, selectedModel);
+      const store = useDubDubStore.getState();
+      const curRecognType = Number(store.backend?.config?.recognType);
+      if (id === 'deepgram' && curRecognType === 1 && selectedModel) {
+        store.updateAsrProvider(1, selectedModel);
+      } else if (id === 'gemini' && curRecognType === 2 && selectedModel) {
+        store.updateAsrProvider(2, selectedModel);
+      } else if (id === 'elevenlabs' && curRecognType === 4 && selectedModel) {
+        store.updateAsrProvider(4, selectedModel);
+      }
+
+      if (id === 'elevenlabs' || id === 'gemini') {
+        await store.loadVoices?.();
       }
 
       await onRefresh();
@@ -304,7 +314,7 @@ export const ApiProvidersTab: React.FC<ApiProvidersTabProps> = ({
                     <div className="relative flex items-center">
                       <input
                         type={form.showKey ? 'text' : 'password'}
-                        disabled={p.fromEnv}
+                        disabled={isSaving}
                         placeholder={
                           p.fromEnv
                             ? 'Configured via environment variable'

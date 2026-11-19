@@ -31,6 +31,77 @@ const VIENEU_PRESET_VOICES = [
   { id: 'Đoan (nữ miền Nam)', name: 'Đoan', region: 'Nữ Nam', gender: 'Nữ', desc: 'Dịu dàng, ngọt ngào' },
 ];
 
+export function probeAudioElementDuration(
+  url: string,
+  fallbackDur: number,
+  onDuration: (dur: number) => void,
+  AudioCtor: { new (src?: string): HTMLAudioElement } = Audio
+): HTMLAudioElement {
+  let settled = false;
+  const finish = (rawDur: number) => {
+    if (settled) return;
+    settled = true;
+    const dur = Number.isFinite(rawDur) && rawDur > 0 ? rawDur : fallbackDur;
+    onDuration(dur);
+  };
+
+  const tempAudio = new AudioCtor(url);
+  tempAudio.onloadedmetadata = () => {
+    if (Number.isFinite(tempAudio.duration) && tempAudio.duration > 0) {
+      finish(tempAudio.duration);
+      return;
+    }
+    const onTimeUpdate = () => {
+      tempAudio.removeEventListener?.('timeupdate', onTimeUpdate);
+      const probed = tempAudio.duration;
+      try {
+        tempAudio.currentTime = 0;
+      } catch {
+        // ignore seek reset failure
+      }
+      finish(probed);
+    };
+    tempAudio.addEventListener?.('timeupdate', onTimeUpdate);
+    try {
+      tempAudio.currentTime = 1e101;
+      setTimeout(() => {
+        tempAudio.removeEventListener?.('timeupdate', onTimeUpdate);
+        finish(tempAudio.duration);
+      }, 150);
+    } catch {
+      tempAudio.removeEventListener?.('timeupdate', onTimeUpdate);
+      finish(fallbackDur);
+    }
+  };
+  tempAudio.onerror = () => {
+    finish(fallbackDur);
+  };
+  return tempAudio;
+}
+
+export function resolveCloneAudioUploadSource(params: {
+  isTrimmed: boolean;
+  isTrimming: boolean;
+  audioFile: File | null;
+  audioBlob: Blob | null;
+  rawAudioFile: File | null;
+  rawAudioBlob: Blob | null;
+}): { sourceAudio: File | Blob | null; useCutRange: boolean } {
+  const { isTrimmed, isTrimming, audioFile, audioBlob, rawAudioFile, rawAudioBlob } = params;
+  const hasRawSource = Boolean(rawAudioFile || rawAudioBlob);
+  const hasDistinctTrimmedAudio =
+    isTrimmed &&
+    Boolean(audioFile || audioBlob) &&
+    (audioBlob !== rawAudioBlob || audioFile !== rawAudioFile);
+  const useCutRange = isTrimming || (isTrimmed && hasRawSource && !hasDistinctTrimmedAudio);
+  const sourceAudio = hasDistinctTrimmedAudio
+    ? (audioFile || audioBlob)
+    : useCutRange
+    ? (rawAudioFile || rawAudioBlob)
+    : (audioFile || audioBlob);
+  return { sourceAudio, useCutRange };
+}
+
 export const CreateVoiceModal: React.FC = () => {
   const isOpen = useDubDubStore((s) => s.isCreateVoiceModalOpen);
   const setIsOpen = useDubDubStore((s) => s.setCreateVoiceModalOpen);
@@ -58,8 +129,13 @@ export const CreateVoiceModal: React.FC = () => {
   const [audioDuration, setAudioDuration] = useState<number | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const recordingSecondsRef = useRef<number>(0);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordingTimerRef = useRef<number | null>(null);
+  const isOpenRef = useRef<boolean>(isOpen);
+  const isMountedRef = useRef<boolean>(true);
+  isOpenRef.current = isOpen;
 
   // Trimming specific
   const [rawAudioFile, setRawAudioFile] = useState<File | null>(null);
@@ -103,6 +179,43 @@ export const CreateVoiceModal: React.FC = () => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  const cleanupRecording = () => {
+    if (recordingTimerRef.current !== null) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== 'inactive') {
+      try {
+        recorder.stop();
+      } catch {
+        // ignore stop errors on already-closed recorder
+      }
+    }
+    mediaRecorderRef.current = null;
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch {
+          // ignore
+        }
+      });
+      mediaStreamRef.current = null;
+    }
+    setIsRecording(false);
+    recordingSecondsRef.current = 0;
+    setRecordingSeconds(0);
+  };
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      cleanupRecording();
+    };
+  }, []);
+
   useEffect(() => {
     if (isOpen) {
       setCreationMode('clone');
@@ -144,6 +257,7 @@ export const CreateVoiceModal: React.FC = () => {
       setClonePreviewFilename(null);
       setIsCloneAuditionPlaying(false);
     } else {
+      cleanupRecording();
       if (audioPlayerRef.current) audioPlayerRef.current.pause();
       if (auditionAudioRef.current) auditionAudioRef.current.pause();
       if (cloneAuditionAudioRef.current) cloneAuditionAudioRef.current.pause();
@@ -175,9 +289,7 @@ export const CreateVoiceModal: React.FC = () => {
     setRawAudioUrl(url);
     setIsTrimmed(false);
 
-    const tempAudio = new Audio(url);
-    tempAudio.onloadedmetadata = () => {
-      const dur = tempAudio.duration;
+    const applyProbedDuration = (dur: number) => {
       setAudioDuration(dur);
       setRawAudioDuration(dur);
       if (dur < 2.0) {
@@ -193,17 +305,19 @@ export const CreateVoiceModal: React.FC = () => {
         setTrimEnd(Math.min(10.0, dur));
       }
     };
-    tempAudio.onerror = () => {
-      setAudioDuration(5.0);
-      setRawAudioDuration(5.0);
-      setIsTrimming(false);
-    };
+
+    probeAudioElementDuration(url, 5.0, applyProbedDuration);
   };
 
   const startRecording = async () => {
     setErrorMsg(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!isOpenRef.current || !isMountedRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      mediaStreamRef.current = stream;
       const supportedTypes = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'];
       const mimeType = supportedTypes.find((t) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported?.(t)) || '';
       const mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
@@ -215,6 +329,14 @@ export const CreateVoiceModal: React.FC = () => {
       };
 
       mediaRecorder.onstop = () => {
+        stream.getTracks().forEach((track) => track.stop());
+        if (mediaStreamRef.current === stream) {
+          mediaStreamRef.current = null;
+        }
+        if (!isOpenRef.current || !isMountedRef.current) {
+          return;
+        }
+        const fallbackRecDur = recordingSecondsRef.current > 0 ? recordingSecondsRef.current : 5.0;
         const actualType = mediaRecorder.mimeType || mimeType || 'audio/webm';
         const blob = new Blob(chunks, { type: actualType });
         if (audioUrl) URL.revokeObjectURL(audioUrl);
@@ -228,9 +350,7 @@ export const CreateVoiceModal: React.FC = () => {
         setRawAudioUrl(url);
         setIsTrimmed(false);
 
-        const tempAudio = new Audio(url);
-        tempAudio.onloadedmetadata = () => {
-          const dur = tempAudio.duration;
+        const applyRecDuration = (dur: number) => {
           setAudioDuration(dur);
           setRawAudioDuration(dur);
           if (dur < 2.0) {
@@ -247,20 +367,24 @@ export const CreateVoiceModal: React.FC = () => {
           }
         };
 
-        stream.getTracks().forEach((track) => track.stop());
+        probeAudioElementDuration(url, fallbackRecDur, applyRecDuration);
       };
 
       mediaRecorder.start(250);
       setIsRecording(true);
+      recordingSecondsRef.current = 0;
       setRecordingSeconds(0);
 
       recordingTimerRef.current = window.setInterval(() => {
         setRecordingSeconds((prev) => {
           if (prev >= 29) {
+            recordingSecondsRef.current = 30;
             stopRecording();
             return 30;
           }
-          return prev + 1;
+          const next = prev + 1;
+          recordingSecondsRef.current = next;
+          return next;
         });
       }, 1000);
     } catch (err: any) {
@@ -269,14 +393,18 @@ export const CreateVoiceModal: React.FC = () => {
   };
 
   const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-      if (recordingTimerRef.current) {
-        clearInterval(recordingTimerRef.current);
-        recordingTimerRef.current = null;
-      }
+    if (recordingTimerRef.current !== null) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
     }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+    }
+    setIsRecording(false);
   };
 
   const handleAutoDetectSpeech = async () => {
@@ -476,10 +604,14 @@ export const CreateVoiceModal: React.FC = () => {
   };
 
   const handleAuditionClone = async () => {
-    const hasRawSource = Boolean(rawAudioFile || rawAudioBlob);
-    const sourceAudio = (isTrimming || isTrimmed) && hasRawSource
-      ? (rawAudioFile || rawAudioBlob)
-      : (audioBlob || audioFile);
+    const { sourceAudio, useCutRange } = resolveCloneAudioUploadSource({
+      isTrimmed,
+      isTrimming,
+      audioFile,
+      audioBlob,
+      rawAudioFile,
+      rawAudioBlob,
+    });
 
     if (!sourceAudio) {
       setErrorMsg('Please upload or record reference audio first.');
@@ -512,8 +644,8 @@ export const CreateVoiceModal: React.FC = () => {
         text: clonePreviewText.trim(),
         language,
         denoise,
-        cut_start: isTrimming || (isTrimmed && hasRawSource) ? trimStart : undefined,
-        cut_end: isTrimming || (isTrimmed && hasRawSource) ? trimEnd : undefined,
+        cut_start: useCutRange ? trimStart : undefined,
+        cut_end: useCutRange ? trimEnd : undefined,
         ref_text: refText.trim() || undefined,
       });
       if (res && (res.preview_url || res.audio_url)) {
@@ -579,10 +711,14 @@ export const CreateVoiceModal: React.FC = () => {
 
       setIsSubmitting(true);
       try {
-        const hasRawSource = Boolean(rawAudioFile || rawAudioBlob);
-        const sourceAudio = (isTrimming || isTrimmed) && hasRawSource
-          ? (rawAudioFile || rawAudioBlob)
-          : (audioBlob || audioFile);
+        const { sourceAudio, useCutRange } = resolveCloneAudioUploadSource({
+          isTrimmed,
+          isTrimming,
+          audioFile,
+          audioBlob,
+          rawAudioFile,
+          rawAudioBlob,
+        });
 
         const payload: any = {
           name: cleanName,
@@ -597,7 +733,7 @@ export const CreateVoiceModal: React.FC = () => {
           tuning_params: { denoise },
           preview_filename: clonePreviewFilename || undefined,
         };
-        if (isTrimming || (isTrimmed && hasRawSource)) {
+        if (useCutRange) {
           payload.cut_start = trimStart;
           payload.cut_end = trimEnd;
         }

@@ -42,8 +42,18 @@ class AsyncResultFutureWrapper:
             if app_cfg.exit_soft:
                 return None, "Task interrupted by user"
 
-            # 5. Short sleep to prevent busy waiting
-            time.sleep(0.5)
+            # 5. Event-driven wait to avoid polling lag without losing health/cancel checks
+            wait_fn = getattr(self.async_result, "wait", None)
+            if callable(wait_fn):
+                wait_fn(timeout=0.2)
+            else:
+                time.sleep(0.2)
+
+    def wait(self, timeout=None):
+        wait_fn = getattr(self.async_result, "wait", None)
+        if callable(wait_fn):
+            return wait_fn(timeout=timeout)
+        return self.done()
 
     def _is_pool_healthy(self):
         """Check whether worker processes in pool are still alive."""
@@ -72,7 +82,7 @@ class GlobalProcessManager:
 
     @classmethod
     def get_cpu_process_nums(cls):
-        cpu_count = int(os.cpu_count())
+        cpu_count = int(os.cpu_count() or 1)
         try:
             man_set = int(float(settings.get('process_max', 0)))
         except (ValueError, TypeError):
@@ -88,7 +98,7 @@ class GlobalProcessManager:
 
     @classmethod
     def get_gpu_process_nums(cls):
-        cpu_count = int(os.cpu_count())
+        cpu_count = int(os.cpu_count() or 1)
         try:
             process_max_gpu = int(float(settings.get('process_max_gpu', 0)))
         except (TypeError, ValueError):

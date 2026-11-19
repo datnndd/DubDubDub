@@ -4,18 +4,12 @@ import {
   X,
   Layers,
   Film,
-  CheckCircle2,
-  Clock,
-  Loader2,
-  AlertCircle,
   Play,
   ArrowRight,
-  ExternalLink,
   Plus,
-  RefreshCw,
   FolderOpen,
 } from 'lucide-react';
-import type { ProjectRecord } from '../types/project';
+import { getSubprojectStatusInfo } from '../utils/projectStatus';
 
 export const SessionVideosDrawer: React.FC = () => {
   const isOpen = useDubDubStore((s) => s.sessionDrawerOpen);
@@ -39,76 +33,46 @@ export const SessionVideosDrawer: React.FC = () => {
     4: '4. Video Edit & Export',
   };
 
-  const getStatusInfo = (sub: ProjectRecord) => {
-    const jobState = projectJobStatuses[sub.id];
-    if (jobState) {
-      if (jobState.status === 'running') {
-        const isVoice = jobState.stage === 'voice';
-        return {
-          label: isVoice
-            ? (jobState.progress != null && jobState.progress > 0 ? `Voice: ${jobState.progress}%` : 'Creating Voice…')
-            : `ASR: ${jobState.progress != null ? jobState.progress.toFixed(0) : '0'}%`,
-          color: 'bg-amber-100 text-[#8D4B00] border-amber-300',
-          icon: <Loader2 className="w-3 h-3 animate-spin" />,
-          progress: jobState.progress,
-        };
-      }
-      if (jobState.status === 'completed') {
-        const isVoice = jobState.stage === 'voice';
-        return {
-          label: isVoice ? 'Voice Ready' : 'Ready for Review',
-          color: 'bg-emerald-100 text-emerald-800 border-emerald-300',
-          icon: <CheckCircle2 className="w-3 h-3" />,
-          progress: 100,
-        };
-      }
-      if (jobState.status === 'failed') {
-        return {
-          label: jobState.stage === 'voice' ? 'Voice Failed' : 'Failed',
-          color: 'bg-rose-100 text-rose-800 border-rose-300',
-          icon: <AlertCircle className="w-3 h-3" />,
-          progress: 0,
-        };
-      }
-      if (jobState.status === 'queued') {
-        return {
-          label: 'Queued',
-          color: 'bg-stone-100 text-stone-700 border-stone-300',
-          icon: <Clock className="w-3 h-3" />,
-          progress: 0,
-        };
-      }
-    }
+  const totalCount = sessionSubprojects.length;
+  const isNotFailed = (s: { id: string; status?: string }) =>
+    s.status !== 'failed' && projectJobStatuses[s.id]?.status !== 'failed';
 
-    if (sub.stage >= 2 || sub.status === 'completed') {
-      const isStage3or4 = sub.stage >= 3;
-      return {
-        label: sub.stage >= 4 ? 'Completed' : isStage3or4 ? 'Voice Ready' : 'Ready for Review',
-        color: 'bg-emerald-100 text-emerald-800 border-emerald-300',
-        icon: <CheckCircle2 className="w-3 h-3" />,
-        progress: 100,
-      };
-    }
-    if (sub.status === 'processing') {
-      return {
-        label: 'Processing…',
-        color: 'bg-amber-100 text-[#8D4B00] border-amber-300',
-        icon: <Loader2 className="w-3 h-3 animate-spin" />,
-        progress: 50,
-      };
-    }
+  let readyCount = 0;
+  let readinessLabel = '';
+  if (currentStep === 4) {
+    readyCount = sessionSubprojects.filter(
+      (s) => isNotFailed(s) && (s.stage >= 4 || (s.status === 'completed' && s.stage >= 4))
+    ).length;
+    readinessLabel = `${readyCount} of ${totalCount} videos completed`;
+  } else if (currentStep === 3) {
+    readyCount = sessionSubprojects.filter(
+      (s) =>
+        isNotFailed(s) &&
+        (s.stage >= 3 ||
+          (projectJobStatuses[s.id]?.stage === 'voice' && projectJobStatuses[s.id]?.status === 'completed'))
+    ).length;
+    readinessLabel = `${readyCount} of ${totalCount} videos voice-ready`;
+  } else {
+    readyCount = sessionSubprojects.filter(
+      (s) =>
+        isNotFailed(s) &&
+        (s.stage >= 2 ||
+          (projectJobStatuses[s.id]?.status === 'completed' && projectJobStatuses[s.id]?.stage !== 'voice'))
+    ).length;
+    readinessLabel = `${readyCount} of ${totalCount} videos ready for review`;
+  }
 
-    return {
-      label: 'Pending',
-      color: 'bg-stone-100 text-stone-600 border-stone-200',
-      icon: <Clock className="w-3 h-3" />,
-      progress: 0,
-    };
-  };
-
-  const completedCount = sessionSubprojects.filter(
-    (s) => s.stage >= 2 || projectJobStatuses[s.id]?.status === 'completed'
-  ).length;
+  const hasRunnableStage1 = sessionSubprojects.some(
+    (s) =>
+      (s.stage ?? 1) <= 1 &&
+      s.status !== 'completed' &&
+      projectJobStatuses[s.id]?.status !== 'completed' &&
+      Boolean((s as any).media_id || (s as any).mediaId || s.media_path)
+  );
+  const isBatchAsrRunning = sessionSubprojects.some((s) => {
+    const st = projectJobStatuses[s.id];
+    return st && (st.status === 'running' || st.status === 'queued') && st.stage !== 'voice' && st.stage !== 'render';
+  });
 
   return (
     <div className="fixed inset-y-0 right-0 z-40 w-96 max-w-full bg-white shadow-2xl border-l border-stone-200 flex flex-col animate-in slide-in-from-right duration-200 select-none">
@@ -123,7 +87,7 @@ export const SessionVideosDrawer: React.FC = () => {
               Session: {activeParentProjectName || 'Daily Batch'}
             </h3>
             <p className="text-[10px] text-stone-500">
-              {completedCount} of {sessionSubprojects.length} videos ready for review
+              {readinessLabel}
             </p>
           </div>
         </div>
@@ -151,13 +115,13 @@ export const SessionVideosDrawer: React.FC = () => {
         <div className="px-4 py-2 bg-stone-100/70 border-b border-stone-200 shrink-0">
           <div className="flex items-center justify-between text-[10px] font-semibold text-stone-600 mb-1">
             <span>Batch Readiness</span>
-            <span>{Math.round((completedCount / (sessionSubprojects.length || 1)) * 100)}%</span>
+            <span>{Math.round((readyCount / (totalCount || 1)) * 100)}%</span>
           </div>
           <div className="w-full bg-stone-200 h-1.5 rounded-full overflow-hidden">
             <div
               className="bg-[#8D4B00] h-full transition-all duration-300"
               style={{
-                width: `${Math.round((completedCount / (sessionSubprojects.length || 1)) * 100)}%`,
+                width: `${Math.round((readyCount / (totalCount || 1)) * 100)}%`,
               }}
             />
           </div>
@@ -182,16 +146,18 @@ export const SessionVideosDrawer: React.FC = () => {
         ) : (
           sessionSubprojects.map((sub, idx) => {
             const isActive = sub.id === activeProjectId;
-            const status = getStatusInfo(sub);
+            const status = getSubprojectStatusInfo(sub, projectJobStatuses, 'w-3 h-3');
 
             return (
               <div
                 key={sub.id}
-                onClick={() => switchSessionVideo(sub.id)}
-                className={`p-3 rounded-xl border transition-all cursor-pointer relative ${
+                onClick={() => {
+                  if (!isActive) void switchSessionVideo(sub.id);
+                }}
+                className={`p-3 rounded-xl border transition-all relative ${
                   isActive
-                    ? 'bg-amber-50/60 border-amber-300 shadow-xs ring-1 ring-amber-300/60'
-                    : 'bg-white border-stone-200 hover:border-stone-300 hover:bg-stone-50/60'
+                    ? 'bg-amber-50/60 border-amber-300 shadow-xs ring-1 ring-amber-300/60 cursor-default'
+                    : 'bg-white border-stone-200 hover:border-stone-300 hover:bg-stone-50/60 cursor-pointer'
                 }`}
               >
                 <div className="flex items-start justify-between gap-2">
@@ -220,7 +186,7 @@ export const SessionVideosDrawer: React.FC = () => {
                 {/* Status & Progress bar */}
                 <div className="mt-2.5 flex items-center justify-between">
                   <span
-                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold border ${status.color}`}
+                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold border ${status.pillClasses}`}
                   >
                     {status.icon}
                     <span>{status.label}</span>
@@ -241,8 +207,9 @@ export const SessionVideosDrawer: React.FC = () => {
         {currentStep === 1 && sessionSubprojects.length > 0 && (
           <button
             type="button"
+            disabled={!hasRunnableStage1 || isBatchAsrRunning}
             onClick={() => startBatchPrepareJobs()}
-            className="w-full py-2 rounded-xl bg-[#8D4B00] hover:bg-[#743D00] text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-xs cursor-pointer transition-colors"
+            className="w-full py-2 rounded-xl bg-[#8D4B00] hover:bg-[#743D00] text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow-xs cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Play className="w-3.5 h-3.5 fill-current" />
             <span>Process Batch ASR (All Videos)</span>

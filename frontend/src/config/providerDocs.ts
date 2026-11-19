@@ -13,12 +13,40 @@ export interface ProviderDocInfo {
 
 export const PROVIDER_DOCS: Record<string, ProviderDocInfo> = {
   // --- ASR (Speech-to-Text) ---
+  qwen_asr: {
+    id: 'qwen_asr',
+    name: 'Qwen3-ASR',
+    category: 'asr',
+    docUrl: 'https://github.com/QwenLM/Qwen3-ASR',
+    description: 'Local multilingual speech recognition models powered by Qwen3-ASR.',
+  },
   deepgram: {
     id: 'deepgram',
     name: 'Deepgram',
     category: 'asr',
     docUrl: 'https://developers.deepgram.com/docs/getting-started-with-pre-recorded-audio',
     description: 'Real-time & pre-recorded speech recognition API with speaker diarization and Nova-3 models.',
+  },
+  gemini_stt: {
+    id: 'gemini_stt',
+    name: 'Gemini STT',
+    category: 'asr',
+    docUrl: 'https://ai.google.dev/gemini-api/docs/audio',
+    description: 'Multimodal audio transcription and timestamped speech recognition via Google Gemini.',
+  },
+  google_stt: {
+    id: 'google_stt',
+    name: 'Google Speech-to-Text',
+    category: 'asr',
+    docUrl: 'https://cloud.google.com/speech-to-text/docs',
+    description: 'Google Speech-to-Text recognition API supporting global languages.',
+  },
+  elevenlabs_stt: {
+    id: 'elevenlabs_stt',
+    name: 'ElevenLabs Scribe',
+    category: 'asr',
+    docUrl: 'https://elevenlabs.io/docs/capabilities/speech-to-text',
+    description: 'ElevenLabs Scribe speech-to-text API with high-accuracy transcription and diarization.',
   },
   whisper: {
     id: 'whisper',
@@ -154,16 +182,38 @@ export function getProviderDocInfo(
 ): ProviderDocInfo | null {
   if (idOrType === undefined || idOrType === null) return null;
   const raw = String(idOrType).trim().toLowerCase();
+  if (!raw) return null;
 
-  // Numerical mapping for ASR providers
-  if (categoryHint === 'asr') {
+  const isNumeric = typeof idOrType === 'number' || /^\d+$/.test(raw);
+
+  // Numerical mapping for ASR providers (matches videotrans/recognition/__init__.py)
+  if (categoryHint === 'asr' && isNumeric) {
     const num = Number(raw);
-    if (num === 1) return PROVIDER_DOCS.deepgram;
-    if (num === 0) return PROVIDER_DOCS.whisper;
+    switch (num) {
+      case 0: return PROVIDER_DOCS.qwen_asr;
+      case 1: return PROVIDER_DOCS.deepgram;
+      case 2: return PROVIDER_DOCS.gemini_stt;
+      case 3: return PROVIDER_DOCS.google_stt;
+      case 4: return PROVIDER_DOCS.elevenlabs_stt;
+      case 5: return PROVIDER_DOCS.whisper;
+      default: return null;
+    }
+  }
+
+  // Numerical mapping for LLM translation providers (matches videotrans/translator/_registry.py)
+  if (categoryHint === 'llm' && isNumeric) {
+    const num = Number(raw);
+    switch (num) {
+      case 0: return PROVIDER_DOCS.google;
+      case 1: return PROVIDER_DOCS.openai;
+      case 2: return PROVIDER_DOCS.gemini;
+      case 3: return PROVIDER_DOCS.deepseek;
+      default: return null;
+    }
   }
 
   // Numerical mapping for TTS providers
-  if (categoryHint === 'tts' || typeof idOrType === 'number' || /^\d+$/.test(raw)) {
+  if ((categoryHint === 'tts' || !categoryHint) && isNumeric) {
     const num = Number(raw);
     switch (num) {
       case 0: return PROVIDER_DOCS.elevenlabs;
@@ -175,22 +225,42 @@ export function getProviderDocInfo(
       case 6: return PROVIDER_DOCS.cosyvoice;
       case 7: return PROVIDER_DOCS.f5tts;
       case 8: return PROVIDER_DOCS.chattts;
+      default: return null;
     }
   }
 
-  // Direct ID match
-  if (PROVIDER_DOCS[raw]) {
+  // Category-specific string disambiguation before generic direct match
+  if (raw === 'qwen-asr' || raw === 'qwen_asr' || raw === 'qwenasr' || raw.includes('qwen')) {
+    return PROVIDER_DOCS.qwen_asr;
+  }
+  if (raw === 'whisper-large-v3' || raw === 'faster-whisper' || raw.includes('whisper')) {
+    return PROVIDER_DOCS.whisper;
+  }
+  if (raw === 'gemini-stt' || (categoryHint === 'asr' && raw.includes('gemini'))) {
+    return PROVIDER_DOCS.gemini_stt;
+  }
+  if (raw === 'google-stt' || (categoryHint === 'asr' && raw.includes('google'))) {
+    return PROVIDER_DOCS.google_stt;
+  }
+  if (categoryHint === 'asr' && raw.includes('eleven')) {
+    return PROVIDER_DOCS.elevenlabs_stt;
+  }
+  if (raw === 'gemini-tts' || raw === 'gemini_tts' || (categoryHint === 'tts' && raw.includes('gemini'))) {
+    return PROVIDER_DOCS.gemini_tts;
+  }
+
+  // Direct ID match (respect categoryHint when specified)
+  if (PROVIDER_DOCS[raw] && (!categoryHint || PROVIDER_DOCS[raw].category === categoryHint)) {
     return PROVIDER_DOCS[raw];
   }
 
   // Name or partial match
   if (raw.includes('deepgram')) return PROVIDER_DOCS.deepgram;
-  if (raw.includes('whisper')) return PROVIDER_DOCS.whisper;
   if (raw.includes('funasr')) return PROVIDER_DOCS.funasr;
   if (raw.includes('vieneu')) return PROVIDER_DOCS.vieneu;
   if (raw.includes('omni')) return PROVIDER_DOCS.omnivoice;
   if (raw.includes('eleven')) return PROVIDER_DOCS.elevenlabs;
-  if (raw.includes('gemini')) return categoryHint === 'tts' ? PROVIDER_DOCS.gemini_tts : PROVIDER_DOCS.gemini;
+  if (raw.includes('gemini')) return PROVIDER_DOCS.gemini;
   if (raw.includes('deepseek')) return PROVIDER_DOCS.deepseek;
   if (raw.includes('claude') || raw.includes('anthropic')) return PROVIDER_DOCS.claude;
   if (raw.includes('ollama')) return PROVIDER_DOCS.ollama;

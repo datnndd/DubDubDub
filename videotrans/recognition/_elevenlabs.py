@@ -1,49 +1,73 @@
-import logging
 from dataclasses import dataclass
 from typing import List, Union
 
 import httpx
 from elevenlabs import ElevenLabs
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_not_exception_type, before_log, after_log
-from videotrans.configure.config import  params, settings, logger
-from videotrans.configure.excepts import NO_RETRY_EXCEPT
+from elevenlabs.core import ApiError as ElevenLabsApiError
+from videotrans.configure.config import params, logger
 from videotrans.recognition._base import BaseRecogn
+from videotrans.recognition._retry import (
+    build_httpx_retry_types,
+    extract_status_code,
+    is_retryable_status,
+    is_retryable_error,
+    run_with_retry,
+)
 from videotrans.task.taskcfg import SrtItem
 from videotrans.util._srt_parse import ms_to_time_string
+
+
+_RETRYABLE_ELEVENLABS_NET = build_httpx_retry_types()
+
+
+def _should_retry_elevenlabs(exc: BaseException) -> bool:
+    if isinstance(exc, ElevenLabsApiError):
+        return is_retryable_error(exc)
+    return is_retryable_error(exc) or isinstance(exc, _RETRYABLE_ELEVENLABS_NET)
 
 
 @dataclass
 class ElevenLabsRecogn(BaseRecogn):
 
-    @retry(retry=retry_if_not_exception_type(NO_RETRY_EXCEPT), stop=(stop_after_attempt(settings.get('retry_nums'))), wait=wait_fixed(2), before=before_log(logger, logging.INFO),  after=after_log(logger, logging.INFO))
     def _exec(self) -> Union[List[SrtItem], None]:
-        if self._exit(): return
+        if self._exit():
+            return
 
         with open(self.audio_file, 'rb') as file:
             file_object = file.read()
 
-        client = ElevenLabs(
-            api_key=params.get('elevenlabstts_key', ''),
-            httpx_client=httpx.Client(proxy=self.proxy_str)
-        )
-
-        language_code = self.detect_language[:2] if self.detect_language and self.detect_language != 'auto' else ''
+        raw_lang = (self.detect_language or '').strip().lower()
+        language_code = '' if raw_lang in ('', 'auto', '-') else raw_lang[:2]
         logger.debug(f'{language_code=}')
 
-        raws = []
+        model_id = self.model_name or "scribe_v2"
+        call_kwargs = {
+            "model_id": model_id,
+            "file": file_object,
+            "diarize": True,
+        }
         if language_code:
-            res = client.speech_to_text.convert(
-                model_id="scribe_v2",
-                file=file_object,
-                language_code=language_code,
-                diarize=True
+            call_kwargs["language_code"] = language_code
+
+        timeout_cfg = (
+            httpx.Timeout(240.0, connect=30.0)
+            if callable(getattr(httpx, "Timeout", None))
+            else 240.0
+        )
+        with httpx.Client(proxy=self.proxy_str or None, timeout=timeout_cfg) as http_client:
+            client = ElevenLabs(
+                api_key=params.get('elevenlabstts_key', ''),
+                timeout=240.0,
+                httpx_client=http_client,
             )
-        else:
-            res = client.speech_to_text.convert(
-                model_id="scribe_v1",
-                file=file_object,
-                diarize=True
+            res = run_with_retry(
+                lambda: client.speech_to_text.convert(**call_kwargs),
+                should_retry=_should_retry_elevenlabs,
+                is_cancelled=self._exit,
+                label="ElevenLabsRecogn",
             )
+
+        raws = []
         last_tmp = None
         logger.debug(f'elevenlabs{res=}\n')
         for it in res.words:
@@ -52,7 +76,7 @@ class ElevenLabsRecogn(BaseRecogn):
             text = it.text
             if not text: continue
             isflag = text[0] in self.flag or text[-1] in self.flag
-            spk = it.speaker_id.replace('speaker_', '')
+            spk = (it.speaker_id or '').replace('speaker_', '')
 
             st = int(it.start * 1000)
             end = int(it.end * 1000)

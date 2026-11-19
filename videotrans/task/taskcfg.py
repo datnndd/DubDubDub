@@ -145,6 +145,10 @@ class TaskCfgSTT(TaskCfgBase):
     rephrase: int = 0  # 0=default segmentation, 1=LLM re-segmentation
     fix_punc: int = 0  # 0=default, 1=restore punctuation, 2=remove all punctuation
     deepgram_options: Optional[Union[dict, str]] = None
+    subtitle_source: str = "audio_asr"  # subtitle source audio_asr|video_ocr
+    ocr_roi: Optional[tuple] = None  # normalized (x,y,w,h)
+    ocr_roi_confirmed: bool = False  # user confirmed ROI in dialog
+    ocr_options: Optional[dict] = None  # coarse_interval_ms, use_angle_cls, paragraph_mode
 
 
 # Dubbing
@@ -190,9 +194,6 @@ class TaskCfgVTT(TaskCfgSTT, TaskCfgTTS, TaskCfgSTS):
     subtitle_type: int = 0  # Subtitle embedding type: 0=none, 1=hard, 2=soft, 3=dual hard, 4=dual soft
     only_out_mp4: bool = False  # Whether to output mp4 only, used only in video translation
     only_out_dubbed_audio: bool = False
-    subtitle_source: str = "audio_asr"  # subtitle source audio_asr|video_ocr
-    ocr_roi: Optional[tuple] = None  # normalized (x,y,w,h)
-    ocr_roi_confirmed: bool = False  # user confirmed ROI in dialog
     recogn2pass: bool = False  # Second-pass speech recognition on dubbed audio
     output_srt: int = 0  # Output subtitle format in transcribe and translate mode: 0=single, 1=bilingual target bottom, 2=bilingual target top
     copysrt_rawvideo: bool = False  # Whether to copy generated subtitles to video directory

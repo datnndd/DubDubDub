@@ -44,10 +44,12 @@ class BaseTTS(BaseCon):
     # Whether finished
     has_done: int = field(default=0, init=False)
 
-    # Pause duration after each task
-    wait_sec: float = float(settings.get('dubbing_wait', 0))
-    # Concurrent thread count
-    dub_nums: int = int(float(settings.get('dubbing_thread', 1)))
+    # Pause duration after each task (resolved dynamically in __post_init__)
+    wait_sec: Optional[float] = None
+    # Concurrent thread count (resolved dynamically in __post_init__)
+    dub_nums: Optional[int] = None
+    # Cloud provider flag for auto-scaling concurrency
+    is_cloud_provider: bool = False
     # Stores message
     error: Union[str, Exception, None] = None
     # Dubbing API URL
@@ -61,6 +63,19 @@ class BaseTTS(BaseCon):
 
     def __post_init__(self):
         super().__post_init__()
+        is_cloud = bool(self.is_cloud_provider or self.tts_type in (0, 3))
+        if self.dub_nums is None:
+            cfg_threads = int(float(settings.get('dubbing_thread', 1) or 1))
+            if is_cloud and cfg_threads <= 1:
+                self.dub_nums = max(1, min(4, len(self.queue_tts)))
+            else:
+                self.dub_nums = max(1, cfg_threads)
+        if self.wait_sec is None:
+            cfg_wait = float(settings.get('dubbing_wait', 0) or 0)
+            if is_cloud and cfg_wait == 1.0:
+                self.wait_sec = 0.0
+            else:
+                self.wait_sec = max(0.0, cfg_wait)
         Path(f'{config.TEMP_DIR}/{self.uuid}').mkdir(parents=True, exist_ok=True)
         self.queue_tts = copy.deepcopy(self.queue_tts)
         self.len = len(self.queue_tts)
@@ -152,17 +167,17 @@ class BaseTTS(BaseCon):
             logger.debug(f'设定最大配音线程: {self.dub_nums},实际 单线程配音, 待配音字幕长度: {self.len}, 配音后暂停{self.wait_sec}s')
             for k, item in enumerate(self.queue_tts):
                 if self._exit(): return
-                if not item.get('text').strip() or vail_file(item['filename']):
+                if not item.get('text', '').strip() or vail_file(item['filename']):
                     continue
-                # Only record the last error
                 error = self._item_task(item, k)
-                self.error = error
-                if error and isinstance(error, StopTask):
-                    # Send termination signal; termination will add uuid to app_cfg.stop_uid
-                    raise error
+                if error:
+                    self.error = error
+                    if isinstance(error, StopTask):
+                        raise error
 
                 self.signal(text=f'{tr("Dubbing")} [{k + 1}/{self.len}]')
-                time.sleep(self.wait_sec)
+                if self.wait_sec > 0 and k < len(self.queue_tts) - 1:
+                    time.sleep(self.wait_sec)
             return
 
         all_task = []
@@ -172,8 +187,11 @@ class BaseTTS(BaseCon):
         try:
             completed_tasks = 0
             for k, item in enumerate(self.queue_tts):
-                if self._exit(): return
-                if not item.get('text').strip() or vail_file(item['filename']):
+                if self._exit():
+                    for f in all_task:
+                        f.cancel()
+                    return
+                if not item.get('text', '').strip() or vail_file(item['filename']):
                     completed_tasks += 1
                     continue
                 future = pool.submit(self._item_task, item, k)
@@ -181,18 +199,23 @@ class BaseTTS(BaseCon):
 
             if all_task:
                 for task in as_completed(all_task):
-                    if self._exit(): return
-                    # Only record the last error
+                    if self._exit():
+                        for f in all_task:
+                            f.cancel()
+                        return
                     error = task.result()
-                    self.error = error
-                    if error and isinstance(error, StopTask):
-                        # Send termination signal; termination will add uuid to app_cfg.stop_uid
-                        raise error
+                    if error:
+                        self.error = error
+                        if isinstance(error, StopTask):
+                            for f in all_task:
+                                f.cancel()
+                            raise error
                     completed_tasks += 1
                     self.signal(text=f"{tr('Dubbing')}: [{completed_tasks}/{self.len}] ...")
             self.signal(text=f"TTS ended ...")
         finally:
-            # Only cancels queued tasks and prevents main thread from waiting
+            for f in all_task:
+                f.cancel()
             pool.shutdown(wait=False)
 
     # Called by run(); subclasses may override to implement batch dubbing for entire queue_tts
@@ -224,12 +247,15 @@ class BaseTTS(BaseCon):
 
     # Text normalization and parameter cleanup (volume, etc.)
     def _cleantts(self) -> None:
+        if not self.queue_tts:
+            return
         normalizer = None
+        lang_prefix = (self.language or "")[:2].lower()
         if settings.get('normal_text'):
-            if self.language[:2] == 'zh':
+            if lang_prefix == 'zh':
                 from videotrans.util.cn_tn import TextNorm
                 normalizer = TextNorm(to_banjiao=True)
-            elif self.language[:2] == 'en':
+            elif lang_prefix == 'en':
                 from videotrans.util.en_tn import EnglishNormalizer
                 normalizer = EnglishNormalizer()
 
@@ -240,15 +266,15 @@ class BaseTTS(BaseCon):
                 except Exception as e:
                     logger.exception(f'文本规范化失败，忽略:{it["text"]=},{e}', exc_info=True)
 
-        volume = self.queue_tts[0].get('volume', '+0%')
+        volume = str(self.queue_tts[0].get('volume') or '+0%')
         volume = f'+{volume}' if re.match(r'^\d+(\.\d+)?%$', volume) else volume
         self.volume = '+0%' if not re.match(r'^[+-]\d+(\.\d+)?%$', volume) else volume
 
-        rate = self.queue_tts[0].get('rate', '+0%')
+        rate = str(self.queue_tts[0].get('rate') or '+0%')
         rate = f'+{rate}' if re.match(r'^\d+(\.\d+)?%$', rate) else rate
         self.rate = '+0%' if not re.match(r'^[+-]\d+(\.\d+)?%$', rate) else rate
 
-        pitch = self.queue_tts[0].get('pitch', '+0Hz').replace('hz', 'Hz')
+        pitch = str(self.queue_tts[0].get('pitch') or '+0Hz').replace('hz', 'Hz')
         pitch = f'+{pitch}' if re.match(r'^\d+(\.\d+)?Hz$', pitch, re.I) else pitch
         self.pitch = '+0Hz' if not re.match(r'^[+-]\d+(\.\d+)?Hz$', pitch, flags=re.I) else pitch
 
@@ -295,3 +321,72 @@ class BaseTTS(BaseCon):
         if not ref_wav or not Path(ref_wav).exists():
             raise RuntimeError(tr('The role {} does not exist', role))
         return ref_wav, ref_text
+
+    def convert_to_wav(self, mp3_file_path: str, output_wav_file_path: str, extra=None):
+        """Convert TTS output to 48kHz stereo PCM_16 WAV and trim leading/trailing silence fast via NumPy."""
+        if self._exit() or not vail_file(mp3_file_path):
+            return
+        cmd = [
+            "-y",
+            "-i",
+            mp3_file_path,
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-c:a",
+            "pcm_s16le",
+        ]
+        if extra:
+            cmd += extra
+        cmd.append(output_wav_file_path)
+        try:
+            from videotrans.util.help_ffmpeg import runffmpeg, remove_silence_wav
+            runffmpeg(cmd, force_cpu=True)
+            if settings.get('remove_dubb_silence', True) and Path(output_wav_file_path).is_file():
+                try:
+                    import math
+                    import numpy as np
+                    import soundfile as sf
+
+                    data, sr = sf.read(output_wav_file_path, dtype="float32", always_2d=False)
+                    if sr > 0 and data.size > 0:
+                        mono = np.mean(data, axis=1) if data.ndim > 1 else data
+                        rms = float(np.sqrt(np.mean(mono * mono)))
+                        dbfs = 20.0 * math.log10(rms) if rms > 1e-10 else -float("inf")
+                        if not math.isfinite(dbfs):
+                            dbfs = -50.0
+                        silence_thresh_db = min(-55.0, dbfs - 20.0)
+                        thresh_amp = 10.0 ** (silence_thresh_db / 20.0)
+
+                        step = max(1, int(sr * 0.010))  # 10ms frames
+                        min_sil_frames = max(1, int(round(200 / 10)))
+                        n_frames = len(mono) // step
+                        if n_frames > 0:
+                            trimmed_view = mono[: n_frames * step].reshape(n_frames, step)
+                            frame_rms = np.sqrt(np.mean(trimmed_view * trimmed_view, axis=1))
+                            is_nonsilent = frame_rms >= thresh_amp
+                            if np.any(is_nonsilent):
+                                first_ns = int(np.argmax(is_nonsilent))
+                                last_ns = int(len(is_nonsilent) - 1 - np.argmax(is_nonsilent[::-1]))
+                                # Match pydub detect_nonsilent semantics: only trim if silence >= 200ms
+                                raw_start_ms = first_ns * 10 if first_ns >= min_sil_frames else 0
+                                raw_end_ms = (last_ns + 1) * 10 if (n_frames - 1 - last_ns) >= min_sil_frames else int(len(data) * 1000 / sr)
+                                total_ms = int(len(data) * 1000 / sr)
+                                start_trim_ms = max(0, raw_start_ms - 80)
+                                end_trim_ms = min(total_ms, raw_end_ms + 600)
+                                if start_trim_ms > 0 or end_trim_ms < total_ms:
+                                    s_idx = int(start_trim_ms * sr / 1000)
+                                    e_idx = max(s_idx + 1, int(end_trim_ms * sr / 1000))
+                                    tmp_trim = Path(output_wav_file_path).with_suffix(".trim.wav")
+                                    try:
+                                        sf.write(str(tmp_trim), data[s_idx:e_idx], sr, subtype="PCM_16", format="WAV")
+                                        os.replace(tmp_trim, output_wav_file_path)
+                                    finally:
+                                        tmp_trim.unlink(missing_ok=True)
+                except Exception:
+                    remove_silence_wav(output_wav_file_path)
+        except Exception as e:
+            logger.exception(f'Failed to convert to 48k wav, skipping: {e}', exc_info=True)
+            return False
+        return True

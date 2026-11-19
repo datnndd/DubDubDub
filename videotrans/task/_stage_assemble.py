@@ -26,8 +26,37 @@ class AssembleMixin:
         self._join_video_audio_srt()
         logger.debug(f'[音频+字幕+画面合成阶段结束耗时]:{time.time()-_st}s')
 
+    def _wait_for_novoice_before_export(self) -> bool:
+        if self._exit():
+            return False
+        novoice_thread = getattr(self, "_novoice_thread", None)
+        while novoice_thread is not None and novoice_thread.is_alive():
+            if self._exit():
+                return False
+            novoice_thread.join(timeout=0.2)
+        if self._exit():
+            return False
+        task_uuid = getattr(self, "uuid", None)
+        if task_uuid and task_uuid in app_cfg.queue_novice:
+            ready = is_novoice_mp4(
+                self.cfg.novoice_mp4,
+                task_uuid,
+                event_sink=getattr(self, "event_sink", None),
+                cancellation_token=getattr(self, "cancellation_token", None),
+            )
+            if self._exit() or not ready:
+                return False
+        return True
+
     def task_done(self) -> None:
         if self._exit(): return
+        novoice_thread = getattr(self, "_novoice_thread", None)
+        if novoice_thread is not None and novoice_thread.is_alive():
+            if getattr(self.cfg, 'only_out_dubbed_audio', False) and getattr(self.cfg, 'video_autorate', False):
+                if not self._wait_for_novoice_before_export():
+                    return
+            else:
+                novoice_thread.join(timeout=2.0)
         self.precent = max(99, self.precent)
 
         if self.cfg.app_mode == 'tiqu':
@@ -49,6 +78,8 @@ class AssembleMixin:
 
         try:
             if getattr(self.cfg, 'only_out_dubbed_audio', False):
+                if getattr(self.cfg, 'video_autorate', False) and not self._wait_for_novoice_before_export():
+                    return
                 self._export_dubbed_audio()
                 self._export_slowed_video()
             elif self.cfg.only_out_mp4:
@@ -71,6 +102,8 @@ class AssembleMixin:
     def _export_slowed_video(self) -> None:
         if not getattr(self.cfg, 'video_autorate', False):
             return
+        if not self._wait_for_novoice_before_export():
+            return
         if not vail_file(self.cfg.novoice_mp4):
             raise VideoTransError(tr('Slow video output is missing: {}', self.cfg.novoice_mp4))
         output_path = Path(self.cfg.target_dir) / f'{self.cfg.target_language_code}-slowed.mp4'
@@ -91,6 +124,7 @@ class AssembleMixin:
                 Path(output_path).unlink(missing_ok=True)
 
     def _video_extend(self, duration_ms=1000):
+        cancel_token = getattr(self, "cancellation_token", None)
         sec = duration_ms / 1000.0
         final_video_path = Path(f'{self.cfg.cache_folder}/final_video_with_freeze_lastend.mp4').as_posix()
 
@@ -102,21 +136,34 @@ class AssembleMixin:
                '-an', 'final_video_with_freeze_lastend.mp4'
         ]
         try:
-            runffmpeg(cmd, force_cpu=True, cmd_dir=self.cfg.cache_folder)
+            runffmpeg(cmd, force_cpu=True, cmd_dir=self.cfg.cache_folder, cancellation_token=cancel_token)
+            if self._exit():
+                return
             if Path(final_video_path).exists():
                 shutil.copy2(final_video_path, self.cfg.novoice_mp4)
                 logger.debug(f"视频定格应延长{duration_ms}ms，实际向上取整秒延长{sec}s,操作成功。")
         except Exception as e:
+            if self._exit():
+                return
             logger.exception(f"视频定格延长操作失败,跳过 {e}", exc_info=True)
 
     def _join_video_audio_srt(self) -> None:
         if self._exit() or not self.should_hebing:
             return
+        cancel_token = getattr(self, "cancellation_token", None)
         if self.should_dubbing and self.queue_tts:
             self._save_srt_target(self.queue_tts, self.cfg.target_sub)
         self.signal(text="Checking novoice.mp4...")
-        is_novoice_mp4(self.cfg.novoice_mp4, self.uuid)
-        if not Path(self.cfg.novoice_mp4).exists():
+        ready = is_novoice_mp4(
+            self.cfg.novoice_mp4,
+            self.uuid,
+            event_sink=getattr(self, "event_sink", None),
+            cancellation_token=cancel_token,
+        )
+        if self._exit() or not ready:
+            if self._exit():
+                return
+        if not vail_file(self.cfg.novoice_mp4):
             raise VideoTransError(f'{self.cfg.novoice_mp4} 不存在')
 
         if self.should_dubbing and not vail_file(self.cfg.target_wav):
@@ -124,6 +171,7 @@ class AssembleMixin:
 
         self.precent = min(max(90, self.precent), 98)
         target_m4a = self.cfg.cache_folder + "/will_embed.m4a"
+        Path(target_m4a).unlink(missing_ok=True)
         output_source_output = True
         duration_ms = int(get_video_duration(self.cfg.novoice_mp4))
         # If video duration is greater than audio duration, pad silence at end of audio; do not compare audio > video thereafter
@@ -132,27 +180,30 @@ class AssembleMixin:
             self.signal(text=tr("Get original sound..."))
             self._get_origin_audio(target_m4a,duration_ms)
         else:
-            output_source_output = False
-            cmd = [
-                "-y",
-                "-i",
-                self.cfg.name,
-                "-vn",
-                "-b:a", "128k",
-                "-c:a",
-                "aac",
-                self.cfg.source_wav_output
-            ]
+            if self.video_info.get('streams_audio', 0) > 0:
+                output_source_output = False
+                cmd = [
+                    "-y",
+                    "-i",
+                    self.cfg.name,
+                    "-vn",
+                    "-b:a", "128k",
+                    "-c:a",
+                    "aac",
+                    self.cfg.source_wav_output
+                ]
 
-            def _output():
-                nonlocal output_source_output
-                try:
-                    runffmpeg(cmd)
-                except Exception as e:
-                    logger.exception(f'单独输出原始视频中音频文件到目标文件夹失败，跳过{e}', exc_info=True)
-                finally:
-                    output_source_output = True
-            threading.Thread(target=_output, daemon=True).start()
+                def _output():
+                    nonlocal output_source_output
+                    try:
+                        runffmpeg(cmd, cancellation_token=cancel_token)
+                    except Exception as e:
+                        logger.exception(f'单独输出原始视频中音频文件到目标文件夹失败，跳过{e}', exc_info=True)
+                    finally:
+                        output_source_output = True
+                threading.Thread(target=_output, daemon=True).start()
+            else:
+                output_source_output = True
             self.signal(text=tr("Check manually added BGM..."))
             self._back_music()
             self.signal(text="Mix original audio...")
@@ -177,9 +228,14 @@ class AssembleMixin:
                 os.path.basename(target_m4a)
             ])
             self.signal(text=tr("Process voiceover for embedding..."))
-            runffmpeg(_cmd, cmd_dir=self.cfg.cache_folder)
+            runffmpeg(_cmd, cmd_dir=self.cfg.cache_folder, cancellation_token=cancel_token)
 
-        shutil.copy2(target_m4a, self.cfg.target_wav_output)
+        if self._exit():
+            return
+
+        has_audio = vail_file(target_m4a)
+        if has_audio:
+            shutil.copy2(target_m4a, self.cfg.target_wav_output)
         self.precent = min(max(95, self.precent), 98)
         _video_output_ext = settings.get('out_video_ext', '.mp4')
         subtitles_file, subtitle_langcode = None, None
@@ -190,8 +246,8 @@ class AssembleMixin:
         if _video_output_ext!='.mp4':
             subtitle_langcode=translator.get_mkv_code(subtitle_langcode)
 
-        audio_ms = get_audio_time(target_m4a)
-        a_v_offset=audio_ms-duration_ms
+        audio_ms = get_audio_time(target_m4a) if has_audio else 0
+        a_v_offset = (audio_ms - duration_ms) if has_audio else 0
 
         is_copy_mode = str(self.video_codec_num) == '264'
         is_lossless=self.is_copy_video and is_copy_mode and not self.cfg.video_autorate and self.cfg.subtitle_type not in [1, 3]
@@ -230,9 +286,12 @@ class AssembleMixin:
             cmd1 = [
                 "-i",
                 novoice_mp4_basename,
-                "-i",
-                target_m4a_basename
             ]
+            if has_audio:
+                cmd1.extend([
+                    "-i",
+                    target_m4a_basename,
+                ])
             enc_qua = ['-crf', f'{settings.get("crf", 23)}', '-preset', settings.get('preset', 'medium')]
 
             fps_mode=None
@@ -246,18 +305,25 @@ class AssembleMixin:
                 cmd1.extend([
                     '-map',
                     '0:v',
-                    '-map',
-                    '1:a'
                 ])
+                if has_audio:
+                    cmd1.extend([
+                        '-map',
+                        '1:a',
+                    ])
                 if self.cfg.subtitle_type in [2, 4]:
-                    cmd1.extend(['-map', '2:s'])
+                    sub_input_idx = 2 if has_audio else 1
+                    cmd1.extend(['-map', f'{sub_input_idx}:s'])
 
                 cmd1.extend([
                     "-c:v",
                     "copy"  if is_copy_mode else f"libx{self.video_codec_num}",
-                    "-c:a",
-                    "copy",
                 ])
+                if has_audio:
+                    cmd1.extend([
+                        "-c:a",
+                        "copy",
+                    ])
                 if self.cfg.subtitle_type in [2, 4]:
                     cmd1.extend([
                         "-c:s",
@@ -273,22 +339,26 @@ class AssembleMixin:
                 if fps_mode:
                     cmd2.extend(fps_mode)
 
-                cmd2.extend(['-shortest',tmp_target_mp4_basename])
+                if has_audio and self.cfg.subtitle_type not in [2, 4]:
+                    cmd2.append('-shortest')
+                cmd2.append(tmp_target_mp4_basename)
                 if is_copy_mode:
                     logger.debug(f'[最终视频合成]copy模式，无需重新编码:\n{cmd0 + cmd1 + cmd2}')
-                    runffmpeg(cmd0 + cmd1 + cmd2, cmd_dir=self.cfg.cache_folder, force_cpu=True)
+                    runffmpeg(cmd0 + cmd1 + cmd2, cmd_dir=self.cfg.cache_folder, force_cpu=True, cancellation_token=cancel_token)
                 elif app_cfg.video_codec.startswith('libx') or settings.get('force_lib'):
                     logger.debug(f'[最终视频合成]不支持硬件编码或指定了强制软编解码:\n{cmd0 + cmd1 + cmd2}')
-                    runffmpeg(cmd0 + cmd1 + enc_qua + cmd2, cmd_dir=self.cfg.cache_folder, force_cpu=True)
+                    runffmpeg(cmd0 + cmd1 + enc_qua + cmd2, cmd_dir=self.cfg.cache_folder, force_cpu=True, cancellation_token=cancel_token)
                 else:
                     hw_decode_args, _, vcodec, enc_args = self._get_hard_cfg()
                     cmd1[cmd1.index('-c:v') + 1] = vcodec
                     try:
                         self._subprocess(cmd0 + hw_decode_args + cmd1 + enc_args + cmd2)
                     except Exception as e:
+                        if self._exit():
+                            return
                         cmd1[cmd1.index('-c:v') + 1] = f'libx{self.video_codec_num}'
                         logger.exception(f'硬件处理视频合成失败，回退软编 {e}', exc_info=True)
-                        runffmpeg(cmd0 + cmd1 + enc_qua + cmd2, cmd_dir=self.cfg.cache_folder, force_cpu=True)
+                        runffmpeg(cmd0 + cmd1 + enc_qua + cmd2, cmd_dir=self.cfg.cache_folder, force_cpu=True, cancellation_token=cancel_token)
 
             else:
                 cmd1.append('-filter_complex')
@@ -296,35 +366,51 @@ class AssembleMixin:
                 cmd2 = [
                     "-map",
                     "[v_out]",
-                    "-map",
-                    "1:a",
+                ]
+                if has_audio:
+                    cmd2.extend([
+                        "-map",
+                        "1:a",
+                    ])
+                cmd2.extend([
                     "-c:v",
                     f'libx{self.video_codec_num}',
-                    '-c:a',
-                    'copy',
-                ]
+                ])
+                if has_audio:
+                    cmd2.extend([
+                        '-c:a',
+                        'copy',
+                    ])
                 cmd3 = ["-movflags", "+faststart"]
 
                 if fps_mode:
                     cmd3.extend(fps_mode)
-                cmd3.extend(['-shortest', tmp_target_mp4_basename])
+                if has_audio:
+                    cmd3.append('-shortest')
+                cmd3.append(tmp_target_mp4_basename)
                 if app_cfg.video_codec.startswith('libx') or settings.get('force_lib'):
                     logger.debug(f'[最终视频合成]不支持硬件编解码或指定了强制软编解码:\n{cmd0 + cmd1 + cmd2}')
                     runffmpeg(cmd0 + cmd1 + subtitle_filter + cmd2 + enc_qua + cmd3,
-                                    cmd_dir=self.cfg.cache_folder, force_cpu=True)
+                                    cmd_dir=self.cfg.cache_folder, force_cpu=True, cancellation_token=cancel_token)
                 else:
                     try:
                         hw_decode_args, vf_string, vcodec, enc_args = self._get_hard_cfg(subtitles_file)
                         cmd2[cmd2.index('-c:v') + 1] = vcodec
                         self._subprocess(cmd0 + hw_decode_args + cmd1 + [vf_string] + cmd2 + enc_args + cmd3)
                     except Exception as e:
+                        if self._exit():
+                            return
                         cmd2[cmd2.index('-c:v') + 1] = f'libx{self.video_codec_num}'
                         logger.exception(f'硬件处理视频合成失败，回退软编 {e}', exc_info=True)
                         runffmpeg(cmd0 + cmd1 + subtitle_filter + cmd2 + enc_qua + cmd3,
-                                        cmd_dir=self.cfg.cache_folder, force_cpu=True)
+                                        cmd_dir=self.cfg.cache_folder, force_cpu=True, cancellation_token=cancel_token)
         except Exception as e:
+            if self._exit():
+                return
             raise VideoTransError(tr('Error in embedding the final step of the subtitle dubbing')+str(e)) from e
 
+        if self._exit():
+            return
         if Path(tmp_target_mp4).exists():
             try:
                 self.cfg.targetdir_mp4=self.cfg.targetdir_mp4[:-4]+_video_output_ext
@@ -344,6 +430,7 @@ class AssembleMixin:
     def _get_origin_audio(self, output,duration_ms=0):
         if self.video_info.get('streams_audio', 0) == 0:
             return
+        cancel_token = getattr(self, "cancellation_token", None)
         cmd = [
             "-y",
             "-i",
@@ -355,7 +442,7 @@ class AssembleMixin:
             cmd.extend(['-af', f'apad=pad_dur={v_a_offset/1000.0}'])
 
         cmd.extend(['-c:a', 'aac', '-b:a', '128k',output])
-        return runffmpeg(cmd)
+        return runffmpeg(cmd, cancellation_token=cancel_token)
 
     def _hebing_pro(self, protxt) -> None:
         while 1:
@@ -463,19 +550,59 @@ class AssembleMixin:
 
     def _subprocess(self, cmd):
         logger.debug(f'[尝试硬件编解码执行命令]\n{" ".join(cmd)}\n')
+        from videotrans.core.proc_registry import (
+            get_current_job_id,
+            register_proc,
+            unregister_proc,
+            kill_process_tree,
+        )
+
+        active_job_id = get_current_job_id()
+        proc = None
         try:
-            if self._exit(): return
-            cmd = ["ffmpeg", '-nostdin'] + cmd
-            subprocess.run(
+            if self._exit():
+                return False
+            cmd = ["ffmpeg", '-nostdin'] + list(cmd)
+            proc = subprocess.Popen(
                 cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 encoding="utf-8",
                 errors='ignore',
-                check=True,
                 text=True,
-                capture_output=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
-                cwd=self.cfg.cache_folder
+                cwd=self.cfg.cache_folder,
             )
+            if active_job_id:
+                register_proc(active_job_id, proc)
+
+            stdout = ""
+            stderr = ""
+            while True:
+                if self._exit():
+                    kill_process_tree(proc)
+                    try:
+                        out, err = proc.communicate(timeout=1.0)
+                        stdout += out or ""
+                        stderr += err or ""
+                    except Exception:
+                        pass
+                    raise FFmpegError("FFmpeg execution was cancelled")
+                try:
+                    out, err = proc.communicate(timeout=0.2)
+                    stdout += out or ""
+                    stderr += err or ""
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+
+            if self._exit():
+                raise FFmpegError("FFmpeg execution was cancelled")
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, cmd, output=stdout, stderr=stderr)
             return True
         except subprocess.CalledProcessError as e:
             raise FFmpegError(f"尝试使用硬件执行命令出错[CalledProcessError]:{e.stderr}\n{e.stdout},{e}") from e
+        finally:
+            if proc and active_job_id:
+                unregister_proc(active_job_id, proc)

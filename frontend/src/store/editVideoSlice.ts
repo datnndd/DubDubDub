@@ -1,7 +1,19 @@
 import { StateCreator } from 'zustand';
 import type { AudioMixSettings, SubtitleStyleSettings, EditVideoState } from '../types/editor';
-import { uploadEditAsset } from '../api/media';
+import { uploadEditAsset, uploadMedia } from '../api/media';
 import { requestRender } from '../api/stages';
+
+async function readFileAsDataUrl(file: File): Promise<string> {
+  if (typeof FileReader === 'undefined') {
+    return typeof URL !== 'undefined' && URL.createObjectURL ? URL.createObjectURL(file) : '';
+  }
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+    reader.onerror = () => reject(reader.error || new Error('Failed to read file'));
+    reader.readAsDataURL(file);
+  });
+}
 
 const DEFAULT_AUDIO_MIX: AudioMixSettings = { original: 0, dubbed: 100, background: 35 };
 
@@ -113,24 +125,48 @@ export const createEditVideoSlice: StateCreator<any, [], [], EditVideoSlice> = (
 
   setBackgroundAudio: async (file: File | null) => {
     if (!file) return;
+    set((state: any) => ({
+      editVideo: { ...state.editVideo, error: null },
+    }));
     try {
       const resp = await uploadEditAsset('background-audio', file);
-      const url = URL.createObjectURL(file);
+      const respUrl = (resp as any)?.url;
+      let url = typeof respUrl === 'string' && respUrl && !respUrl.startsWith('blob:') ? respUrl : '';
+      if (!url) {
+        try {
+          const mediaResp = await uploadMedia(file);
+          if (mediaResp?.id) {
+            url = `/api/media/${mediaResp.id}/file`;
+          }
+        } catch {
+          // Fallback when /api/media is unavailable in mocked test environments
+        }
+      }
+      if (!url && typeof URL !== 'undefined' && URL.createObjectURL) {
+        url = URL.createObjectURL(file);
+      }
       set((state: any) => ({
         editVideo: {
           ...state.editVideo,
+          error: null,
           backgroundAudio: { id: resp.id, file, name: resp.name, url },
         },
       }));
       get().triggerAutosave();
     } catch (err: any) {
       console.warn('Failed to upload background audio:', err);
+      set((state: any) => ({
+        editVideo: {
+          ...state.editVideo,
+          error: err?.message || 'Failed to upload background audio',
+        },
+      }));
     }
   },
 
   removeBackgroundAudio: () => {
     const cur = get().editVideo.backgroundAudio;
-    if (cur?.url && typeof URL !== 'undefined') {
+    if (cur?.url && cur.url.startsWith('blob:') && typeof URL !== 'undefined') {
       try { URL.revokeObjectURL(cur.url); } catch (_) {}
     }
     set((state: any) => ({
@@ -144,24 +180,44 @@ export const createEditVideoSlice: StateCreator<any, [], [], EditVideoSlice> = (
 
   setThumbnail: async (file: File | null) => {
     if (!file) return;
+    set((state: any) => ({
+      editVideo: { ...state.editVideo, error: null },
+    }));
     try {
       const resp = await uploadEditAsset('thumbnail', file);
-      const url = URL.createObjectURL(file);
+      const respUrl = (resp as any)?.url;
+      let url = typeof respUrl === 'string' && respUrl && !respUrl.startsWith('blob:') ? respUrl : '';
+      if (!url) {
+        try {
+          url = await readFileAsDataUrl(file);
+        } catch {
+          if (typeof URL !== 'undefined' && URL.createObjectURL) {
+            url = URL.createObjectURL(file);
+          }
+        }
+      }
       set((state: any) => ({
         editVideo: {
           ...state.editVideo,
+          error: null,
           thumbnail: { id: resp.id, file, name: resp.name, url },
         },
       }));
       get().triggerAutosave();
     } catch (err: any) {
       console.warn('Failed to upload thumbnail:', err);
+      set((state: any) => ({
+        editVideo: {
+          ...state.editVideo,
+          error: err?.message || 'Failed to upload thumbnail',
+        },
+      }));
     }
   },
 
   removeThumbnail: () => {
     const cur = get().editVideo.thumbnail;
-    if (cur?.url && typeof URL !== 'undefined') {
+    if (cur?.url && cur.url.startsWith('blob:') && typeof URL !== 'undefined') {
       try { URL.revokeObjectURL(cur.url); } catch (_) {}
     }
     set((state: any) => ({
@@ -208,18 +264,40 @@ export const createEditVideoSlice: StateCreator<any, [], [], EditVideoSlice> = (
 
     set((s: any) => ({
       editVideo: { ...s.editVideo, exporting: true, error: null },
+      jobStatus: 'running',
+      jobStage: 'render',
+      jobProgress: 0,
+      jobMessage: 'Rendering dubbed video…',
+      startTime: Date.now(),
+      elapsedSeconds: 0,
     }));
 
     try {
       const payload = buildRenderRequest(state);
-      const res = await requestRender(payload);
-      const jobId = res.id || res.jobId;
-      if (jobId) {
-        state.subscribeToJob?.(jobId);
+      const res: any = await requestRender(payload);
+      const jobId = res?.id || res?.jobId;
+      if (!jobId) {
+        throw new Error('Server did not return a render job ID');
       }
+      if (res?.status === 'succeeded') {
+        set((s: any) => ({
+          editVideo: { ...s.editVideo, exporting: false, error: null },
+          jobStatus: 'completed',
+          jobStage: 'render',
+          jobProgress: 100,
+          jobMessage: res.message || 'Video rendered successfully',
+        }));
+        get().loadProjects?.();
+        return;
+      }
+      state.subscribeToJob?.(jobId, state.activeProjectId, { jobType: 'render' });
     } catch (err: any) {
+      const errMsg = err?.message || 'Video export failed';
       set((s: any) => ({
-        editVideo: { ...s.editVideo, exporting: false, error: err.message },
+        editVideo: { ...s.editVideo, exporting: false, error: errMsg },
+        jobStatus: 'failed',
+        jobStage: 'render',
+        jobMessage: errMsg,
       }));
     }
   },

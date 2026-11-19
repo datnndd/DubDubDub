@@ -6,13 +6,36 @@ import { ProviderDocLink } from '../src/components/ProviderDocLink';
 
 describe('Provider Documentation Registry & Links', () => {
   it('resolves official documentation links for ASR providers', () => {
+    const qwenDoc = getProviderDocInfo(0, 'asr');
+    expect(qwenDoc).not.toBeNull();
+    expect(qwenDoc?.id).toBe('qwen_asr');
+    expect(qwenDoc?.docUrl).toContain('Qwen3-ASR');
+
     const deepgramDoc = getProviderDocInfo('deepgram', 'asr');
     expect(deepgramDoc).not.toBeNull();
     expect(deepgramDoc?.docUrl).toContain('developers.deepgram.com');
 
-    const whisperDoc = getProviderDocInfo(0, 'asr');
+    const deepgramNumDoc = getProviderDocInfo(1, 'asr');
+    expect(deepgramNumDoc?.id).toBe('deepgram');
+
+    const geminiSttDoc = getProviderDocInfo(2, 'asr');
+    expect(geminiSttDoc?.id).toBe('gemini_stt');
+    expect(geminiSttDoc?.category).toBe('asr');
+
+    const googleSttDoc = getProviderDocInfo(3, 'asr');
+    expect(googleSttDoc?.id).toBe('google_stt');
+    expect(googleSttDoc?.category).toBe('asr');
+
+    const elevenSttDoc = getProviderDocInfo(4, 'asr');
+    expect(elevenSttDoc?.id).toBe('elevenlabs_stt');
+    expect(elevenSttDoc?.category).toBe('asr');
+
+    const whisperDoc = getProviderDocInfo(5, 'asr');
     expect(whisperDoc).not.toBeNull();
+    expect(whisperDoc?.id).toBe('whisper');
     expect(whisperDoc?.docUrl).toContain('platform.openai.com/docs/guides/speech-to-text');
+
+    expect(getProviderDocInfo(99, 'asr')).toBeNull();
 
     const funasrDoc = getProviderDocInfo('funasr');
     expect(funasrDoc).not.toBeNull();
@@ -52,6 +75,9 @@ describe('Provider Documentation Registry & Links', () => {
     // Edge-TTS (id 4)
     const edgeDoc = getProviderDocInfo(4, 'tts');
     expect(edgeDoc?.docUrl).toContain('github.com/rany2/edge-tts');
+
+    // Shared name 'openai' with tts categoryHint
+    expect(getProviderDocInfo('openai', 'tts')?.id).toBe('openaitts');
   });
 
   it('renders ProviderDocLink with secure new-tab attributes', () => {

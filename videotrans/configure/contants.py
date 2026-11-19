@@ -75,16 +75,16 @@ DEEPGRAM_MODEL = [
 ]
 
 # Default Gemini model
-DEFAULT_GEMINI_MODEL = "gemini-3.6-flash,gemini-3.5-flash,gemini-pro-latest,gemini-flash-latest,gemini-2.5-pro,gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-2.0-flash,gemini-1.5-flash,gemini-1.5-pro,gemini-flash-latest,gemini-pro-latest"
 # Gemini TTS voice roles
 GEMINITTS_ROLES = "Zephyr,Puck,Charon,Kore,Fenrir,Leda,Orus,Aoede,Callirrhoe,Autonoe,Enceladus,Iapetus,Umbriel,Algieba,Despina,Erinome,Algenib,Rasalgethi,Laomedeia,Achernar,Alnilam,Schedar,Gacrux,Pulcherrima,Achird,Zubenelgenubi,Vindemiatrix,Sadachbia,Sadaltager,Sulafat"
 
-GEMINI_TTS_MODELS = "gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts,gemini-2.5-pro-preview-tts"
+GEMINI_TTS_MODELS = "gemini-2.5-flash-preview-tts,gemini-2.5-pro-preview-tts,gemini-2.0-flash"
 
-Chatgpt_Model = "gpt-5.5,gpt-5.5-pro,gpt-5.4-pro,gpt-5.4,gpt-5.4-mini,gpt-5,gpt-5-mini,gpt-4.1"
-Deepseek_Model = "deepseek-v4-pro,deepseek-v4-flash"
+Chatgpt_Model = "gpt-4o,gpt-4o-mini,o1,o1-mini,o3-mini,gpt-4-turbo,gpt-4,gpt-3.5-turbo"
+Deepseek_Model = "deepseek-chat,deepseek-reasoner"
 Whisper_Models = "large-v3"
-ELEVENLABS_TTS_MODELS = "eleven_v3,eleven_flash_v2_5,eleven_flash_v2,eleven_multilingual_v2,eleven_multilingual_v1"
+ELEVENLABS_TTS_MODELS = "eleven_multilingual_v2,eleven_flash_v2_5,eleven_flash_v2,eleven_turbo_v2_5,eleven_multilingual_v1"
 
 
 # -------------- Model Download URLs -------------------

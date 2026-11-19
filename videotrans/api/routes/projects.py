@@ -1,3 +1,4 @@
+import asyncio
 import os
 import math
 import re
@@ -5,6 +6,9 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
+import time
+import uuid
 import wave
 import zipfile
 from pathlib import Path
@@ -14,6 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from videotrans.core.project_store import (
+    _segment_srt_timestamp,
     create_project,
     get_project,
     get_project_dir,
@@ -27,6 +32,7 @@ from videotrans.core.project_store import (
     delete_project,
     find_project_by_audio_hash,
 )
+from videotrans.util.segment_ops import parse_timestamp
 from videotrans.core.job_store import list_jobs as list_project_jobs
 from videotrans.core.stage_reset import BaselineMissingError, reset_project_stage
 from videotrans.core.content_hash import compute_content_hash
@@ -59,6 +65,7 @@ class ProjectUpdateRequest(BaseModel):
     stage: Optional[int] = None
     status: Optional[str] = None
     state: Optional[dict[str, Any]] = None
+    merge: Optional[bool] = True
 
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
@@ -290,7 +297,9 @@ async def update_project_handler(
     media_store = getattr(request.app.state, "media_store", None) or MEDIA
     media_id = str(payload.mediaId or "") or None
     if not media_id and isinstance(payload.state, dict):
-        media_id = str(payload.state.get("backend", {}).get("mediaId") or "") or None
+        backend_state = payload.state.get("backend")
+        if isinstance(backend_state, dict):
+            media_id = str(backend_state.get("mediaId") or "") or None
 
     if media_id:
         kwargs["media_id"] = media_id
@@ -312,7 +321,10 @@ async def update_project_handler(
                 state_dict=payload.state,
                 stage=kwargs.get("stage"),
                 status=kwargs.get("status"),
+                merge=True if payload.merge is None else bool(payload.merge),
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid project state: {exc}") from exc
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"Could not save project subtitles: {exc}") from exc
         extra_keys = ("name", "duration", "media_id", "media_path")
@@ -337,6 +349,221 @@ class DubbingAssemblyRequest(BaseModel):
     segments: list[dict[str, Any]]
 
 
+def _resample_mono_float32(data: Any, orig_sr: int, target_sr: int) -> Any:
+    import numpy as np
+
+    if orig_sr == target_sr or data.size == 0:
+        return np.asarray(data, dtype=np.float32)
+    try:
+        import soxr
+        resampled = soxr.resample(data, orig_sr, target_sr)
+        return np.asarray(resampled, dtype=np.float32)
+    except Exception:
+        from scipy.signal import resample_poly
+        g = math.gcd(target_sr, orig_sr)
+        resampled = resample_poly(data, target_sr // g, orig_sr // g)
+        return np.asarray(resampled, dtype=np.float32)
+
+
+_assemble_locks_guard = threading.Lock()
+_assemble_project_locks: dict[str, threading.Lock] = {}
+
+
+def _get_assemble_lock(project_id: str) -> threading.Lock:
+    with _assemble_locks_guard:
+        lock = _assemble_project_locks.get(project_id)
+        if lock is None:
+            lock = threading.Lock()
+            _assemble_project_locks[project_id] = lock
+        return lock
+
+
+_MAX_DUBBING_DURATION_S = 86_400.0
+
+
+def _parse_dubbing_timestamp(segment: dict[str, Any], sec_key: str, time_key: str) -> float:
+    raw_sec = segment.get(sec_key)
+    if raw_sec is not None:
+        if isinstance(raw_sec, bool):
+            raise ValueError(f"invalid {sec_key}")
+        try:
+            val = float(raw_sec)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"invalid {sec_key}") from exc
+    else:
+        raw_time = segment.get(time_key)
+        if raw_time is None or isinstance(raw_time, bool):
+            raise ValueError(f"missing {sec_key}/{time_key}")
+        if isinstance(raw_time, (int, float)):
+            try:
+                val = float(raw_time)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"invalid {time_key}") from exc
+        elif isinstance(raw_time, str):
+            cleaned = raw_time.strip().replace(",", ".")
+            if not cleaned:
+                raise ValueError(f"empty {time_key}")
+            if ":" in cleaned:
+                parts = cleaned.split(":")
+                if len(parts) not in (2, 3):
+                    raise ValueError(f"invalid {time_key}")
+                try:
+                    if len(parts) == 3:
+                        h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
+                        if h < 0 or m < 0 or s < 0 or not math.isfinite(s):
+                            raise ValueError(f"invalid {time_key}")
+                    else:
+                        m, s = int(parts[0]), float(parts[1])
+                        if m < 0 or s < 0 or not math.isfinite(s):
+                            raise ValueError(f"invalid {time_key}")
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(f"invalid {time_key}") from exc
+                val = parse_timestamp(raw_time)
+            else:
+                try:
+                    val = float(cleaned)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(f"invalid {time_key}") from exc
+        else:
+            raise ValueError(f"invalid {time_key}")
+
+    if not math.isfinite(val) or val < 0 or val > _MAX_DUBBING_DURATION_S:
+        raise ValueError(f"{sec_key} out of supported range (0..{_MAX_DUBBING_DURATION_S}s)")
+    return val
+
+
+def _assemble_dubbing_sync(
+    project_id: str,
+    project_duration_s: Any,
+    segments: list[dict[str, Any]],
+) -> None:
+    import numpy as np
+    import soundfile as sf
+
+    TARGET_SR = 48000
+    SAMPLES_PER_MS = TARGET_SR // 1000  # 48
+    MAX_TOTAL_SAMPLES = int(_MAX_DUBBING_DURATION_S * TARGET_SR)
+
+    if isinstance(project_duration_s, bool):
+        raise HTTPException(status_code=400, detail="Invalid project duration")
+    try:
+        proj_dur_val = float(project_duration_s or 0.0)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid project duration: {exc}") from exc
+    if not math.isfinite(proj_dur_val) or proj_dur_val < 0 or proj_dur_val > _MAX_DUBBING_DURATION_S:
+        raise HTTPException(status_code=400, detail=f"Project duration exceeds supported bounds (0..{_MAX_DUBBING_DURATION_S}s)")
+
+    parsed_segments: list[dict[str, Any]] = []
+    duration_ms = max(0, int(round(proj_dur_val * 1000)))
+    for segment in segments:
+        if not str(segment.get("targetText") or segment.get("sourceText") or "").strip():
+            continue
+        segment_id = segment.get("id", "unknown")
+        preview_id = str(segment.get("previewAudioId") or "")
+        if not re.fullmatch(r"prev_[0-9a-f]{12}", preview_id):
+            raise HTTPException(status_code=400, detail=f"Generate a voice preview for segment {segment_id} before opening Stage 4")
+        try:
+            start = _parse_dubbing_timestamp(segment, "startSec", "startTime")
+            end = _parse_dubbing_timestamp(segment, "endSec", "endTime")
+            if end <= start:
+                raise ValueError("invalid timing")
+            audio_path = voice_store.get_preview_audio_path(f"{preview_id}.wav")
+            if not audio_path.is_file() or audio_path.stat().st_size == 0:
+                raise ValueError("preview file missing")
+            data, sr = sf.read(str(audio_path), dtype="float32", always_2d=False)
+            if data.size == 0 or sr <= 0:
+                raise ValueError("empty preview audio")
+            if data.ndim > 1:
+                data = np.mean(data, axis=1, dtype=np.float32)
+            else:
+                data = np.asarray(data, dtype=np.float32)
+            if not np.all(np.isfinite(data)):
+                data = np.nan_to_num(data, nan=0.0, posinf=1.0, neginf=-1.0)
+            if int(sr) != TARGET_SR:
+                data = _resample_mono_float32(data, int(sr), TARGET_SR)
+        except (TypeError, ValueError, OverflowError, OSError, sf.SoundFileError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=f"Preview audio or timing is invalid for segment {segment_id}: {exc}") from exc
+
+        start_ms = int(round(start * 1000))
+        end_ms = int(round(end * 1000))
+        parsed_segments.append({
+            "segment_id": segment_id,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "clip": data,
+        })
+
+    if not parsed_segments:
+        raise HTTPException(status_code=400, detail="Generate dubbing previews before opening Stage 4")
+
+    parsed_segments.sort(key=lambda s: s["start_ms"])
+
+    clips: list[tuple[int, np.ndarray]] = []
+    total_samples = duration_ms * SAMPLES_PER_MS
+    for idx, seg in enumerate(parsed_segments):
+        start_ms = seg["start_ms"]
+        end_ms = seg["end_ms"]
+        clip: np.ndarray = seg["clip"]
+        clip_ms = max(1, int(round(len(clip) * 1000 / TARGET_SR)))
+        next_start_ms = parsed_segments[idx + 1]["start_ms"] if idx + 1 < len(parsed_segments) else None
+
+        if next_start_ms is not None:
+            max_allowed_end_ms = max(start_ms + 1, next_start_ms - 30)
+        else:
+            max_allowed_end_ms = max(duration_ms, end_ms, start_ms + clip_ms)
+
+        available_samples = max(SAMPLES_PER_MS, (max_allowed_end_ms - start_ms) * SAMPLES_PER_MS)
+
+        if len(clip) > available_samples:
+            clip = clip[:available_samples].copy()
+            fade_in_samples = min(20 * SAMPLES_PER_MS, max(1, len(clip) // 2))
+            fade_out_samples = min(30 * SAMPLES_PER_MS, max(1, len(clip) // 2))
+        else:
+            clip = clip.copy()
+            fade_in_samples = min(20 * SAMPLES_PER_MS, max(1, len(clip) // 2))
+            fade_out_samples = fade_in_samples
+
+        if fade_in_samples > 1:
+            clip[:fade_in_samples] *= np.linspace(0.0, 1.0, fade_in_samples, dtype=np.float32)
+        if fade_out_samples > 1:
+            clip[-fade_out_samples:] *= np.linspace(1.0, 0.0, fade_out_samples, dtype=np.float32)
+
+        start_sample = start_ms * SAMPLES_PER_MS
+        clips.append((start_sample, clip))
+        total_samples = max(total_samples, start_sample + len(clip))
+
+    total_samples = max(1, total_samples)
+    if total_samples > MAX_TOTAL_SAMPLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Dubbing duration exceeds supported bounds (0..{_MAX_DUBBING_DURATION_S}s)",
+        )
+    try:
+        merged = np.zeros(total_samples, dtype=np.float32)
+        for start_sample, clip in clips:
+            merged[start_sample : start_sample + len(clip)] += clip
+        np.clip(merged, -1.0, 1.0, out=merged)
+    except (OverflowError, MemoryError) as exc:
+        raise HTTPException(status_code=400, detail=f"Dubbing duration is too large to assemble: {exc}") from exc
+
+    output = get_project_dir(project_id) / "dubbing" / "voiceover_merged.wav"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pending = output.with_name(f"voiceover_merged.{uuid.uuid4().hex[:8]}.tmp.wav")
+    with _get_assemble_lock(project_id):
+        try:
+            sf.write(str(pending), merged, TARGET_SR, subtype="PCM_16", format="WAV")
+            for attempt in range(6):
+                try:
+                    os.replace(pending, output)
+                    break
+                except PermissionError:
+                    if attempt >= 5:
+                        raise
+                    time.sleep(0.01 * (attempt + 1))
+        finally:
+            pending.unlink(missing_ok=True)
+
+
 @router.post("/api/projects/{project_id}/dubbing/assemble")
 async def assemble_project_dubbing_handler(project_id: str, payload: DubbingAssemblyRequest) -> JSONResponse:
     project = get_project(project_id)
@@ -345,79 +572,7 @@ async def assemble_project_dubbing_handler(project_id: str, payload: DubbingAsse
     if not payload.segments:
         raise HTTPException(status_code=400, detail="Generate dubbing previews before opening Stage 4")
 
-    from pydub import AudioSegment
-    from pydub.exceptions import CouldntDecodeError
-
-    parsed_segments: list[dict[str, Any]] = []
-    duration_ms = max(0, int(round(float(project.get("duration") or 0) * 1000)))
-    for segment in payload.segments:
-        if not str(segment.get("targetText") or segment.get("sourceText") or "").strip():
-            continue
-        segment_id = segment.get("id", "unknown")
-        preview_id = str(segment.get("previewAudioId") or "")
-        if not re.fullmatch(r"prev_[0-9a-f]{12}", preview_id):
-            raise HTTPException(status_code=400, detail=f"Generate a voice preview for segment {segment_id} before opening Stage 4")
-        try:
-            start = float(segment.get("startSec"))
-            end = float(segment.get("endSec"))
-            if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
-                raise ValueError("invalid timing")
-            audio_path = voice_store.get_preview_audio_path(f"{preview_id}.wav")
-            if not audio_path.is_file() or audio_path.stat().st_size == 0:
-                raise ValueError("preview file missing")
-            clip = AudioSegment.from_wav(audio_path).set_frame_rate(48000).set_channels(1)
-        except (TypeError, ValueError, OSError, CouldntDecodeError) as exc:
-            raise HTTPException(status_code=400, detail=f"Preview audio or timing is invalid for segment {segment_id}: {exc}") from exc
-        start_ms = int(round(start * 1000))
-        end_ms = int(round(end * 1000))
-        parsed_segments.append({
-            "segment_id": segment_id,
-            "start_ms": start_ms,
-            "end_ms": end_ms,
-            "clip": clip,
-        })
-
-    if not parsed_segments:
-        raise HTTPException(status_code=400, detail="Generate dubbing previews before opening Stage 4")
-
-    parsed_segments.sort(key=lambda s: s["start_ms"])
-
-    clips: list[tuple[int, AudioSegment]] = []
-    for idx, seg in enumerate(parsed_segments):
-        start_ms = seg["start_ms"]
-        end_ms = seg["end_ms"]
-        clip = seg["clip"]
-        next_start_ms = parsed_segments[idx + 1]["start_ms"] if idx + 1 < len(parsed_segments) else None
-
-        if next_start_ms is not None:
-            max_allowed_end_ms = max(start_ms + 1, next_start_ms - 30)
-        else:
-            max_allowed_end_ms = max(duration_ms, end_ms, start_ms + len(clip))
-
-        available_dur = max(1, max_allowed_end_ms - start_ms)
-
-        if len(clip) > available_dur:
-            clip = clip[:available_dur]
-            fade_out_dur = min(30, max(1, len(clip) // 2))
-            fade_in_dur = min(20, max(1, len(clip) // 2))
-            clip = clip.fade_in(fade_in_dur).fade_out(fade_out_dur)
-        else:
-            fade_dur = min(20, max(1, len(clip) // 2))
-            clip = clip.fade_in(fade_dur).fade_out(fade_dur)
-
-        clips.append((start_ms, clip))
-        duration_ms = max(duration_ms, start_ms + len(clip))
-    output = get_project_dir(project_id) / "dubbing" / "voiceover_merged.wav"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    merged = AudioSegment.silent(duration=duration_ms, frame_rate=48000).set_channels(1)
-    for start_ms, clip in clips:
-        merged = merged.overlay(clip, position=start_ms)
-    pending = output.with_name("voiceover_merged.tmp.wav")
-    try:
-        merged.export(pending, format="wav")
-        os.replace(pending, output)
-    finally:
-        pending.unlink(missing_ok=True)
+    await asyncio.to_thread(_assemble_dubbing_sync, project_id, project.get("duration"), payload.segments)
     return JSONResponse({"ok": True, "audio_url": f"/api/projects/{project_id}/dubbing/audio"})
 
 
@@ -475,21 +630,34 @@ def _build_srt(segments: list[dict], field: str = "targetText") -> str:
         if not isinstance(seg, dict):
             continue
         text = str(seg.get(field) or (seg.get("sourceText") if field == "targetText" else seg.get("targetText")) or "").strip()
-        start = _format_srt_time(float(seg.get("startSec", 0)))
-        end = _format_srt_time(float(seg.get("endSec", float(seg.get("startSec", 0)) + 1.0)))
+        start = _segment_srt_timestamp(seg, "startSec", "startTime")
+        if "endSec" in seg or seg.get("endTime") is not None:
+            end = _segment_srt_timestamp(seg, "endSec", "endTime")
+        else:
+            end = _segment_srt_timestamp({"endSec": parse_timestamp(start) + 1.0}, "endSec", "endTime")
         lines.append(f"{i}\n{start} --> {end}\n{text}\n")
     return "\n".join(lines).strip() + "\n"
 
 
 def _create_fallback_wav(path: Path, duration_sec: float = 1.0) -> None:
+    if isinstance(duration_sec, bool):
+        raise ValueError("Invalid project duration")
+    dur = float(duration_sec)
+    if not math.isfinite(dur) or dur < 0 or dur > _MAX_DUBBING_DURATION_S:
+        raise ValueError(f"Fallback WAV duration out of supported bounds (0..{_MAX_DUBBING_DURATION_S}s)")
     sample_rate = 44100
-    num_frames = int(max(0.5, float(duration_sec)) * sample_rate)
+    num_frames = int(max(0.5, dur) * sample_rate)
+    chunk_frames = min(num_frames, sample_rate * 10)
+    zero_chunk = b"\x00" * (chunk_frames * 2)
     with wave.open(str(path), 'wb') as wav_file:
         wav_file.setnchannels(1)
         wav_file.setsampwidth(2)
         wav_file.setframerate(sample_rate)
-        data = struct.pack(f"<{num_frames}h", *([0] * num_frames))
-        wav_file.writeframes(data)
+        remaining = num_frames
+        while remaining > 0:
+            take = min(remaining, chunk_frames)
+            wav_file.writeframes(zero_chunk if take == chunk_frames else b"\x00" * (take * 2))
+            remaining -= take
 
 
 def _prepare_capcut_assets(project_id: str) -> dict[str, Path]:
@@ -512,16 +680,21 @@ def _prepare_capcut_assets(project_id: str) -> dict[str, Path]:
 
     state = project.get("state") or {}
     segments = state.get("segments") or []
+    if not isinstance(segments, list):
+        raise HTTPException(status_code=400, detail="Invalid project segments")
 
-    # 1. subtitles_edited.srt
-    edited_srt_path = exports_dir / f"{prefix}subtitles_edited.srt"
-    edited_content = _build_srt(segments, field="targetText")
-    edited_srt_path.write_text(edited_content, encoding="utf-8")
+    try:
+        # 1. subtitles_edited.srt
+        edited_srt_path = exports_dir / f"{prefix}subtitles_edited.srt"
+        edited_content = _build_srt(segments, field="targetText")
+        edited_srt_path.write_text(edited_content, encoding="utf-8")
 
-    # 2. subtitles_target.srt
-    target_srt_path = exports_dir / f"{prefix}subtitles_target.srt"
-    target_content = _build_srt(segments, field="rawTranslation" if any("rawTranslation" in s for s in segments) else "targetText")
-    target_srt_path.write_text(target_content, encoding="utf-8")
+        # 2. subtitles_target.srt
+        target_srt_path = exports_dir / f"{prefix}subtitles_target.srt"
+        target_content = _build_srt(segments, field="rawTranslation" if any(isinstance(s, dict) and "rawTranslation" in s for s in segments) else "targetText")
+        target_srt_path.write_text(target_content, encoding="utf-8")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid segment timestamp: {exc}") from exc
 
     # 3. voiceover_merged.wav
     voiceover_path = exports_dir / f"{prefix}voiceover_merged.wav"
@@ -544,7 +717,15 @@ def _prepare_capcut_assets(project_id: str) -> dict[str, Path]:
         except Exception:
             voiceover_path = found_audio
     elif not voiceover_path.is_file() or voiceover_path.stat().st_size == 0:
-        _create_fallback_wav(voiceover_path, duration_sec=float(project.get("duration") or 1.0))
+        try:
+            raw_dur = project.get("duration")
+            if isinstance(raw_dur, bool):
+                raise ValueError("Invalid project duration")
+            dur_val = float(raw_dur if raw_dur not in (None, 0, 0.0) else 1.0)
+            _create_fallback_wav(voiceover_path, duration_sec=dur_val)
+        except (TypeError, ValueError, OverflowError, MemoryError) as exc:
+            voiceover_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=f"Invalid project duration for audio export: {exc}") from exc
 
     # 4. bundle.zip
     zip_path = exports_dir / f"{prefix}capcut_export_{project_id}.zip"

@@ -88,8 +88,10 @@ def split_segment(
     Otherwise, splits text cleanly at the nearest word boundary proportional
     to the split timestamp.
     """
-    start_sec = round(parse_timestamp(segment.get("startSec", segment.get("startTime", 0.0))), 3)
-    end_sec = round(parse_timestamp(segment.get("endSec", segment.get("endTime", 0.0))), 3)
+    raw_start = segment.get("startSec") if segment.get("startSec") is not None else segment.get("startTime", 0.0)
+    raw_end = segment.get("endSec") if segment.get("endSec") is not None else segment.get("endTime", 0.0)
+    start_sec = round(parse_timestamp(raw_start), 3)
+    end_sec = round(parse_timestamp(raw_end), 3)
     try:
         split_sec = round(float(split_time), 3)
     except (TypeError, ValueError):

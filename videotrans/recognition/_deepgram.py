@@ -1,4 +1,3 @@
-import logging
 import os
 import re
 import time
@@ -12,15 +11,30 @@ from deepgram import (
     PrerecordedOptions,
     FileSource,
 )
+from deepgram.clients.common.v1.errors import DeepgramApiError
 from deepgram_captions import DeepgramConverter, srt
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_not_exception_type, before_log, after_log
-from videotrans.configure.excepts import NO_RETRY_EXCEPT
-from videotrans.configure.config import tr,params,settings,logger
+from videotrans.configure import config, contants
+from videotrans.configure.config import tr, params, settings, logger
 from videotrans.recognition._base import BaseRecogn
+from videotrans.recognition._retry import (
+    build_httpx_retry_types,
+    extract_status_code,
+    is_retryable_status,
+    is_retryable_error,
+    run_with_retry,
+)
 from videotrans.task.taskcfg import SrtItem
-from videotrans.configure import contants
 from videotrans.util._ffmpeg_runner import runffmpeg
 from videotrans.util._srt_parse import ms_to_time_string, get_subtitle_from_srt
+
+
+_RETRYABLE_DEEPGRAM_NET = build_httpx_retry_types()
+
+
+def _should_retry_deepgram(exc: BaseException) -> bool:
+    if isinstance(exc, DeepgramApiError):
+        return is_retryable_error(exc)
+    return is_retryable_error(exc) or isinstance(exc, _RETRYABLE_DEEPGRAM_NET)
 
 
 def parse_deepgram_options(raw: Any) -> dict:
@@ -59,28 +73,39 @@ def parse_deepgram_options(raw: Any) -> dict:
 @dataclass
 class DeepgramRecogn(BaseRecogn):
 
-    @retry(retry=retry_if_not_exception_type(NO_RETRY_EXCEPT), stop=(stop_after_attempt(settings.get('retry_nums'))), wait=wait_fixed(2), before=before_log(logger, logging.INFO),  after=after_log(logger, logging.INFO))
     def _exec(self) -> Union[List[SrtItem], None]:
-        if self._exit(): return
-        import zhconv    
-        if os.path.getsize(self.audio_file) > 52428800:
-            runffmpeg(
-                ['-y', '-i', self.audio_file, '-ac', '1', '-ar', '16000', self.cache_folder + '/deepgram-tmp.mp3'])
-            self.audio_file = self.cache_folder + '/deepgram-tmp.mp3'
-        with open(self.audio_file, "rb") as file:
-            buffer_data = file.read()
+        if self._exit():
+            return
+
+        audio_path = self.audio_file
+        tmp_mp3 = None
+        try:
+            if os.path.getsize(audio_path) > 52428800:
+                tmp_dir = Path(self.cache_folder) if self.cache_folder else Path(config.TEMP_DIR)
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                tmp_mp3 = tmp_dir / f"deepgram-tmp-{time.time_ns()}.mp3"
+                runffmpeg(['-y', '-i', audio_path, '-ac', '1', '-ar', '16000', str(tmp_mp3)])
+                audio_path = str(tmp_mp3)
+            with open(audio_path, "rb") as file:
+                buffer_data = file.read()
+        finally:
+            if tmp_mp3 is not None:
+                try:
+                    tmp_mp3.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
         self.signal(
             text=tr("Recognition may take a while, please be patient"))
 
-        deepgram = DeepgramClient(params.get('deepgram_apikey'))
         payload: FileSource = {
             "buffer": buffer_data,
         }
 
+        raw_lang = (self.detect_language or "").strip().lower()
         diarize = self.max_speakers > -1
-        preset_options = {
+        preset_options: dict[str, Any] = {
             "model": self.model_name or "nova-3",
-            "language": self.detect_language[:2] if self.detect_language else "zh",
             "smart_format": True,
             "punctuate": True,
             "paragraphs": True,
@@ -88,6 +113,10 @@ class DeepgramRecogn(BaseRecogn):
             "diarize_model": "latest",
             "utt_split": 0.8,
         }
+        if raw_lang == "auto":
+            preset_options["detect_language"] = True
+        else:
+            preset_options["language"] = raw_lang[:2] if raw_lang and raw_lang != "-" else "zh"
 
         user_raw = (
             getattr(self, "deepgram_options", None)
@@ -103,6 +132,10 @@ class DeepgramRecogn(BaseRecogn):
             for k, v in user_opts.items():
                 if v is not None and v != "":
                     preset_options[k] = v
+            if raw_lang == "auto" and user_opts.get("language"):
+                preset_options.pop("detect_language", None)
+
+        lang_prefix = str(preset_options.get("language") or "").strip().lower()[:2]
 
         if diarize:
             preset_options["utterances"] = True
@@ -132,18 +165,39 @@ class DeepgramRecogn(BaseRecogn):
                 return d
             options.to_dict = _to_dict
 
+        deepgram = DeepgramClient(params.get('deepgram_apikey'))
+        transport = httpx.HTTPTransport(proxy=self.proxy_str) if self.proxy_str else None
         request_started = time.perf_counter()
         logger.info(
             "[Deepgram] prerecorded request start model=%s language=%s diarize=%s payload=%.2f MiB",
             self.model_name,
-            self.detect_language[:2],
+            lang_prefix or ("auto" if raw_lang == "auto" else "zh"),
             diarize,
             len(buffer_data) / (1024 * 1024),
         )
         try:
-            res = deepgram.listen.rest.v("1").transcribe_file(payload, options, timeout=600, transport=httpx.HTTPTransport())
-        except TypeError:
-            res = deepgram.listen.rest.v("1").transcribe_file(payload, options, timeout=600)
+            def _do_transcribe():
+                rest_client = deepgram.listen.rest.v("1")
+                if transport is not None:
+                    try:
+                        return rest_client.transcribe_file(payload, options, timeout=600, transport=transport)
+                    except TypeError:
+                        return rest_client.transcribe_file(payload, options, timeout=600)
+                return rest_client.transcribe_file(payload, options, timeout=600)
+
+            res = run_with_retry(
+                _do_transcribe,
+                should_retry=_should_retry_deepgram,
+                is_cancelled=self._exit,
+                label="DeepgramRecogn",
+            )
+        finally:
+            if transport is not None and callable(getattr(transport, "close", None)):
+                try:
+                    transport.close()
+                except Exception:
+                    pass
+
         request_duration = round(time.perf_counter() - request_started, 2)
         logger.info(
             "[Deepgram] prerecorded request completed in %.2fs",
@@ -154,6 +208,26 @@ class DeepgramRecogn(BaseRecogn):
             type="asr_timing",
             duration=request_duration,
         )
+
+        if not lang_prefix:
+            detected = None
+            try:
+                ch0 = res.results.channels[0]
+                detected = getattr(ch0, "detected_language", None)
+            except Exception:
+                pass
+            if not isinstance(detected, str):
+                try:
+                    detected = res["results"]["channels"][0].get("detected_language")
+                except Exception:
+                    detected = None
+            if isinstance(detected, str) and detected.strip():
+                lang_prefix = detected.strip().lower()[:2]
+
+        zhconv = None
+        if lang_prefix == 'zh':
+            import zhconv as _zhconv
+            zhconv = _zhconv
 
         # 1. Extract utterances option
         raw_utterances = []
@@ -191,9 +265,9 @@ class DeepgramRecogn(BaseRecogn):
             start_ms = int(round(float(start_sec) * 1000))
             end_ms = int(round(float(end_sec) * 1000))
             clean_text = str(text).strip()
-            if self.detect_language[:2] in contants.CJK_LANG:
+            if lang_prefix in contants.CJK_LANG:
                 clean_text = re.sub(r'\s| ', '', clean_text, flags=re.I | re.S)
-                if self.detect_language[:2] == 'zh':
+                if lang_prefix == 'zh' and zhconv is not None:
                     clean_text = zhconv.convert(clean_text, 'zh-hans')
 
             startraw = ms_to_time_string(ms=start_ms)
@@ -218,14 +292,19 @@ class DeepgramRecogn(BaseRecogn):
                 if hasattr(ch, "alternatives") and ch.alternatives:
                     alt = ch.alternatives[0]
                     if hasattr(alt, "paragraphs") and alt.paragraphs:
-                        paragraphs_transcript = getattr(alt.paragraphs, "transcript", "")
-                        if hasattr(alt.paragraphs, "paragraphs") and alt.paragraphs.paragraphs:
+                        pt = getattr(alt.paragraphs, "transcript", "")
+                        paragraphs_transcript = pt if isinstance(pt, str) else ""
+                        if hasattr(alt.paragraphs, "paragraphs") and isinstance(alt.paragraphs.paragraphs, list):
                             raw_paragraphs = alt.paragraphs.paragraphs
             if not raw_paragraphs and hasattr(res, "__getitem__"):
                 try:
                     p_obj = res["results"]["channels"][0]["alternatives"][0]["paragraphs"]
-                    paragraphs_transcript = p_obj.get("transcript", "") if isinstance(p_obj, dict) else getattr(p_obj, "transcript", "")
-                    raw_paragraphs = p_obj.get("paragraphs", []) if isinstance(p_obj, dict) else getattr(p_obj, "paragraphs", [])
+                    pt = p_obj.get("transcript", "") if isinstance(p_obj, dict) else getattr(p_obj, "transcript", "")
+                    if isinstance(pt, str) and not paragraphs_transcript:
+                        paragraphs_transcript = pt
+                    rp = p_obj.get("paragraphs", []) if isinstance(p_obj, dict) else getattr(p_obj, "paragraphs", [])
+                    if isinstance(rp, list):
+                        raw_paragraphs = rp
                 except Exception:
                     pass
         except Exception as e:
@@ -268,9 +347,9 @@ class DeepgramRecogn(BaseRecogn):
             start_ms = int(round(float(start_sec) * 1000))
             end_ms = int(round(float(end_sec) * 1000))
             clean_text = str(text).strip()
-            if self.detect_language[:2] in contants.CJK_LANG:
+            if lang_prefix in contants.CJK_LANG:
                 clean_text = re.sub(r'\s| ', '', clean_text, flags=re.I | re.S)
-                if self.detect_language[:2] == 'zh':
+                if lang_prefix == 'zh' and zhconv is not None:
                     clean_text = zhconv.convert(clean_text, 'zh-hans')
 
             startraw = ms_to_time_string(ms=start_ms)
@@ -287,7 +366,8 @@ class DeepgramRecogn(BaseRecogn):
             })
 
         # Save speaker list if diarized
-        if speaker_list:
+        if speaker_list and self.cache_folder:
+            Path(self.cache_folder).mkdir(parents=True, exist_ok=True)
             Path(f'{self.cache_folder}/speaker.json').write_text(json.dumps(speaker_list), encoding='utf-8')
 
         # Persist both options to transcript_options.json for downstream choice
@@ -299,9 +379,9 @@ class DeepgramRecogn(BaseRecogn):
         elif paragraphs_transcript and utterances_list:
             # Fallback single paragraph covering the speech span
             clean_pt = paragraphs_transcript.strip()
-            if self.detect_language[:2] in contants.CJK_LANG:
+            if lang_prefix in contants.CJK_LANG:
                 clean_pt = re.sub(r'\s| ', '', clean_pt, flags=re.I | re.S)
-                if self.detect_language[:2] == 'zh':
+                if lang_prefix == 'zh' and zhconv is not None:
                     clean_pt = zhconv.convert(clean_pt, 'zh-hans')
             transcript_options["paragraphs"] = [{
                 "line": 1,
@@ -315,10 +395,12 @@ class DeepgramRecogn(BaseRecogn):
             }]
 
         if transcript_options:
-            Path(f"{self.cache_folder}/transcript_options.json").write_text(
-                json.dumps(transcript_options, ensure_ascii=False, indent=2),
-                encoding="utf-8"
-            )
+            if self.cache_folder:
+                Path(self.cache_folder).mkdir(parents=True, exist_ok=True)
+                Path(f"{self.cache_folder}/transcript_options.json").write_text(
+                    json.dumps(transcript_options, ensure_ascii=False, indent=2),
+                    encoding="utf-8"
+                )
             self.transcript_options = transcript_options
 
         # Choose default raws
@@ -333,11 +415,11 @@ class DeepgramRecogn(BaseRecogn):
             try:
                 transcription = DeepgramConverter(res)
                 srt_str = srt(transcription,
-                              line_length=int(settings.get('cjk_len') if self.detect_language[:2] in ['zh', 'ja','ko'] else settings.get('other_len')))
+                              line_length=int(settings.get('cjk_len', 20) if lang_prefix in ['zh', 'ja', 'ko'] else settings.get('other_len', 60)))
                 raws = get_subtitle_from_srt(srt_str, is_file=False)
-                if self.detect_language[:2] in contants.CJK_LANG:
+                if lang_prefix in contants.CJK_LANG:
                     for i, it in enumerate(raws):
-                        if self.detect_language[:2] == 'zh':
+                        if lang_prefix == 'zh' and zhconv is not None:
                             it['text'] = zhconv.convert(it['text'], 'zh-hans')
                         raws[i]['text'] = it['text'].replace(' ', '')
             except Exception as e:

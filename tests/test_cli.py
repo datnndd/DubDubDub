@@ -740,3 +740,54 @@ class TestArgumentParsingIntegration:
         for level in ('DEBUG', 'INFO', 'WARNING', 'ERROR'):
             args = parser.parse_args(['--task', 'stt', '--name', 'test.mp4', '--log-level', level])
             assert args.log_level == level
+
+    def test_video_ocr_stt_and_vtv_flags_parse_validate_and_build(self, tmp_path):
+        f = tmp_path / "silent.mp4"
+        f.touch()
+        parser = build_parser()
+
+        # STT with video_ocr
+        args = parser.parse_args([
+            '--task', 'stt', '--name', str(f),
+            '--subtitle_source', 'video_ocr',
+            '--ocr_roi', '0.1,0.75,0.8,0.2',
+            '--ocr_interval_ms', '250',
+        ])
+        validate_task_params(args, parser)
+        stt_params = build_stt_params(args)
+        assert stt_params["subtitle_source"] == "video_ocr"
+        assert stt_params["ocr_roi"] == (0.1, 0.75, 0.8, 0.2)
+        assert stt_params["ocr_roi_confirmed"] is True
+        assert stt_params["ocr_options"] == {"coarse_interval_ms": 250}
+
+        # VTV with video_ocr and interval clamping
+        vtv_args = parser.parse_args([
+            '--task', 'vtv', '--name', str(f),
+            '--source_language_code', 'zh-cn', '--target_language_code', 'en',
+            '--subtitle_source', 'video_ocr',
+            '--ocr_roi', '0.05,0.8,0.9,0.15',
+            '--ocr_interval_ms', '50',
+        ])
+        validate_task_params(vtv_args, parser)
+        vtv_params = build_vtv_params(vtv_args)
+        assert vtv_params["subtitle_source"] == "video_ocr"
+        assert vtv_params["ocr_roi"] == (0.05, 0.8, 0.9, 0.15)
+        assert vtv_params["ocr_roi_confirmed"] is True
+        assert vtv_params["ocr_options"] == {"coarse_interval_ms": 100}
+
+        # Missing --ocr_roi when --subtitle_source video_ocr fails validation
+        missing_roi = parser.parse_args([
+            '--task', 'stt', '--name', str(f),
+            '--subtitle_source', 'video_ocr',
+        ])
+        with pytest.raises(SystemExit):
+            validate_task_params(missing_roi, parser)
+
+        # Out-of-bounds --ocr_roi fails validation
+        bad_roi = parser.parse_args([
+            '--task', 'stt', '--name', str(f),
+            '--subtitle_source', 'video_ocr',
+            '--ocr_roi', '0.9,0.9,0.5,0.5',
+        ])
+        with pytest.raises(SystemExit):
+            validate_task_params(bad_roi, parser)

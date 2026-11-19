@@ -1,11 +1,9 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { useDubDubStore } from '../store';
 import {
   X,
   FolderSearch,
-  FolderOpen,
   Plus,
-  Trash2,
   CheckSquare,
   Square,
   Loader2,
@@ -18,6 +16,7 @@ import {
 import { scanFolders, registerLocalMedia, uploadBatchMedia } from '../api/media';
 import { batchCreateProjects } from '../api/projects';
 import { formatBytes } from '../store/prepareSlice';
+import { formatLocalDateYmd } from '../utils/date';
 
 export interface ScannedVideoItem {
   path: string;
@@ -28,6 +27,10 @@ export interface ScannedVideoItem {
   selected: boolean;
 }
 
+export function getVideoDedupKey(v: Pick<ScannedVideoItem, 'path' | 'filename'>): string {
+  return String(v.path || v.filename || '').replace(/\\/g, '/').trim();
+}
+
 export const FolderScanModal: React.FC = () => {
   const isOpen = useDubDubStore((s) => s.scanModalOpen);
   const setScanModalOpen = useDubDubStore((s) => s.setScanModalOpen);
@@ -36,6 +39,11 @@ export const FolderScanModal: React.FC = () => {
   const setActiveView = useDubDubStore((s) => s.setActiveView);
   const setStep = useDubDubStore((s) => s.setStep);
   const setSessionDrawerOpen = useDubDubStore((s) => s.setSessionDrawerOpen);
+  const activeView = useDubDubStore((s) => s.activeView);
+  const activeParentProjectId = useDubDubStore((s) => s.activeParentProjectId);
+  const activeParentProjectName = useDubDubStore((s) => s.activeParentProjectName);
+  const loadSubprojects = useDubDubStore((s) => s.loadSubprojects);
+  const loadProjects = useDubDubStore((s) => s.loadProjects);
 
   const [folderPaths, setFolderPaths] = useState<string[]>([]);
   const [currentPathInput, setCurrentPathInput] = useState('');
@@ -48,7 +56,32 @@ export const FolderScanModal: React.FC = () => {
 
   const directoryInputRef = useRef<HTMLInputElement | null>(null);
 
+  const resetModalState = useCallback(() => {
+    setFolderPaths([]);
+    setCurrentPathInput('');
+    setIsRecursive(true);
+    setIsScanning(false);
+    setIsImporting(false);
+    setScanError(null);
+    setDetectedVideos([]);
+    setSearchFilter('');
+    if (directoryInputRef.current) {
+      directoryInputRef.current.value = '';
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isOpen) {
+      resetModalState();
+    }
+  }, [isOpen, resetModalState]);
+
   if (!isOpen) return null;
+
+  const handleClose = () => {
+    resetModalState();
+    setScanModalOpen(false);
+  };
 
   const handleAddPath = () => {
     const trimmed = currentPathInput.trim().replace(/^["']|["']$/g, '');
@@ -82,12 +115,24 @@ export const FolderScanModal: React.FC = () => {
     try {
       const res = await scanFolders(pathsToScan, isRecursive);
       if (res?.ok && Array.isArray(res.videos)) {
-        const items: ScannedVideoItem[] = res.videos.map((v) => ({
+        const scannedItems: ScannedVideoItem[] = res.videos.map((v) => ({
           ...v,
           selected: true,
         }));
-        setDetectedVideos(items);
-        if (items.length === 0) {
+        setDetectedVideos((prev) => {
+          const browserPicked = prev.filter((v) => Boolean(v.file));
+          const mergedMap = new Map<string, ScannedVideoItem>();
+          for (const item of browserPicked) {
+            mergedMap.set(getVideoDedupKey(item), item);
+          }
+          for (const item of scannedItems) {
+            const key = getVideoDedupKey(item);
+            const existing = mergedMap.get(key);
+            mergedMap.set(key, existing ? { ...item, selected: existing.selected } : item);
+          }
+          return Array.from(mergedMap.values());
+        });
+        if (scannedItems.length === 0) {
           setScanError('No .mp4 video files found in the specified folder(s).');
         }
       } else {
@@ -102,6 +147,7 @@ export const FolderScanModal: React.FC = () => {
 
   const handleBrowserDirectoryPick = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
+    e.target.value = '';
     if (files.length === 0) return;
 
     const mp4Files = files.filter((f) => f.name.toLowerCase().endsWith('.mp4'));
@@ -120,8 +166,15 @@ export const FolderScanModal: React.FC = () => {
     }));
 
     setDetectedVideos((prev) => {
-      const existingNames = new Set(prev.map((p) => p.filename));
-      const newItems = items.filter((it) => !existingNames.has(it.filename));
+      const existingKeys = new Set(prev.map((p) => getVideoDedupKey(p)));
+      const newItems: ScannedVideoItem[] = [];
+      for (const it of items) {
+        const key = getVideoDedupKey(it);
+        if (!existingKeys.has(key)) {
+          existingKeys.add(key);
+          newItems.push(it);
+        }
+      }
       return [...prev, ...newItems];
     });
     setScanError(null);
@@ -183,20 +236,26 @@ export const FolderScanModal: React.FC = () => {
             mediaPath: v.path,
           }));
 
-      // 3. Create parent project (named today's date YYYY-MM-DD) and subprojects
-      const today = new Date().toISOString().split('T')[0];
-      const batchRes = await batchCreateProjects({
-        date: today,
-        items: batchItems,
-      });
+      // 3. Create or append to parent project (active session parent or today's local YYYY-MM-DD)
+      const today = formatLocalDateYmd();
+      const targetParentId = activeView !== 'projects' && activeParentProjectId ? activeParentProjectId : undefined;
+      const batchRes = await batchCreateProjects(
+        targetParentId
+          ? { parentId: targetParentId, items: batchItems }
+          : { date: today, items: batchItems }
+      );
 
       if (batchRes?.ok && Array.isArray(batchRes.projects) && batchRes.projects.length > 0) {
-        setSessionSubprojects(batchRes.projects, batchRes.parent.id, batchRes.parent.name);
+        const shouldMerge = Boolean(targetParentId && batchRes.parent?.id === targetParentId);
+        (setSessionSubprojects as any)(batchRes.projects, batchRes.parent.id, batchRes.parent.name, { merge: shouldMerge });
 
-        // Select the first subproject to view in Stage 1
+        // Select the first newly imported subproject to view in Stage 1
         const firstProject = batchRes.projects[0];
         await selectProject(firstProject.id, false);
+        void loadSubprojects(batchRes.parent.id);
+        void loadProjects();
 
+        resetModalState();
         setScanModalOpen(false);
         setActiveView('dubbing');
         setStep(1);
@@ -232,7 +291,7 @@ export const FolderScanModal: React.FC = () => {
             </div>
           </div>
           <button
-            onClick={() => setScanModalOpen(false)}
+            onClick={handleClose}
             className="p-1.5 rounded-lg text-stone-400 hover:text-stone-700 hover:bg-stone-200/50 transition-colors cursor-pointer"
           >
             <X className="w-4 h-4" />
@@ -429,7 +488,14 @@ export const FolderScanModal: React.FC = () => {
         <div className="h-14 px-6 border-t border-stone-200 flex items-center justify-between bg-stone-50/75 shrink-0">
           <div className="text-xs text-stone-500 font-medium">
             {selectedVideos.length > 0 ? (
-              <span>Group will be organized in parent project: <strong>{new Date().toISOString().split('T')[0]}</strong></span>
+              <span>
+                Group will be organized in parent project:{' '}
+                <strong>
+                  {activeView !== 'projects' && activeParentProjectId
+                    ? (activeParentProjectName || activeParentProjectId)
+                    : formatLocalDateYmd()}
+                </strong>
+              </span>
             ) : (
               <span>Select folders to scan</span>
             )}
@@ -437,7 +503,7 @@ export const FolderScanModal: React.FC = () => {
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => setScanModalOpen(false)}
+              onClick={handleClose}
               className="px-3.5 py-1.5 rounded-xl border border-stone-200 text-stone-700 hover:bg-stone-100 text-xs font-semibold cursor-pointer"
             >
               Cancel

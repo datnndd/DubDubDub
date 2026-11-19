@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -66,21 +67,30 @@ async def translate_handler(
 
     source_lang = str(payload.sourceLanguage or "zh-cn")
     target_lang = str(payload.targetLanguage or "en")
-    translate_type = int(payload.translateType if payload.translateType is not None else 0)
-    _, aisendsrt = _translation_mode(payload.translationMode)
+    try:
+        translate_type = int(payload.translateType if payload.translateType is not None else 0)
+        _, aisendsrt = _translation_mode(payload.translationMode)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     segments = []
+    has_non_empty = False
     for s in raw_segments:
         if isinstance(s, dict):
-            text = str(s.get("sourceText") or s.get("text") or "").strip()
-            if text:
-                item = dict(s)
-                item["sourceText"] = text
-                segments.append(item)
+            raw_src = s.get("sourceText") if s.get("sourceText") is not None else s.get("text")
+            text = str(raw_src or "").strip()
+            item = dict(s)
+            item["sourceText"] = text
+            if not text:
+                item["text"] = ""
+            else:
+                has_non_empty = True
+            segments.append(item)
 
-    if not segments:
-        return JSONResponse({"ok": True, "segments": []})
+    if not segments or not has_non_empty:
+        return JSONResponse({"ok": True, "segments": segments})
 
+    import shutil
     import uuid
     from pathlib import Path
     from videotrans.configure.config import TEMP_DIR
@@ -88,6 +98,7 @@ async def translate_handler(
     media_store = getattr(request.app.state, "media_store", None) or MEDIA
     media_id = getattr(payload, "mediaId", None) or (payload.model_dump().get("mediaId") if hasattr(payload, "model_dump") else None)
     media = media_store.get(str(media_id)) if media_id else None
+    fallback_path: Optional[Path] = None
     if media is None or not media.path.is_file():
         fallback_path = Path(TEMP_DIR) / f"webui-trans-{uuid.uuid4().hex}.mp4"
         fallback_path.touch(exist_ok=True)
@@ -119,11 +130,17 @@ async def translate_handler(
     job_manager = getattr(request.app.state, "job_manager", None)
     runner = getattr(job_manager, "_translation_runner", None) or run_staged_translation
     token = CancellationToken()
-    result = await asyncio.to_thread(runner, TaskRequest(task_params), None, token)
-    if result.status == TaskStatus.FAILED:
-        err_msg = result.failure.message if result.failure else "Translation failed"
-        raise HTTPException(status_code=400, detail=err_msg)
-    return JSONResponse({"ok": True, "segments": list(result.segments)})
+    try:
+        result = await asyncio.to_thread(runner, TaskRequest(task_params), None, token)
+        if result.status == TaskStatus.FAILED:
+            err_msg = result.failure.message if result.failure else "Translation failed"
+            raise HTTPException(status_code=400, detail=err_msg)
+        return JSONResponse({"ok": True, "segments": list(result.segments)})
+    finally:
+        if fallback_path is not None:
+            fallback_path.unlink(missing_ok=True)
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        shutil.rmtree(target_dir, ignore_errors=True)
 
 
 @router.post("/api/ocr/extract")
@@ -140,32 +157,36 @@ async def ocr_extract_handler(
     try:
         start_sec = float(payload.startSec)
         end_sec = float(payload.endSec)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise HTTPException(status_code=400, detail="startSec and endSec must be numeric")
 
-    if end_sec <= start_sec or start_sec < 0:
-        raise HTTPException(status_code=400, detail="endSec must be strictly greater than startSec >= 0")
+    if not (math.isfinite(start_sec) and math.isfinite(end_sec)) or end_sec <= start_sec or start_sec < 0:
+        raise HTTPException(status_code=400, detail="endSec must be finite and strictly greater than startSec >= 0")
 
     roi = payload.roi
     if isinstance(roi, dict):
         try:
-            rx = float(roi.get("x", 0))
-            ry = float(roi.get("y", 0))
-            rw = float(roi.get("width", roi.get("w", 0)))
-            rh = float(roi.get("height", roi.get("h", 0)))
+            rx_val = roi.get("x")
+            ry_val = roi.get("y")
+            rw_val = roi.get("width") if roi.get("width") is not None else roi.get("w")
+            rh_val = roi.get("height") if roi.get("height") is not None else roi.get("h")
+            rx = float(0 if rx_val is None else rx_val)
+            ry = float(0 if ry_val is None else ry_val)
+            rw = float(0 if rw_val is None else rw_val)
+            rh = float(0 if rh_val is None else rh_val)
             roi = [rx, ry, rw, rh]
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise HTTPException(status_code=400, detail="roi elements must be numeric")
     elif not (isinstance(roi, (list, tuple)) and len(roi) == 4):
         raise HTTPException(status_code=400, detail="roi must be a 4-element list [x, y, w, h] or a dict with x, y, width, height")
 
     try:
         rx, ry, rw, rh = [float(v) for v in roi]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise HTTPException(status_code=400, detail="roi elements must be numeric")
 
-    if rw <= 0 or rh <= 0 or rx < 0 or ry < 0 or rx + rw > 1.05 or ry + rh > 1.05:
-        raise HTTPException(status_code=400, detail="roi must be normalized (0..1) with positive width and height")
+    if not all(math.isfinite(v) for v in (rx, ry, rw, rh)) or rw <= 0 or rh <= 0 or rx < 0 or ry < 0 or rx + rw > 1.05 or ry + rh > 1.05:
+        raise HTTPException(status_code=400, detail="roi must be finite and normalized (0..1) with positive width and height")
 
     normalized_roi = NormalizedRoi(rx, ry, rw, rh)
     language = payload.language

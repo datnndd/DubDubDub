@@ -2,12 +2,13 @@ import { StateCreator } from 'zustand';
 import type { Segment, OcrSubtitleEntry } from '../types/segment';
 import { formatTimecode } from './playbackSlice';
 import { requestTranslate, requestOcrExtract } from '../api/stages';
+import { updateProjectState } from '../api/projects';
 
 const DEFAULT_SEGMENTS: Segment[] = [];
 
 export interface TranscriptSlice {
   segments: Segment[];
-  activeSegmentId: number;
+  activeSegmentId: number | null;
   searchQuery: string;
   lockedTerms: Array<{ id: number; source: string; target: string }>;
   translationModal: {
@@ -28,7 +29,7 @@ export interface TranscriptSlice {
   setTranscriptOptions: (options: { utterances?: Segment[]; paragraphs?: Segment[] } | null) => void;
   selectSegmentationOption: (option: 'utterances' | 'paragraphs') => void;
   setShowSegmentationModal: (show: boolean) => void;
-  setActiveSegmentId: (id: number) => void;
+  setActiveSegmentId: (id: number | null) => void;
   setSearchQuery: (query: string) => void;
   updateSegmentText: (id: number, text: string, isTarget?: boolean) => void;
   updateSegmentTiming: (id: number, startSec: number, endSec: number) => void;
@@ -114,7 +115,7 @@ export const createTranscriptSlice: StateCreator<any, [], [], TranscriptSlice> =
 
   setShowSegmentationModal: (show: boolean) => set({ showSegmentationModal: show }),
 
-  setActiveSegmentId: (id: number) => set({ activeSegmentId: id }),
+  setActiveSegmentId: (id: number | null) => set({ activeSegmentId: id }),
 
   setSearchQuery: (searchQuery: string) => set({ searchQuery }),
 
@@ -334,11 +335,32 @@ export const createTranscriptSlice: StateCreator<any, [], [], TranscriptSlice> =
       };
     });
 
+    const prevIdBySeg = new Map<Segment, number>();
+    currentState.segments.forEach((s: Segment) => prevIdBySeg.set(s, s.id));
+    const origOverride = currentState.segmentVoiceOverrides?.[segmentId] ?? original.voiceOverride;
+    const newSegSet = new Set<Segment>(newSegments);
+
     const next = [...currentState.segments];
     next.splice(idx, 1, ...newSegments);
 
     next.sort((a, b) => a.startSec - b.startSec);
-    const reindexed = next.map((seg, i) => ({ ...seg, id: i + 1 }));
+    const nextOverrides: Record<number, string> = {};
+    const reindexed = next.map((seg, i) => {
+      const newId = i + 1;
+      let overrideForSeg: string | undefined;
+      if (newSegSet.has(seg)) {
+        overrideForSeg = origOverride;
+      } else {
+        const oldId = prevIdBySeg.get(seg);
+        overrideForSeg = (oldId != null ? currentState.segmentVoiceOverrides?.[oldId] : undefined) ?? seg.voiceOverride;
+      }
+      if (overrideForSeg) {
+        nextOverrides[newId] = overrideForSeg;
+        return { ...seg, id: newId, voiceOverride: overrideForSeg };
+      }
+      const { voiceOverride: _removed, ...rest } = seg;
+      return { ...rest, id: newId };
+    });
 
     const activeSeg = reindexed.find(
       (s) => s.startSec === newSegments[0].startSec && s.sourceText === newSegments[0].sourceText
@@ -346,6 +368,7 @@ export const createTranscriptSlice: StateCreator<any, [], [], TranscriptSlice> =
 
     set((state: any) => ({
       segments: reindexed,
+      segmentVoiceOverrides: nextOverrides,
       activeSegmentId: activeSeg?.id || 1,
       dubbingStatus: 'idle',
       assembledDubUrl: null,
@@ -360,6 +383,11 @@ export const createTranscriptSlice: StateCreator<any, [], [], TranscriptSlice> =
   },
 
   runBatchTranslation: async (sourceLang?: string, targetLang?: string) => {
+    const targetProjectId = get().activeProjectId;
+    const baseSegments: Segment[] = get().segments || [];
+    const baseOptions = get().transcriptOptions;
+    const baseOptionKey = get().selectedSegmentOption;
+
     if (sourceLang && get().languages?.source?.code !== sourceLang) {
       const avail = get().backend?.options?.languages || [];
       const opt = avail.find((l: any) => l.code === sourceLang);
@@ -388,12 +416,13 @@ export const createTranscriptSlice: StateCreator<any, [], [], TranscriptSlice> =
       const req: any = buildTranslationRequest(get());
       if (sourceLang) req.sourceLanguage = sourceLang;
       if (targetLang) req.targetLanguage = targetLang;
-      if (get().activeProjectId) req.projectId = get().activeProjectId;
+      if (targetProjectId) req.projectId = targetProjectId;
       if (get().backend?.mediaId) req.mediaId = get().backend.mediaId;
       const resp = await requestTranslate(req);
 
       if (resp.ok && resp.segments) {
         const segMap = new Map<number, string>();
+        const respById = new Map<number, any>();
         resp.segments.forEach((s: any, idx: number) => {
           let trans = '';
           if (typeof s.targetText === 'string' && s.targetText.trim()) {
@@ -407,25 +436,43 @@ export const createTranscriptSlice: StateCreator<any, [], [], TranscriptSlice> =
             trans = s.targetText || s.text;
           }
 
+          const hasExplicitId = (s.id !== undefined && s.id !== null) || (s.line !== undefined && s.line !== null);
           if (s.id !== undefined && s.id !== null) {
             segMap.set(Number(s.id), trans);
+            respById.set(Number(s.id), s);
           }
           if (s.line !== undefined && s.line !== null) {
             segMap.set(Number(s.line), trans);
+            if (!respById.has(Number(s.line))) {
+              respById.set(Number(s.line), s);
+            }
           }
-          segMap.set(idx + 1, trans);
-          segMap.set(idx, trans);
+          if (!hasExplicitId) {
+            if (!segMap.has(idx + 1)) segMap.set(idx + 1, trans);
+            if (!segMap.has(idx)) segMap.set(idx, trans);
+          }
         });
 
-        const nextSegments = get().segments.map((s: Segment, index: number) => {
-          const respSeg = resp.segments[index];
+        const sameProject = get().activeProjectId === targetProjectId;
+        const sourceSegments: Segment[] = sameProject ? (get().segments || []) : baseSegments;
+        const lengthsMatch = resp.segments.length === sourceSegments.length;
+        const nextSegments = sourceSegments.map((s: Segment, index: number) => {
+          const srcText = String(s.sourceText ?? s.text ?? '').trim();
+          const posSeg = resp.segments[index];
+          const posMatchesId =
+            posSeg &&
+            (posSeg.id === undefined || posSeg.id === null || Number(posSeg.id) === Number(s.id)) &&
+            (posSeg.line === undefined || posSeg.line === null || Number(posSeg.line) === Number(s.id));
+          const respSeg = respById.get(Number(s.id)) || (lengthsMatch && posMatchesId ? posSeg : undefined);
           let translated = '';
-          if (respSeg && typeof respSeg.targetText === 'string' && respSeg.targetText.trim()) {
+          if (!srcText) {
+            translated = (respSeg && typeof respSeg.targetText === 'string' ? respSeg.targetText.trim() : '') || (s.targetText || '').trim();
+          } else if (respSeg && typeof respSeg.targetText === 'string' && respSeg.targetText.trim()) {
             translated = respSeg.targetText;
           } else if (respSeg && typeof respSeg.text === 'string' && respSeg.text.trim() && (!respSeg.sourceText || respSeg.text !== respSeg.sourceText)) {
             translated = respSeg.text;
           } else {
-            translated = segMap.get(Number(s.id)) ?? segMap.get(index + 1) ?? s.targetText ?? '';
+            translated = segMap.get(Number(s.id)) ?? (lengthsMatch ? segMap.get(index + 1) : undefined) ?? s.targetText ?? '';
           }
 
           const dur = Math.max(0.1, (s.endSec || 0) - (s.startSec || 0));
@@ -435,52 +482,79 @@ export const createTranscriptSlice: StateCreator<any, [], [], TranscriptSlice> =
           return {
             ...s,
             targetText: translated,
+            rawTranslation: translated,
             cps,
             cpsStatus,
           };
         });
 
-        const curOptions = get().transcriptOptions;
-        const curOptionKey = get().selectedSegmentOption;
+        const curOptions = sameProject ? get().transcriptOptions : baseOptions;
+        const curOptionKey = sameProject ? get().selectedSegmentOption : baseOptionKey;
         const nextOptions = curOptions ? {
           ...curOptions,
           [curOptionKey]: nextSegments,
         } : curOptions;
 
-        set({
-          segments: nextSegments,
-          transcriptOptions: nextOptions,
-          translationModal: {
-            active: true,
-            status: 'completed',
-            progress: 100,
-            message: 'Translation completed successfully',
-            error: null,
-          },
-        });
-        get().triggerAutosave();
+        if (sameProject) {
+          set({
+            segments: nextSegments,
+            transcriptOptions: nextOptions,
+            translationModal: {
+              active: true,
+              status: 'completed',
+              progress: 100,
+              message: 'Translation completed successfully',
+              error: null,
+            },
+          });
+          get().triggerAutosave();
 
-        setTimeout(() => {
-          if (get().translationModal.status === 'completed') {
+          setTimeout(() => {
+            if (get().translationModal.status === 'completed' && get().activeProjectId === targetProjectId) {
+              get().closeTranslationModal();
+            }
+          }, 1200);
+        } else {
+          if (targetProjectId) {
+            try {
+              await updateProjectState(targetProjectId, {
+                segments: nextSegments,
+                ...(nextOptions ? { transcriptOptions: nextOptions } : {}),
+              });
+            } catch (saveErr) {
+              console.warn('Failed to persist batch translation for previous project:', saveErr);
+            }
+          }
+          if (get().translationModal?.status === 'translating') {
             get().closeTranslationModal();
           }
-        }, 1200);
+        }
+      } else {
+        throw new Error((resp as any)?.detail || (resp as any)?.error || (resp as any)?.message || 'Translation failed');
       }
     } catch (err: any) {
-      set({
-        translationModal: {
-          active: true,
-          status: 'failed',
-          progress: 0,
-          message: 'Translation failed',
-          error: err.message,
-        },
-      });
+      if (get().activeProjectId === targetProjectId) {
+        set({
+          translationModal: {
+            active: true,
+            status: 'failed',
+            progress: 0,
+            message: 'Translation failed',
+            error: err.message,
+          },
+        });
+      } else if (get().translationModal?.status === 'translating') {
+        get().closeTranslationModal();
+      }
     }
   },
 
   translateSingleSegment: async (segmentId: number) => {
-    const seg = get().segments.find((s: Segment) => s.id === segmentId);
+    const targetProjectId = get().activeProjectId;
+    const baseSegments: Segment[] = get().segments || [];
+    const baseOptions = get().transcriptOptions;
+    const baseOptionKey = get().selectedSegmentOption;
+    const seg = baseSegments.find((s: Segment) => s.id === segmentId);
     if (!seg) return;
     const text = seg.sourceText || seg.text || '';
     if (!text.trim()) return;
@@ -495,8 +569,8 @@ export const createTranscriptSlice: StateCreator<any, [], [], TranscriptSlice> =
         translateType: get().backend?.config?.translateType ?? 0,
         translationMode: get().backend?.config?.translationMode || 'srt',
       };
-      if (get().activeProjectId) {
-        req.projectId = get().activeProjectId;
+      if (targetProjectId) {
+        req.projectId = targetProjectId;
       }
       const resp = await requestTranslate(req);
       if (resp.ok && resp.segments && resp.segments.length > 0) {
@@ -507,7 +581,37 @@ export const createTranscriptSlice: StateCreator<any, [], [], TranscriptSlice> =
             ? item.text
             : (item.targetText || item.text || '');
         if (trans) {
-          get().updateSegmentText(segmentId, trans, true);
+          if (get().activeProjectId === targetProjectId) {
+            get().updateSegmentText(segmentId, trans, true);
+          } else if (targetProjectId) {
+            const nextSegments = baseSegments.map((s: Segment) => {
+              if (s.id !== segmentId) return s;
+              const dur = Math.max(0.1, (s.endSec || 0) - (s.startSec || 0));
+              const cps = Number((trans.trim().length / dur).toFixed(1));
+              const cpsStatus = cps <= 14.5 ? 'Optimal' : cps <= 18.0 ? 'Good' : 'Warning';
+              return {
+                ...s,
+                targetText: trans,
+                cps,
+                cpsStatus,
+                previewAudioUrl: undefined,
+                previewAudioId: undefined,
+                previewSpeedFactor: undefined,
+              };
+            });
+            const nextOptions = baseOptions ? {
+              ...baseOptions,
+              [baseOptionKey]: nextSegments,
+            } : baseOptions;
+            try {
+              await updateProjectState(targetProjectId, {
+                segments: nextSegments,
+                ...(nextOptions ? { transcriptOptions: nextOptions } : {}),
+              });
+            } catch (saveErr) {
+              console.warn('Failed to persist single segment translation for previous project:', saveErr);
+            }
+          }
         }
       }
     } catch (err) {

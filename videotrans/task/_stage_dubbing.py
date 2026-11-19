@@ -8,6 +8,7 @@ from videotrans.configure._paths import DUBBING_CACHE
 from videotrans.configure.config import tr, settings, logger
 from videotrans.configure.excepts import DubbingSrtError
 from videotrans.tts import run as run_tts, SUPPORT_CLONE
+from videotrans.tts._cache import prune_cache_dir, touch_cache_entry
 from videotrans.util.help_misc import get_md5, vail_file
 from videotrans.util.help_srt import get_subtitle_from_srt, delete_punc
 
@@ -80,10 +81,11 @@ class DubbingMixin:
                 "tts_type": self.cfg.tts_type,
                 "filename": f"{self.cfg.cache_folder}/{i}-{_key}.wav"
             }
-            _dubbing_cache=f'{DUBBING_CACHE}/{_key}.wav'
+            _dubbing_cache = f'{DUBBING_CACHE}/{_key}.wav'
             if vail_file(_dubbing_cache):
-                # Directly use cache
-                shutil.copy2(_dubbing_cache,tmp_dict['filename'])
+                # Directly use cache and refresh LRU mtime
+                touch_cache_entry(Path(_dubbing_cache))
+                shutil.copy2(_dubbing_cache, tmp_dict['filename'])
             if str(voice).strip().lower() == 'clone' and self.cfg.tts_type in SUPPORT_CLONE:
                 tmp_dict['ref_wav'] = f"{self.cfg.cache_folder}/clone-{i}.wav"
                 tmp_dict['ref_language'] = self.cfg.detect_language[:2]
@@ -110,15 +112,30 @@ class DubbingMixin:
         if settings.get('save_segment_audio', False):
             outname = self.cfg.target_dir + f'/segment_audio_{self.cfg.noextname}'
             Path(outname).mkdir(parents=True, exist_ok=True)
+        dub_cache_root = Path(DUBBING_CACHE)
+        dub_cache_root.mkdir(parents=True, exist_ok=True)
+        written_cache_names: set[str] = set()
         for it in self.queue_tts:
             it['text']=it['text'].strip('...')
             if self.cfg.fix_punc==2:
                 it['text']=delete_punc(it['text'])
             if Path(it['filename']).exists():
                 # Save to cache
-                shutil.copy2(it['filename'],f'{DUBBING_CACHE}/'+Path(it['filename']).name.split('-')[-1])
+                cache_name = Path(it['filename']).name.split('-')[-1]
+                cache_dest = dub_cache_root / cache_name
+                shutil.copy2(it['filename'], cache_dest)
+                touch_cache_entry(cache_dest)
+                written_cache_names.add(cache_name)
                 if outname:
                     text = re.sub(r'["\'*?\\/|:<>\r\n\t]+', '', it['text'], flags=re.I | re.S)
                     name = f'{outname}/{it["line"]}-{text[:60]}.wav'
                     shutil.copy2(it['filename'], name)
+        prune_cache_dir(
+            dub_cache_root,
+            max_age_seconds=14 * 86400,
+            max_bytes=1024 * 1024 * 1024,
+            max_files=2000,
+            primary_suffixes=(".wav",),
+            exclude_names=written_cache_names,
+        )
         

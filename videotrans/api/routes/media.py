@@ -36,7 +36,7 @@ class RegisterLocalMediaRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
 
-@router.post("/api/media/scan-folders")
+@router.post("/api/media/scan-folders", include_in_schema=False)
 @router.post("/api/media/scan_folders")
 async def scan_folders_handler(payload: ScanFoldersRequest) -> JSONResponse:
     target_paths = payload.paths or []
@@ -78,7 +78,7 @@ async def scan_folders_handler(payload: ScanFoldersRequest) -> JSONResponse:
     return JSONResponse({"ok": True, "videos": results, "count": len(results)})
 
 
-@router.post("/api/media/register-local", status_code=201)
+@router.post("/api/media/register-local", status_code=201, include_in_schema=False)
 @router.post("/api/media/register_local", status_code=201)
 async def register_local_media_handler(
     payload: RegisterLocalMediaRequest,
@@ -103,13 +103,16 @@ async def register_local_media_handler(
     return JSONResponse({"ok": True, "media": records, "count": len(records)}, status_code=201)
 
 
-@router.post("/api/media/batch-upload", status_code=201)
+@router.post("/api/media/batch-upload", status_code=201, include_in_schema=False)
 @router.post("/api/media/batch_upload", status_code=201)
 async def batch_upload_media_handler(
     request: Request,
 ) -> JSONResponse:
     store = getattr(request.app.state, "media_store", None) or MEDIA
-    form = await request.form()
+    try:
+        form = await request.form()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid multipart form: {exc}") from exc
     uploaded_records = []
 
     for key, value in form.multi_items():

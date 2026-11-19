@@ -351,3 +351,27 @@ async def test_jobs_post_deepgram_custom_model_and_media_recovery(tmp_path):
         assert res.status_code == 202, f"Expected 202 Accepted, got {res.status_code}: {res.text}"
         data = res.json()
         assert data["id"]
+
+
+def test_deepgram_rejects_whisper_leak_in_runtime_params(tmp_path, monkeypatch):
+    from videotrans import recognition
+    from videotrans.configure import config as runtime_config
+
+    monkeypatch.setitem(runtime_config.params, "stt_model_name", "large-v3")
+    monkeypatch.setitem(runtime_config.params, "model_name", "large-v3")
+
+    dummy_media = tmp_path / "test.mp4"
+    dummy_media.write_bytes(b"dummy")
+
+    with pytest.raises(ValueError, match="not supported by Deepgram"):
+        build_task_params(
+            dummy_media,
+            {
+                "recognType": recognition.Deepgram,
+                "modelName": "large-v3",
+                "sourceLanguage": "en",
+            },
+            job_type="asr",
+            output_dir=tmp_path,
+            temp_dir=tmp_path,
+        )

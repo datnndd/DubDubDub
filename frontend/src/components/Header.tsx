@@ -9,118 +9,27 @@ import {
   Settings as SettingsIcon,
   ArrowLeft,
   Layers,
-  CheckCircle2,
-  Loader2,
-  AlertCircle,
-  Clock,
 } from 'lucide-react';
-import type { ProjectRecord } from '../types/project';
-
-export interface SubprojectStatusInfo {
-  label: string;
-  badgeText: string;
-  pillClasses: string;
-  icon: React.ReactNode;
-  status: 'running' | 'completed' | 'failed' | 'queued' | 'pending';
-  isVoice?: boolean;
-}
-
-export function getSubprojectStatusInfo(
-  sub: { id: string; stage?: number; status?: string; name?: string },
-  projectJobStatuses: Record<string, any> = {}
-): SubprojectStatusInfo {
-  const jobState = projectJobStatuses[sub.id];
-
-  if (jobState) {
-    if (jobState.status === 'running') {
-      const isVoice = jobState.stage === 'voice';
-      const label = isVoice
-        ? (jobState.progress != null && jobState.progress > 0
-            ? `Voice: ${jobState.progress}%`
-            : 'Creating Voice…')
-        : `ASR: ${jobState.progress != null ? jobState.progress.toFixed(0) : '0'}%`;
-      return {
-        label,
-        badgeText: isVoice
-          ? (jobState.progress != null && jobState.progress > 0 ? `${jobState.progress}%` : 'Voice…')
-          : (jobState.progress != null ? `${jobState.progress.toFixed(0)}%` : 'ASR…'),
-        pillClasses: 'bg-amber-100 text-[#8D4B00] border-amber-300 animate-pulse',
-        icon: <Loader2 className="w-2.5 h-2.5 animate-spin text-amber-600" />,
-        status: 'running',
-        isVoice,
-      };
-    }
-    if (jobState.status === 'completed') {
-      const isVoice = jobState.stage === 'voice';
-      return {
-        label: isVoice ? 'Voice Ready' : 'Ready for Review',
-        badgeText: isVoice ? 'Voice Ready' : 'Ready',
-        pillClasses: 'bg-emerald-100 text-emerald-800 border-emerald-300',
-        icon: <CheckCircle2 className="w-2.5 h-2.5 text-emerald-600" />,
-        status: 'completed',
-        isVoice,
-      };
-    }
-    if (jobState.status === 'failed') {
-      return {
-        label: jobState.stage === 'voice' ? 'Voice Failed' : 'Failed',
-        badgeText: 'Failed',
-        pillClasses: 'bg-rose-100 text-rose-800 border-rose-300',
-        icon: <AlertCircle className="w-2.5 h-2.5 text-rose-600" />,
-        status: 'failed',
-      };
-    }
-    if (jobState.status === 'queued') {
-      return {
-        label: 'Queued',
-        badgeText: 'Queued',
-        pillClasses: 'bg-stone-100 text-stone-700 border-stone-300',
-        icon: <Clock className="w-2.5 h-2.5 text-stone-500" />,
-        status: 'queued',
-      };
-    }
-  }
-
-  const stage = sub.stage || 1;
-  if (stage >= 2 || sub.status === 'completed') {
-    const isStage3or4 = stage >= 3;
-    return {
-      label: stage >= 4 ? 'Completed' : isStage3or4 ? 'Voice Ready' : 'Ready for Review',
-      badgeText: stage >= 4 ? 'Done' : isStage3or4 ? 'Voice Ready' : 'Ready',
-      pillClasses: 'bg-emerald-100 text-emerald-800 border-emerald-300',
-      icon: <CheckCircle2 className="w-2.5 h-2.5 text-emerald-600" />,
-      status: 'completed',
-    };
-  }
-  if (sub.status === 'processing') {
-    return {
-      label: 'Processing…',
-      badgeText: 'Working…',
-      pillClasses: 'bg-amber-100 text-[#8D4B00] border-amber-300 animate-pulse',
-      icon: <Loader2 className="w-2.5 h-2.5 animate-spin text-amber-600" />,
-      status: 'running',
-    };
-  }
-
-  return {
-    label: 'Pending',
-    badgeText: 'Pending',
-    pillClasses: 'bg-stone-100 text-stone-600 border-stone-200',
-    icon: <Clock className="w-2.5 h-2.5 text-stone-400" />,
-    status: 'pending',
-  };
-}
+import { isParentProject } from '../utils/project';
+export { type SubprojectStatusInfo, getSubprojectStatusInfo } from '../utils/projectStatus';
 
 export const Header: React.FC = () => {
   const activeView = useDubDubStore((s) => s.activeView);
+  const activeProjectId = useDubDubStore((s) => s.activeProjectId);
   const setActiveView = useDubDubStore((s) => s.setActiveView);
   const setStep = useDubDubStore((s) => s.setStep);
   const project = useDubDubStore((s) => s.project);
   const projectsList = useDubDubStore((s) => s.projectsList);
+  const backend = useDubDubStore((s) => s.backend);
   const openSettings = useDubDubStore((s) => s.openSettings);
   const sessionSubprojects = useDubDubStore((s) => s.sessionSubprojects || []);
   const sessionDrawerOpen = useDubDubStore((s) => s.sessionDrawerOpen);
   const setSessionDrawerOpen = useDubDubStore((s) => s.setSessionDrawerOpen);
+
+  const videoProjectsCount = (projectsList || []).filter((p) => !isParentProject(p)).length;
+  const hw = backend?.options?.hardware;
+  const hwReady = Boolean(backend?.ready);
+  const cudaAvailable = Boolean(hw?.cudaAvailable);
 
   return (
     <header className="h-[50px] flex-shrink-0 bg-white border-b border-[#E7E4DC] px-4 flex items-center justify-between gap-4 z-30 shadow-2xs">
@@ -159,11 +68,11 @@ export const Header: React.FC = () => {
           >
             <FolderOpen className={`w-3.5 h-3.5 ${activeView === 'projects' ? 'text-[#8D4B00]' : 'text-stone-400'}`} />
             <span>Projects</span>
-            {projectsList?.length > 0 && (
+            {videoProjectsCount > 0 && (
               <span className={`px-1.5 py-0.2 rounded-full text-[9px] font-bold ${
                 activeView === 'projects' ? 'bg-amber-100 text-[#8D4B00]' : 'bg-stone-200 text-stone-600'
               }`}>
-                {projectsList.length}
+                {videoProjectsCount}
               </span>
             )}
           </button>
@@ -248,14 +157,29 @@ export const Header: React.FC = () => {
           <span>Settings</span>
         </button>
 
-        <div className="hidden sm:flex items-center gap-1 text-[11px] text-stone-500 font-medium">
-          <Sparkles className="w-3 h-3 text-stone-400" />
-          <span>Auto-saved {project?.lastSaved || 'Just now'}</span>
-        </div>
+        {activeView === 'dubbing' && Boolean(activeProjectId) && (
+          <div className="hidden sm:flex items-center gap-1 text-[11px] text-stone-500 font-medium">
+            <Sparkles className="w-3 h-3 text-stone-400" />
+            <span>Auto-saved {project?.lastSaved || 'Just now'}</span>
+          </div>
+        )}
 
-        <div className="flex items-center gap-2 px-2.5 py-1 bg-stone-50 rounded-lg border border-stone-200 shadow-2xs">
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 warm-pulse" />
-          <span className="font-mono text-[10px] font-semibold text-stone-700">Warm GPU</span>
+        <div
+          data-testid="header-hardware-badge"
+          className="flex items-center gap-2 px-2.5 py-1 bg-stone-50 rounded-lg border border-stone-200 shadow-2xs"
+        >
+          <span
+            className={`w-1.5 h-1.5 rounded-full ${
+              !hwReady
+                ? 'bg-amber-400 animate-pulse'
+                : cudaAvailable
+                ? 'bg-emerald-500 warm-pulse'
+                : 'bg-stone-400'
+            }`}
+          />
+          <span className="font-mono text-[10px] font-semibold text-stone-700">
+            {!hwReady ? 'Checking HW…' : cudaAvailable ? 'GPU Ready' : 'CPU Mode'}
+          </span>
         </div>
       </div>
     </header>

@@ -19,12 +19,29 @@ Pure stdlib; no heavy imports.
 from typing import List
 
 from videotrans.ocr._types import OcrConfig, OcrResult, OcrSegment
-from videotrans.ocr._text import normalize_text, text_similarity, representative_text
+from videotrans.ocr._text import (
+    is_same_subtitle_text,
+    normalize_text,
+    representative_text,
+    text_similarity,
+)
 
 
 # Internal states
 _EMPTY = "EMPTY"
 _ACTIVE = "ACTIVE"
+_MAX_OBS_PER_SEGMENT = 16
+
+
+def _append_bounded_obs(obs_list: list, text: str, conf: float) -> None:
+    obs_list.append((text, conf))
+    if len(obs_list) > _MAX_OBS_PER_SEGMENT:
+        best_idx = max(range(len(obs_list)), key=lambda i: obs_list[i][1])
+        if best_idx < len(obs_list) - _MAX_OBS_PER_SEGMENT:
+            best_item = obs_list[best_idx]
+            obs_list[:] = [best_item] + obs_list[-(_MAX_OBS_PER_SEGMENT - 1):]
+        else:
+            obs_list[:] = obs_list[-_MAX_OBS_PER_SEGMENT:]
 
 
 class SegmentBuilder:
@@ -44,6 +61,9 @@ class SegmentBuilder:
         self._gap_start_ms = None
         # Timestamp of the most recent non-empty (active) observation.
         self._last_active_ts = None
+        # Bounded line-frequency tracking for persistent watermark stripping.
+        self._line_counts: dict[str, int] = {}
+        self._nonempty_obs_count: int = 0
 
     # -- helpers ---------------------------------------------------------
     @property
@@ -53,16 +73,20 @@ class SegmentBuilder:
         return 0.90
 
     def _is_similar(self, a: str, b: str) -> bool:
-        return text_similarity(a, b) >= self.config.similarity_threshold
+        return is_same_subtitle_text(a, b, self.config.similarity_threshold)
 
     def _open_segment_from_candidate(self):
         """Promote buffered candidate observations to an open ACTIVE segment."""
         obs = self._cand
         start_ms = obs[0]["ts"]
+        bounded = []
+        for o in obs:
+            _append_bounded_obs(bounded, o["text"], o["confidence"])
         self._open = {
             "start_ms": start_ms,
             "last_ts": obs[-1]["ts"],
-            "observations": [(o["text"], o["confidence"]) for o in obs],
+            "observations": bounded,
+            "sample_count": len(obs),
         }
         self._last_active_ts = obs[-1]["ts"]
         self._gap_start_ms = None
@@ -82,7 +106,7 @@ class SegmentBuilder:
             end_ms=int(end_ms),
             text=text,
             confidence=avg_conf,
-            samples=len(obs),
+            samples=int(self._open.get("sample_count", len(obs))),
         )
         # Only emit segments that carry text.
         if seg.text:
@@ -94,7 +118,38 @@ class SegmentBuilder:
     def _reset_candidate_with(self, ts: int, text: str, conf: float):
         self._cand = [{"ts": ts, "text": text, "confidence": conf}]
 
+    def _record_line_freq(self, text: str) -> None:
+        self._nonempty_obs_count += 1
+        seen = set()
+        for ln in text.splitlines():
+            ln_norm = normalize_text(ln)
+            if ln_norm and ln_norm not in seen:
+                seen.add(ln_norm)
+                if ln_norm in self._line_counts or len(self._line_counts) < 512:
+                    self._line_counts[ln_norm] = self._line_counts.get(ln_norm, 0) + 1
+
     # -- public API ------------------------------------------------------
+    def on_dedup_skip(self, timestamp_ms: int) -> None:
+        """Advance segment timing when a frame is visually identical and OCR is skipped."""
+        ts = int(timestamp_ms)
+        if self._state == _EMPTY:
+            if self._cand:
+                last = self._cand[-1]
+                self._cand.append({"ts": ts, "text": last["text"], "confidence": last["confidence"]})
+                if len(self._cand) >= max(1, self.config.min_stable_samples):
+                    self._open_segment_from_candidate()
+            return
+        if self._state != _ACTIVE or self._open is None:
+            return
+        if self._gap_start_ms is None:
+            self._open["last_ts"] = ts
+            self._last_active_ts = ts
+        else:
+            if self._last_active_ts is not None and (ts - self._last_active_ts) > self.config.grace_gap_ms:
+                self._finish_open(self._last_active_ts)
+                self._state = _EMPTY
+                self._cand = []
+
     def observe(self, timestamp_ms: int, result: OcrResult):
         """Feed one sampled observation. Empty text is a normal observation."""
         ts = int(timestamp_ms)
@@ -102,6 +157,9 @@ class SegmentBuilder:
         conf = float(result.confidence if result is not None else 0.0)
         norm = normalize_text(text)
         is_empty = norm == ""
+
+        if not is_empty:
+            self._record_line_freq(text)
 
         if self._state == _EMPTY:
             if is_empty:
@@ -141,7 +199,8 @@ class SegmentBuilder:
         last_open_text = self._open["observations"][-1][0]
         if self._is_similar(last_open_text, text) or self._is_similar(open_rep, text):
             # Same subtitle continues (possibly after a bridged short gap).
-            self._open["observations"].append((text, conf))
+            _append_bounded_obs(self._open["observations"], text, conf)
+            self._open["sample_count"] = int(self._open.get("sample_count", 0)) + 1
             self._open["last_ts"] = ts
             self._last_active_ts = ts
             self._gap_start_ms = None
@@ -163,6 +222,7 @@ class SegmentBuilder:
         prematurely finalized.
         """
         return sorted(self._segments, key=lambda s: s.start_ms)
+
     def finalize(self) -> List[OcrSegment]:
         """Close any open segment and return all segments sorted by start_ms."""
         if self._open is not None:
@@ -174,5 +234,32 @@ class SegmentBuilder:
             self._finish_open(end_ms)
         self._state = _EMPTY
         self._cand = []
+
+        if self._nonempty_obs_count >= 4 and len(self._segments) >= 1:
+            watermark_keys = {
+                k for k, cnt in self._line_counts.items()
+                if cnt > 0.85 * self._nonempty_obs_count
+            }
+            if watermark_keys:
+                filtered: List[OcrSegment] = []
+                for seg in self._segments:
+                    kept_lines = [
+                        ln for ln in seg.text.splitlines()
+                        if normalize_text(ln) not in watermark_keys
+                    ]
+                    new_txt = "\n".join(ln.strip() for ln in kept_lines if ln.strip())
+                    if new_txt:
+                        filtered.append(
+                            OcrSegment(
+                                start_ms=seg.start_ms,
+                                end_ms=seg.end_ms,
+                                text=new_txt,
+                                confidence=seg.confidence,
+                                samples=seg.samples,
+                            )
+                        )
+                if filtered:
+                    self._segments = filtered
+
         return sorted(self._segments, key=lambda s: s.start_ms)
 

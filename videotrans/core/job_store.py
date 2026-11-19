@@ -149,6 +149,7 @@ def append_event(job_id: str, payload: str | dict[str, Any]) -> int:
     raw_payload = payload if isinstance(payload, str) else json.dumps(payload)
     now = time.time()
     with db_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT COALESCE(MAX(seq), 0) AS s FROM job_events WHERE job_id = ?",
             (job_id,),

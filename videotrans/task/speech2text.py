@@ -58,10 +58,73 @@ class SpeechToText(BaseTask):
         if self._exit(): return
         Path(self.cfg.target_dir).mkdir(parents=True, exist_ok=True)
         Path(self.cfg.cache_folder).mkdir(parents=True, exist_ok=True)
+        if getattr(self.cfg, "subtitle_source", "audio_asr") == "video_ocr":
+            return
         from videotrans.util.help_ffmpeg import conver_to_16k
         conver_to_16k(self.cfg.name, self.cfg.shibie_audio)
 
     def recogn(self):
+        if getattr(self.cfg, "subtitle_source", "audio_asr") == "video_ocr":
+            from videotrans.configure.excepts import SpeechToTextError
+            from videotrans.core.proc_registry import get_current_job_id
+            from videotrans.ocr import scan_video_to_srt
+            from videotrans.util.help_ffmpeg import get_video_info
+
+            if not getattr(self.cfg, "ocr_roi_confirmed", False):
+                raise SpeechToTextError(tr("ROI must be confirmed in the OCR preview dialog before starting"))
+            roi = getattr(self.cfg, "ocr_roi", None)
+            if not roi:
+                raise SpeechToTextError(tr("No ROI configured for video OCR"))
+
+            duration_ms = None
+            try:
+                info = get_video_info(self.cfg.name)
+                duration_ms = info.get("time") if isinstance(info, dict) else None
+            except Exception:
+                duration_ms = None
+
+            ocr_opts = getattr(self.cfg, "ocr_options", None) or {}
+            coarse_interval_ms = int(ocr_opts.get("coarse_interval_ms", 500) or 500)
+            use_angle_cls = bool(ocr_opts.get("use_angle_cls", False))
+            paragraph_mode = str(ocr_opts.get("paragraph_mode") or "preserve_lines")
+            job_id = get_current_job_id() or self.uuid
+
+            def _emit_ocr_progress(p: dict) -> None:
+                self.signal(
+                    text=p.get("latest_text", ""),
+                    type="ocr_progress",
+                    progress=p.get("percent"),
+                    percent=p.get("percent"),
+                    timestamp_ms=p.get("timestamp_ms"),
+                    duration_ms=p.get("duration_ms"),
+                    segments=p.get("segments"),
+                    ocr_calls=p.get("ocr_calls"),
+                    skipped_frames=p.get("skipped_frames"),
+                    device=p.get("device"),
+                )
+
+            srt_items, _segments = scan_video_to_srt(
+                self.cfg.name,
+                roi=roi,
+                language=self.cfg.detect_language,
+                device="cuda" if self.cfg.is_cuda else "cpu",
+                checkpoint_path=f"{self.cfg.cache_folder}/ocr_ckpt.json",
+                progress_callback=_emit_ocr_progress,
+                stop_event=self._exit,
+                job_id=job_id,
+                duration_ms=duration_ms,
+                coarse_interval_ms=coarse_interval_ms,
+                use_angle_cls=use_angle_cls,
+                paragraph_mode=paragraph_mode,
+            )
+            if self._exit(): return
+            if not srt_items:
+                raise SpeechToTextError(self.cfg.basename + tr('recogn result is empty'))
+            self.source_srt_list = srt_items
+            self._save_srt_target(self.source_srt_list, self.cfg.target_sub)
+            self.signal(text=Path(self.cfg.target_sub).read_text(encoding='utf-8'), type='replace_subtitle')
+            return
+
         while 1:
             if self._exit(): return
             # Not yet generated
@@ -113,7 +176,8 @@ class SpeechToText(BaseTask):
 
 
         # Chinese/English punctuation restoration
-        if self.cfg.detect_language != 'auto' and self.cfg.fix_punc==1 and self.cfg.detect_language[:2] in ['zh', 'en']:
+        _lang_prefix = (self.cfg.detect_language or "")[:2].lower()
+        if self.cfg.detect_language != 'auto' and self.cfg.fix_punc==1 and _lang_prefix in ['zh', 'en']:
 
             try:
                 from videotrans.process.prepare_audio import fix_punc
@@ -128,7 +192,7 @@ class SpeechToText(BaseTask):
                     text_dict_obj=json.loads(Path(text_dict_file).read_text(encoding='utf-8'))
                     for it in self.source_srt_list:
                         it['text'] = text_dict_obj.get(f'{it["line"]}', it['text'])
-                        if self.cfg.detect_language[:2] == 'en':
+                        if _lang_prefix == 'en':
                             it['text'] = it['text'].replace('，', ',').replace('。', '. ').replace('？', '?').replace(
                                 '！', '!')
                     self._save_srt_target(self.source_srt_list, self.cfg.target_sub)
@@ -161,12 +225,17 @@ class SpeechToText(BaseTask):
                 logger.exception(f"重新断句失败已恢复原样 {e}", exc_info=True)
 
     def diariz(self):
-        if self._exit() or not self.cfg.enable_diariz or Path(self.cfg.cache_folder + "/speaker.json").exists():
+        if (
+            self._exit()
+            or not self.cfg.enable_diariz
+            or getattr(self.cfg, "subtitle_source", "audio_asr") == "video_ocr"
+            or Path(self.cfg.cache_folder + "/speaker.json").exists()
+        ):
             return
         from videotrans.util.help_down import down_file_from_hf, check_and_down_ms
         speaker_type = settings.get('speaker_type', 'built')
         hf_token = settings.get('hf_token')
-        if speaker_type == 'built' and self.cfg.detect_language[:2] not in ['zh', 'en']:
+        if speaker_type == 'built' and (self.cfg.detect_language or "")[:2].lower() not in ['zh', 'en']:
             logger.error(f'当前选择 built 说话人分离模型，但不支持当前语言:{self.cfg.detect_language}')
             return
         if speaker_type in ['pyannote', 'reverb'] and not hf_token:

@@ -305,14 +305,22 @@ def resolve_secret(key: str, fallback: Optional[str] = None) -> Optional[str]:
 
 
 def is_from_env(key: str) -> bool:
-    """Return True if secret is supplied via system environment variable."""
+    """Return True if secret is overridden by an external OS environment variable."""
+    env_val = ""
     aliases = ENV_KEY_MAP.get(key, [])
     for env_name in aliases:
-        if os.environ.get(env_name, "").strip():
-            return True
-    if os.environ.get(key, "").strip() or os.environ.get(key.upper(), "").strip():
-        return True
-    return False
+        v = os.environ.get(env_name, "").strip()
+        if v:
+            env_val = v
+            break
+    if not env_val:
+        env_val = os.environ.get(key, "").strip() or os.environ.get(key.upper(), "").strip()
+    if not env_val:
+        return False
+    db_val = (get_secret(key) or "").strip()
+    if db_val and db_val == env_val:
+        return False
+    return True
 
 
 def is_secret_configured(key: str) -> bool:

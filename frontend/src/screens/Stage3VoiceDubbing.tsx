@@ -21,9 +21,10 @@ import {
 import { previewTTS } from '../api/voices';
 import { useVoiceAudition, auditionVoice } from '../services/voiceAuditionManager';
 import { ProviderDocLink } from '../components/ProviderDocLink';
+import { pickDefaultVoice } from '../store/dubbingSlice';
 import type { Segment } from '../types/segment';
 
-const TTS_PROVIDERS = [
+const FALLBACK_TTS_PROVIDERS = [
   { id: 0, name: 'ElevenLabs' },
   { id: 1, name: 'OmniVoice' },
   { id: 2, name: 'VieNeu-TTS' },
@@ -78,15 +79,41 @@ export const Stage3VoiceDubbing: React.FC = () => {
   const setCreateVoiceModalOpen = useDubDubStore((s) => s.setCreateVoiceModalOpen);
   const setActiveView = useDubDubStore((s) => s.setActiveView);
   const loadVoices = useDubDubStore((s) => s.loadVoices);
-  const updateBackendConfig = useDubDubStore((s) => (s as any).updateBackendConfig);
+  const updateTtsProvider = useDubDubStore((s) => s.updateTtsProvider);
   const project = useDubDubStore((s) => s.project);
   const autoFitVoiceSpeed = useDubDubStore((s) => s.autoFitVoiceSpeed);
   const maxSpeedRate = useDubDubStore((s) => s.maxSpeedRate);
   const dubbingError = useDubDubStore((s) => s.dubbingError);
+  const dubbingErrors = useDubDubStore((s) => s.dubbingErrors || {});
+  const failedSegmentIds = useDubDubStore((s) => s.failedSegmentIds || []);
+  const runFullDubbing = useDubDubStore((s) => s.runFullDubbing);
+  const cancelDubbing = useDubDubStore((s) => s.cancelDubbing);
   const jobProgress = useDubDubStore((s) => s.jobProgress);
   const jobMessage = useDubDubStore((s) => s.jobMessage);
   const setAutoFitVoiceSpeed = useDubDubStore((s) => s.setAutoFitVoiceSpeed);
   const setMaxSpeedRate = useDubDubStore((s) => s.setMaxSpeedRate);
+
+  const ttsProviders = useMemo(() => {
+    const rawVoices = backend?.options?.voices;
+    if (Array.isArray(rawVoices) && rawVoices.length > 0) {
+      const parsed = rawVoices
+        .map((item: any) => {
+          if (Array.isArray(item) && item.length >= 2) {
+            return { id: Number(item[0]), name: String(item[1]) };
+          }
+          if (item && typeof item === 'object' && item.id !== undefined) {
+            return { id: Number(item.id), name: String(item.name || item.label || item.id) };
+          }
+          return null;
+        })
+        .filter((item): item is { id: number; name: string } => Boolean(item && !Number.isNaN(item.id)));
+      if (parsed.length > 0) return parsed;
+    }
+    return FALLBACK_TTS_PROVIDERS;
+  }, [backend?.options?.voices]);
+
+  const defaultVoiceId = useMemo(() => pickDefaultVoice(voices, customVoices), [voices, customVoices]);
+  const isVietnameseTarget = (languages?.target?.code || 'vi').toLowerCase().startsWith('vi');
 
   const [loadingPreviewMap, setLoadingPreviewMap] = useState<Record<number, boolean>>({});
   const [selectedSpeakerFilter, setSelectedSpeakerFilter] = useState<string>('all');
@@ -141,9 +168,8 @@ export const Stage3VoiceDubbing: React.FC = () => {
 
   const handleProviderChange = async (e: React.ChangeEvent<HTMLSelectElement>) => {
     const newProvider = parseInt(e.target.value, 10);
-    if (updateBackendConfig) {
-      updateBackendConfig('ttsType', newProvider);
-    }
+    if (Number.isNaN(newProvider)) return;
+    updateTtsProvider(newProvider);
     await loadVoices();
     triggerAutosave();
   };
@@ -332,9 +358,19 @@ export const Stage3VoiceDubbing: React.FC = () => {
                   <Loader2 className="w-4 h-4 animate-spin text-[#8D4B00]" />
                   <span>Synthesizing Voice Dubbing in Background…</span>
                 </div>
-                <span className="text-xs font-mono font-bold text-[#8D4B00]">
-                  {jobProgress != null ? `${Math.round(jobProgress)}%` : 'Processing…'}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-mono font-bold text-[#8D4B00]">
+                    {jobProgress != null ? `${Math.round(jobProgress)}%` : 'Processing…'}
+                  </span>
+                  <button
+                    type="button"
+                    data-testid="cancel-dubbing-btn"
+                    onClick={() => cancelDubbing()}
+                    className="px-2 py-0.5 rounded bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-bold cursor-pointer transition-colors"
+                  >
+                    Cancel
+                  </button>
+                </div>
               </div>
               <p className="text-[11px] text-amber-800">
                 {jobMessage || 'Generating voice audio for dialogue segments…'}
@@ -351,8 +387,18 @@ export const Stage3VoiceDubbing: React.FC = () => {
             </div>
           )}
           {(previewError || auditionError || dubbingError) && (
-            <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
-              {previewError || auditionError || dubbingError}
+            <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800 flex items-center justify-between gap-2">
+              <span>{previewError || auditionError || dubbingError}</span>
+              {dubbingStatus === 'failed' && failedSegmentIds.length > 0 && (
+                <button
+                  type="button"
+                  data-testid="retry-failed-dubbing-btn"
+                  onClick={() => void runFullDubbing()}
+                  className="px-2.5 py-1 rounded bg-red-700 hover:bg-red-800 text-white text-[10px] font-bold shrink-0 cursor-pointer"
+                >
+                  Retry Failed ({failedSegmentIds.length})
+                </button>
+              )}
             </div>
           )}
           {/* Upper Voice Casting Console */}
@@ -369,7 +415,7 @@ export const Stage3VoiceDubbing: React.FC = () => {
                   onChange={handleProviderChange}
                   className="text-xs bg-white border border-stone-200 rounded px-2 py-1 font-semibold text-stone-800 cursor-pointer focus:outline-none focus:border-[#8D4B00]"
                 >
-                  {TTS_PROVIDERS.map((p) => (
+                  {ttsProviders.map((p) => (
                     <option key={p.id} value={p.id}>
                       {p.name}
                     </option>
@@ -382,7 +428,7 @@ export const Stage3VoiceDubbing: React.FC = () => {
             {/* Speaker Cards */}
             <div className="space-y-2">
               {speakers.map((spk) => {
-                const currentVoice = (speakerVoiceMap && speakerVoiceMap[spk.id]) || (voices[0]?.id ?? 'default');
+                const currentVoice = (speakerVoiceMap && speakerVoiceMap[spk.id]) || defaultVoiceId;
                 const badgeClass = getSpeakerBadgeClasses(spk.color);
                 return (
                   <div
@@ -592,7 +638,14 @@ export const Stage3VoiceDubbing: React.FC = () => {
                 (segmentVoiceOverrides && segmentVoiceOverrides[seg.id]) ||
                 seg.voiceOverride ||
                 (speakerVoiceMap && (speakerVoiceMap[segSpkId] || (seg.speakerId != null ? speakerVoiceMap[String(seg.speakerId)] : undefined))) ||
-                (voices[0]?.id ?? 'Default');
+                defaultVoiceId;
+
+              const matchedCustomForSeg = customVoices.find(
+                (cv) => cv.id === activeVoice || cv.name === activeVoice || `Custom: ${cv.name}` === activeVoice
+              );
+              const matchedPresetForSeg = voices.find((v) => v.id === activeVoice || v.name === activeVoice);
+              const segProvider = matchedCustomForSeg?.provider ?? matchedPresetForSeg?.provider ?? currentProvider;
+              const segDubbingError = dubbingErrors[seg.id];
 
               const isLoadingPreview = Boolean(loadingPreviewMap[seg.id]);
               const isPlayingThis = isKeyPlaying(`segment-${seg.id}`);
@@ -705,33 +758,35 @@ export const Stage3VoiceDubbing: React.FC = () => {
                         <label className="text-[10px] font-semibold text-stone-700 block">
                           Target Dubbing Text
                         </label>
-                        {/* Emotion tag quick insertion chips for VieNeu */}
-                        <div className="flex items-center gap-1">
-                          <button
-                            type="button"
-                            onClick={() => updateSegmentText(seg.id, `${(seg.targetText || '').trim()} [cười] `, true)}
-                            className="px-1.5 py-0.2 rounded text-[9px] font-medium bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200 cursor-pointer"
-                            title="Insert chuckle emotion tag"
-                          >
-                            + [cười]
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => updateSegmentText(seg.id, `${(seg.targetText || '').trim()} [thở dài] `, true)}
-                            className="px-1.5 py-0.2 rounded text-[9px] font-medium bg-sky-50 text-sky-700 hover:bg-sky-100 border border-sky-200 cursor-pointer"
-                            title="Insert sigh emotion tag"
-                          >
-                            + [thở dài]
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => updateSegmentText(seg.id, `${(seg.targetText || '').trim()} [hắng giọng] `, true)}
-                            className="px-1.5 py-0.2 rounded text-[9px] font-medium bg-purple-50 text-purple-700 hover:bg-purple-100 border border-purple-200 cursor-pointer"
-                            title="Insert throat clear emotion tag"
-                          >
-                            + [hắng giọng]
-                          </button>
-                        </div>
+                        {/* Emotion tag quick insertion chips scoped to VieNeu + Vietnamese target */}
+                        {segProvider === 2 && isVietnameseTarget && (
+                          <div className="flex items-center gap-1" data-testid={`vieneu-emotion-chips-${seg.id}`}>
+                            <button
+                              type="button"
+                              onClick={() => updateSegmentText(seg.id, `${(seg.targetText || '').trim()} [cười] `, true)}
+                              className="px-1.5 py-0.2 rounded text-[9px] font-medium bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200 cursor-pointer"
+                              title="Insert chuckle emotion tag"
+                            >
+                              + [cười]
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => updateSegmentText(seg.id, `${(seg.targetText || '').trim()} [thở dài] `, true)}
+                              className="px-1.5 py-0.2 rounded text-[9px] font-medium bg-sky-50 text-sky-700 hover:bg-sky-100 border border-sky-200 cursor-pointer"
+                              title="Insert sigh emotion tag"
+                            >
+                              + [thở dài]
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => updateSegmentText(seg.id, `${(seg.targetText || '').trim()} [hắng giọng] `, true)}
+                              className="px-1.5 py-0.2 rounded text-[9px] font-medium bg-purple-50 text-purple-700 hover:bg-purple-100 border border-purple-200 cursor-pointer"
+                              title="Insert throat clear emotion tag"
+                            >
+                              + [hắng giọng]
+                            </button>
+                          </div>
+                        )}
                       </div>
                       <textarea
                         data-segment-input={`stage3-${seg.id}`}
@@ -794,9 +849,18 @@ export const Stage3VoiceDubbing: React.FC = () => {
                     </div>
 
                     <div className="text-[10px] text-stone-400 font-mono truncate">
-                      Voice: <span className="font-semibold text-stone-600">{activeVoice}</span>
+                      Voice: <span className="font-semibold text-stone-600">{activeVoice || 'Unassigned'}</span>
                     </div>
                   </div>
+                  {segDubbingError && (
+                    <div
+                      role="alert"
+                      data-testid={`segment-dubbing-error-${seg.id}`}
+                      className="rounded-md bg-rose-50 border border-rose-200 px-2.5 py-1 text-[11px] text-rose-800"
+                    >
+                      Synthesis error: {segDubbingError}
+                    </div>
+                  )}
                 </div>
               );
             }))}

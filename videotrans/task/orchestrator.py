@@ -136,6 +136,14 @@ class TaskRequest:
 EventSink = Callable[[TaskEvent], None]
 
 
+def _join_novoice_thread(task: Any, timeout: float = 5.0) -> None:
+    if task is None:
+        return
+    novoice_thread = getattr(task, "_novoice_thread", None)
+    if isinstance(novoice_thread, threading.Thread) and novoice_thread.is_alive():
+        novoice_thread.join(timeout=timeout)
+
+
 def run(
     request: TaskRequest,
     event_sink: EventSink | None = None,
@@ -150,6 +158,7 @@ def run(
     job_id = ""
     output_dir = Path(".")
     terminal_emitted = False
+    task: Any = None
 
     def send(kind: EventKind, message: str = "", *, progress=None, details=None) -> None:
         nonlocal terminal_emitted
@@ -169,7 +178,8 @@ def run(
             send(EventKind.CANCELLED, "Task cancelled before execution")
             return TaskResult(job_id, TaskStatus.CANCELLED, output_dir)
 
-        if values.pop("clear_cache", False) and cache_dir.exists():
+        was_clear_cache = bool(values.pop("clear_cache", False))
+        if was_clear_cache and cache_dir.exists():
             shutil.rmtree(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -191,7 +201,30 @@ def run(
                     except (ValueError, TypeError):
                         pass
                 send(EventKind.LOG, str(raw.get("text", "")), details={"source_type": raw_type, "duration": asr_duration_val})
-            elif raw_type in {"logs", "subtitle", "replace_subtitle"}:
+            elif raw_type == "ocr_progress":
+                raw_pct = raw.get("progress") if raw.get("progress") is not None else raw.get("percent")
+                pct_val: float | None = None
+                if raw_pct is not None:
+                    try:
+                        pct_val = max(0.0, min(100.0, float(raw_pct)))
+                    except (TypeError, ValueError):
+                        pct_val = None
+                details = {
+                    "source_type": "ocr_progress",
+                    "timestamp_ms": raw.get("timestamp_ms"),
+                    "duration_ms": raw.get("duration_ms"),
+                    "segments": raw.get("segments"),
+                    "ocr_calls": raw.get("ocr_calls"),
+                    "skipped_frames": raw.get("skipped_frames"),
+                    "device": raw.get("device"),
+                }
+                send(
+                    EventKind.PROGRESS,
+                    str(raw.get("text", "")),
+                    progress=pct_val,
+                    details={k: v for k, v in details.items() if v is not None},
+                )
+            elif raw_type in {"logs", "subtitle", "replace_subtitle", "trans_progress"}:
                 send(EventKind.LOG, str(raw.get("text", "")), details={"source_type": raw_type})
 
         task = TransCreate(
@@ -199,6 +232,7 @@ def run(
             event_sink=relay,
             cancellation_token=token,
         )
+        reused_merged_dub = False
         if task.cfg.subtitles:
             # Stage 4 is authoritative for edited text/timing. Reuse the prepared
             # media/cache and enter the existing dubbing/assembly stages directly.
@@ -211,6 +245,12 @@ def run(
             task.target_srt_list = get_subtitle_from_srt(task.cfg.target_sub, is_file=True) or []
             task.should_recogn = False
             task.should_trans = False
+            if not was_clear_cache and _stage_merged_dubbing_for_render(task):
+                reused_merged_dub = True
+                task.should_dubbing = True
+                task.should_recogn2 = False
+                if not getattr(task, "is_audio_trans", False) and getattr(task.cfg, "app_mode", "") != "tiqu":
+                    task.should_hebing = True
         send(EventKind.RUNNING)
 
         if stage_limit == "asr":
@@ -219,19 +259,29 @@ def run(
         else:
             stages = [("prepare", True), ("recogn", task.should_recogn),
                       ("diariz", task.should_recogn), ("trans", task.should_trans),
-                      ("dubbing", task.should_dubbing), ("align", task.should_dubbing),
+                      ("dubbing", task.should_dubbing and not reused_merged_dub),
+                      ("align", task.should_dubbing and not reused_merged_dub),
                       ("recogn2pass", task.should_recogn2),
                       ("assembling", task.should_hebing), ("task_done", True)]
 
+        thumbnail_embedded = False
         for stage_name, enabled in stages:
             if not enabled:
                 continue
             stage = stage_name
             if token.is_cancelled():
+                _join_novoice_thread(task)
                 send(EventKind.CANCELLED, "Task cancelled")
                 return TaskResult(job_id, TaskStatus.CANCELLED, output_dir)
 
-            if stage_name == "recogn" and task.should_recogn and getattr(task.cfg, "project_id", None) and not task.cfg.force_recogn:
+            is_video_ocr = getattr(task.cfg, "subtitle_source", "audio_asr") == "video_ocr"
+            if (
+                stage_name == "recogn"
+                and task.should_recogn
+                and getattr(task.cfg, "project_id", None)
+                and not task.cfg.force_recogn
+                and not is_video_ocr
+            ):
                 from videotrans.core.content_hash import compute_content_hash
                 from videotrans.core.project_store import find_project_by_audio_hash
                 audio_path = getattr(task.cfg, "shibie_audio", None) or getattr(task.cfg, "name", None)
@@ -252,25 +302,38 @@ def run(
                             ]
                             task.should_recogn = False
 
+            if stage_name == "task_done" and not thumbnail_embedded:
+                _embed_thumbnail(task.cfg)
+                thumbnail_embedded = True
+
             send(EventKind.STAGE_STARTED)
             getattr(task, stage_name)()
             if token.is_cancelled():
+                _join_novoice_thread(task)
                 send(EventKind.CANCELLED, "Task cancelled")
                 return TaskResult(job_id, TaskStatus.CANCELLED, output_dir)
+            if stage_name == "assembling":
+                _embed_thumbnail(task.cfg)
+                thumbnail_embedded = True
             send(EventKind.STAGE_COMPLETED)
             _persist_stage_artifacts(task, stage_name)
             if stage_name == stop_after_stage:
                 break
 
-        _embed_thumbnail(task.cfg)
+        if token.is_cancelled():
+            _join_novoice_thread(task)
+            send(EventKind.CANCELLED, "Task cancelled")
+            return TaskResult(job_id, TaskStatus.CANCELLED, output_dir)
+
         outputs = _collect_outputs(task.cfg)
         segments = extract_transcript_segments(task)
         transcript_options = extract_transcript_options(task)
-        if stage_limit == "asr" and segments and getattr(task.cfg, "project_id", None):
+        if stage_limit == "asr" and segments and getattr(task.cfg, "project_id", None) and not token.is_cancelled():
             import json
-            from videotrans.core.project_store import init_project_dirs
-            baseline = init_project_dirs(task.cfg.project_id)["transcripts"] / "asr_baseline.json"
-            baseline.write_text(json.dumps({"segments": segments, "transcriptOptions": transcript_options}, ensure_ascii=False), encoding="utf-8")
+            from videotrans.core.project_store import get_project, init_project_dirs
+            if get_project(task.cfg.project_id) is not None:
+                baseline = init_project_dirs(task.cfg.project_id)["transcripts"] / "asr_baseline.json"
+                baseline.write_text(json.dumps({"segments": segments, "transcriptOptions": transcript_options}, ensure_ascii=False), encoding="utf-8")
         if asr_duration_val is None:
             asr_duration_val = getattr(task, "asr_duration", None)
         detected_lang = getattr(task, "detect_language", None) or getattr(task.cfg, "source_code", None)
@@ -296,6 +359,13 @@ def run(
             transcript_options=transcript_options,
         )
     except Exception as exc:
+        if token.is_cancelled():
+            _join_novoice_thread(task)
+            try:
+                send(EventKind.CANCELLED, "Task cancelled")
+            except Exception:
+                logger.exception("Failed to send terminal cancellation event for task %s", job_id, exc_info=True)
+            return TaskResult(job_id, TaskStatus.CANCELLED, output_dir)
         cause = "".join(traceback.format_exception(exc))
         logger.exception("Task %s failed during %s", job_id, stage, exc_info=True)
         failure = TaskFailure(
@@ -334,21 +404,66 @@ def _collect_outputs(cfg: TaskCfgVTT) -> tuple[Path, ...]:
     return tuple(dict.fromkeys(found))
 
 
+def _stage_merged_dubbing_for_render(task: Any) -> bool:
+    """Copy (and volume-scale if requested) Stage 3's voiceover_merged.wav into task.cfg.target_wav."""
+    pid = getattr(getattr(task, "cfg", None), "project_id", None)
+    if not pid:
+        return False
+    try:
+        from videotrans.core.project_store import get_project_dir
+        merged_wav = get_project_dir(str(pid)) / "dubbing" / "voiceover_merged.wav"
+        if not merged_wav.is_file() or merged_wav.stat().st_size <= 44:
+            return False
+        raw_target_wav = getattr(task.cfg, "target_wav", None)
+        if not raw_target_wav:
+            return False
+        dst_wav = Path(raw_target_wav)
+        dst_wav.parent.mkdir(parents=True, exist_ok=True)
+        vol_str = str(getattr(task.cfg, "volume", "+0%") or "+0%").strip()
+        gain = 1.0
+        if vol_str.endswith("%"):
+            try:
+                gain = max(0.0, min(1.5, 1.0 + float(vol_str[:-1]) / 100.0))
+            except (TypeError, ValueError):
+                gain = 1.0
+        if abs(gain - 1.0) > 1e-3:
+            import numpy as np
+            import soundfile as sf
+            data, sr = sf.read(str(merged_wav), dtype="float32")
+            scaled = np.clip(data * np.float32(gain), -1.0, 1.0)
+            sf.write(str(dst_wav), scaled, sr, subtype="PCM_16", format="WAV")
+        else:
+            shutil.copy2(merged_wav, dst_wav)
+        return dst_wav.is_file()
+    except Exception as exc:
+        logger.warning("Failed to stage voiceover_merged.wav for render: %s", exc)
+        return False
+
+
 def _embed_thumbnail(cfg: TaskCfgVTT) -> None:
     """Attach the selected cover image without re-encoding the rendered streams."""
-    thumbnail = Path(cfg.thumbnail).resolve() if cfg.thumbnail else None
-    video = Path(cfg.targetdir_mp4).resolve() if cfg.targetdir_mp4 else None
+    if getattr(cfg, "only_out_dubbed_audio", False):
+        return
+    raw_thumbnail = getattr(cfg, "thumbnail", None)
+    raw_video = getattr(cfg, "targetdir_mp4", None)
+    thumbnail = Path(raw_thumbnail).resolve() if raw_thumbnail else None
+    video = Path(raw_video).resolve() if raw_video else None
     if not thumbnail or not thumbnail.is_file() or not video or not video.is_file():
         return
+    if video.suffix.lower() not in {".mp4", ".m4v"}:
+        return
     from videotrans.util.help_ffmpeg import runffmpeg
-    staged = Path(cfg.cache_folder) / f"thumbnail-{video.name}"
-    runffmpeg([
-        '-y', '-i', video.as_posix(), '-i', thumbnail.as_posix(),
-        '-map', '0', '-map', '1', '-c', 'copy', '-c:v:1', 'mjpeg',
-        '-disposition:v:1', 'attached_pic', staged.as_posix(),
-    ])
-    if staged.is_file():
-        staged.replace(video)
+    staged = video.parent / f".thumbnail-{video.name}"
+    try:
+        runffmpeg([
+            '-y', '-i', video.as_posix(), '-i', thumbnail.as_posix(),
+            '-map', '0', '-map', '1', '-c', 'copy', '-c:v:1', 'mjpeg',
+            '-disposition:v:1', 'attached_pic', staged.as_posix(),
+        ])
+        if staged.is_file():
+            staged.replace(video)
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def _persist_stage_artifacts(task: Any, stage_name: str) -> None:
@@ -356,29 +471,78 @@ def _persist_stage_artifacts(task: Any, stage_name: str) -> None:
     pid = getattr(task.cfg, "project_id", None)
     if not pid:
         return
+    token = getattr(task, "cancellation_token", None)
+    def _is_cancelled() -> bool:
+        return bool(token is not None and getattr(token, "is_cancelled", lambda: False)())
+    if _is_cancelled():
+        return
     try:
         from videotrans.core.project_store import init_project_dirs, update_project_state, get_project, update_project
         import shutil
-        import json
-        dirs = init_project_dirs(pid)
 
         if stage_name == "prepare":
+            p = get_project(pid)
+            if not p or _is_cancelled():
+                return
+            dirs = init_project_dirs(pid)
             for attr in ("shibie_audio", "vocal_file", "novocal_file", "source_wav"):
                 src = getattr(task.cfg, attr, None)
                 if src and Path(src).is_file():
                     dst = dirs["media"] / Path(src).name
                     if not dst.exists() or dst.stat().st_size != Path(src).stat().st_size:
                         shutil.copy2(src, dst)
-            p = get_project(pid)
-            if p and not p.get("audio_hash"):
+            if not p.get("audio_hash") and getattr(task.cfg, "subtitle_source", "audio_asr") != "video_ocr":
                 from videotrans.core.content_hash import compute_content_hash
                 ref_audio = getattr(task.cfg, "shibie_audio", None) or getattr(task.cfg, "name", None)
                 if ref_audio and Path(ref_audio).is_file():
                     h = compute_content_hash(ref_audio)
-                    if h:
+                    if h and not _is_cancelled():
                         update_project(pid, audio_hash=h)
 
         elif stage_name in ("recogn", "diariz"):
+            segments = extract_transcript_segments(task)
+            transcript_options = extract_transcript_options(task)
+            if segments:
+                delta_state: dict[str, Any] = {"segments": list(segments)}
+                default_if_missing: dict[str, Any] | None = None
+                if stage_name == "diariz":
+                    delta_state["forceAsr"] = False
+                if transcript_options:
+                    delta_state["transcript_options"] = transcript_options
+                    default_if_missing = {"selected_segment_option": "utterances"}
+                src_code = getattr(task, "detect_language", None) or getattr(task.cfg, "source_code", None)
+                lang_delta: dict[str, Any] = {}
+                if src_code:
+                    lang_delta["source"] = {
+                        "code": src_code,
+                        "name": src_code,
+                        "flag": "",
+                        "autoDetected": bool(getattr(task, "detect_language", None)),
+                    }
+                if getattr(task.cfg, "target_code", None):
+                    lang_delta["target"] = {
+                        "code": getattr(task.cfg, "target_code"),
+                        "name": getattr(task.cfg, "target_code"),
+                    }
+                if lang_delta:
+                    delta_state["languages"] = lang_delta
+                if _is_cancelled():
+                    return
+                updated = update_project_state(
+                    pid,
+                    delta_state,
+                    stage=2,
+                    status="completed" if stage_name == "diariz" else "processing",
+                    abort_check=_is_cancelled,
+                    default_if_missing=default_if_missing,
+                )
+                if updated is None or _is_cancelled():
+                    return
+            else:
+                if _is_cancelled() or get_project(pid) is None:
+                    return
+
+            dirs = init_project_dirs(pid)
             if getattr(task.cfg, "source_sub", None) and Path(task.cfg.source_sub).is_file():
                 shutil.copy2(task.cfg.source_sub, dirs["transcripts"] / "source.srt")
             speaker_file = Path(task.cfg.cache_folder) / "speaker.json"
@@ -387,49 +551,32 @@ def _persist_stage_artifacts(task: Any, stage_name: str) -> None:
             opts_file = Path(task.cfg.cache_folder) / "transcript_options.json"
             if opts_file.is_file():
                 shutil.copy2(opts_file, dirs["transcripts"] / "transcript_options.json")
-            segments = extract_transcript_segments(task)
-            transcript_options = extract_transcript_options(task)
-            if segments:
-                (dirs["transcripts"] / "segments.json").write_text(json.dumps(list(segments), ensure_ascii=False, indent=2), encoding="utf-8")
-                p = get_project(pid)
-                cur_state = dict(p.get("state") or {}) if p else {}
-                cur_state["segments"] = list(segments)
-                if stage_name == "diariz":
-                    cur_state["forceAsr"] = False
-                if transcript_options:
-                    cur_state["transcript_options"] = transcript_options
-                    cur_state["selected_segment_option"] = cur_state.get("selected_segment_option", "utterances")
-                src_code = getattr(task, "detect_language", None) or getattr(task.cfg, "source_code", None)
-                if src_code:
-                    if "languages" not in cur_state:
-                        cur_state["languages"] = {}
-                    cur_state["languages"]["source"] = {
-                        "code": src_code,
-                        "name": src_code,
-                        "flag": "",
-                        "autoDetected": bool(getattr(task, "detect_language", None)),
-                    }
-                if getattr(task.cfg, "target_code", None):
-                    if "languages" not in cur_state:
-                        cur_state["languages"] = {}
-                    cur_state["languages"]["target"] = {
-                        "code": getattr(task.cfg, "target_code"),
-                        "name": getattr(task.cfg, "target_code"),
-                    }
-                update_project_state(pid, cur_state, stage=2, status="completed" if stage_name == "diariz" else "processing")
 
         elif stage_name == "trans":
-            if getattr(task.cfg, "target_sub", None) and Path(task.cfg.target_sub).is_file():
-                shutil.copy2(task.cfg.target_sub, dirs["transcripts"] / "target.srt")
             segments = extract_transcript_segments(task)
             if segments:
-                (dirs["transcripts"] / "segments.json").write_text(json.dumps(list(segments), ensure_ascii=False, indent=2), encoding="utf-8")
-                p = get_project(pid)
-                cur_state = dict(p.get("state") or {}) if p else {}
-                cur_state["segments"] = list(segments)
-                update_project_state(pid, cur_state, stage=3, status="completed")
+                if _is_cancelled():
+                    return
+                updated = update_project_state(
+                    pid,
+                    {"segments": list(segments)},
+                    stage=3,
+                    status="completed",
+                    abort_check=_is_cancelled,
+                )
+                if updated is None or _is_cancelled():
+                    return
+            else:
+                if _is_cancelled() or get_project(pid) is None:
+                    return
+            if getattr(task.cfg, "target_sub", None) and Path(task.cfg.target_sub).is_file():
+                dirs = init_project_dirs(pid)
+                shutil.copy2(task.cfg.target_sub, dirs["transcripts"] / "target.srt")
 
         elif stage_name in ("dubbing", "align"):
+            if _is_cancelled() or get_project(pid) is None:
+                return
+            dirs = init_project_dirs(pid)
             queue_file = Path(task.cfg.cache_folder) / "queue_tts.json"
             if queue_file.is_file():
                 shutil.copy2(queue_file, dirs["dubbing"] / "queue_tts.json")
@@ -437,21 +584,23 @@ def _persist_stage_artifacts(task: Any, stage_name: str) -> None:
                 shutil.copy2(task.cfg.target_wav, dirs["dubbing"] / Path(task.cfg.target_wav).name)
 
         elif stage_name in ("assembling", "task_done"):
-            p = get_project(pid)
-            cur_state = dict(p.get("state") or {}) if p else {}
-            parent_id = p.get("parent_id") if p else None
+            if _is_cancelled():
+                return
+            updated = update_project_state(pid, {}, stage=4, status="completed", abort_check=_is_cancelled)
+            if updated is None or _is_cancelled():
+                return
+            parent_id = updated.get("parent_id")
             if parent_id:
                 from videotrans.core.project_store import get_parent_project_dir
                 import re
                 parent = get_project(parent_id)
                 parent_name = (parent.get("name") if parent else None) or parent_id
                 parent_dir = get_parent_project_dir(parent_name)
-                safe_stem = re.sub(r"[^\w.-]+", "-", Path(p.get("name") or pid).stem, flags=re.UNICODE).strip("-")
+                safe_stem = re.sub(r"[^\w.-]+", "-", Path(updated.get("name") or pid).stem, flags=re.UNICODE).strip("-")
                 if getattr(task.cfg, "targetdir_mp4", None) and Path(task.cfg.targetdir_mp4).is_file():
                     shutil.copy2(task.cfg.targetdir_mp4, parent_dir / f"{safe_stem}.mp4")
                 if getattr(task.cfg, "target_sub", None) and Path(task.cfg.target_sub).is_file():
                     shutil.copy2(task.cfg.target_sub, parent_dir / f"{safe_stem}.srt")
-            update_project_state(pid, cur_state, stage=4, status="completed")
 
     except Exception as exc:
         logger.warning("Failed to persist stage %s artifacts for project %s: %s", stage_name, pid, exc)
@@ -474,7 +623,13 @@ def run_staged_translation(
     """Execute LLM / machine translation of transcript segments with 1:1 matching."""
     from videotrans import translator
     from videotrans.util.help_srt import ms_to_time_string
-    from videotrans.util.segment_ops import calculate_cps
+    from videotrans.util.segment_ops import calculate_cps, parse_timestamp
+
+    def _seg_seconds(seg: Mapping[str, object], sec_key: str, time_key: str) -> float:
+        raw_sec = seg.get(sec_key)
+        if raw_sec is not None:
+            return parse_timestamp(raw_sec)
+        return parse_timestamp(seg.get(time_key, 0.0))
 
     emit = event_sink or (lambda _event: None)
     token = cancellation_token or CancellationToken()
@@ -492,10 +647,28 @@ def run_staged_translation(
         emit(TaskEvent(job_id, kind, stage, message, progress, details or {}))
 
     def relay(raw: dict) -> None:
+        raw_type = raw.get("type", "logs")
+        if raw_type == "trans_progress":
+            try:
+                pct = max(0.0, min(100.0, float(raw.get("progress", 0.0))))
+            except (TypeError, ValueError):
+                pct = 0.0
+            scaled = round(35.0 + (pct / 100.0) * 60.0, 2)
+            send(
+                EventKind.PROGRESS,
+                str(raw.get("text", "")),
+                progress=scaled,
+                details={
+                    "source_type": "trans_progress",
+                    "completed": raw.get("completed"),
+                    "total": raw.get("total"),
+                },
+            )
+            return
         send(
             EventKind.LOG,
             str(raw.get("text", "")),
-            details={"source_type": raw.get("type", "logs")},
+            details={"source_type": raw_type},
         )
 
     try:
@@ -519,6 +692,8 @@ def run_staged_translation(
         translate_type = int(values.get("translate_type", 0) or 0)
         aisendsrt = values.get("aisendsrt")
 
+        pid = values.get("project_id")
+
         # Bypass when source and target languages are identical
         if source_code.lower() == target_code.lower():
             updated_segments = []
@@ -527,12 +702,36 @@ def run_staged_translation(
                 if not seg_copy.get("targetText"):
                     seg_copy["targetText"] = seg_copy.get("sourceText") or seg_copy.get("text") or ""
                 seg_copy["text"] = seg_copy["targetText"]
-                dur = max(0.1, float(seg_copy.get("endSec", 0.0) or 0.0) - float(seg_copy.get("startSec", 0.0) or 0.0))
+                dur = max(0.1, _seg_seconds(seg_copy, "endSec", "endTime") - _seg_seconds(seg_copy, "startSec", "startTime"))
                 cps, cps_status = calculate_cps(seg_copy["targetText"], dur)
                 seg_copy["targetCps"] = cps
                 seg_copy["cps"] = cps
                 seg_copy["cpsStatus"] = cps_status
                 updated_segments.append(seg_copy)
+
+            if token.is_cancelled():
+                send(EventKind.CANCELLED, "Task cancelled")
+                return TaskResult(job_id, TaskStatus.CANCELLED, output_dir)
+
+            if pid:
+                try:
+                    from videotrans.core.project_store import update_project_state
+                    updated_state = update_project_state(
+                        str(pid),
+                        {"segments": updated_segments},
+                        stage=3,
+                        status="completed",
+                        abort_check=token.is_cancelled,
+                    )
+                    if updated_state is None and token.is_cancelled():
+                        send(EventKind.CANCELLED, "Task cancelled")
+                        return TaskResult(job_id, TaskStatus.CANCELLED, output_dir)
+                except Exception as e:
+                    logger.warning("Failed to persist translation stage artifacts for project %s: %s", pid, e)
+
+            if token.is_cancelled():
+                send(EventKind.CANCELLED, "Task cancelled")
+                return TaskResult(job_id, TaskStatus.CANCELLED, output_dir)
 
             send(EventKind.STAGE_COMPLETED, "Translation bypassed (same language)")
             send(EventKind.PROGRESS, "Complete", progress=100.0)
@@ -545,18 +744,23 @@ def run_staged_translation(
             send(EventKind.SUCCEEDED, "Translation complete", details={"segments": []})
             return TaskResult(job_id, TaskStatus.SUCCEEDED, output_dir, segments=())
 
-        # Construct SrtItem-compatible structures for translator.run
+        # Construct SrtItem-compatible structures for non-empty segments only so
+        # blank cues never shift LLM [id] numbering or positional alignment.
         text_list = []
-        for idx, seg in enumerate(raw_segments, 1):
+        non_empty_positions: list[int] = []
+        for idx, seg in enumerate(raw_segments):
             src_text = str(seg.get("sourceText") if seg.get("sourceText") is not None else (seg.get("text") or "")).strip()
-            start_sec = float(seg.get("startSec", 0.0) or 0.0)
-            end_sec = float(seg.get("endSec", 0.0) or 0.0)
+            if not src_text:
+                continue
+            start_sec = _seg_seconds(seg, "startSec", "startTime")
+            end_sec = _seg_seconds(seg, "endSec", "endTime")
             start_ms = int(round(start_sec * 1000))
             end_ms = int(round(end_sec * 1000))
             start_str = ms_to_time_string(ms=start_ms)
             end_str = ms_to_time_string(ms=end_ms)
+            non_empty_positions.append(idx)
             text_list.append({
-                "line": idx,
+                "line": len(text_list) + 1,
                 "time": f"{start_str} --> {end_str}",
                 "text": src_text,
                 "start_time": start_ms,
@@ -571,42 +775,59 @@ def run_staged_translation(
 
         send(EventKind.PROGRESS, "Translating segments with selected provider...", progress=35.0)
 
-        translated_items = translator.run(
-            translate_type=translate_type,
-            text_list=text_list,
-            source_code=source_code,
-            target_code=target_code,
-            aisendsrt=aisendsrt,
-            uuid=job_id,
-            event_sink=relay,
-            cancellation_token=token,
+        translated_items = (
+            translator.run(
+                translate_type=translate_type,
+                text_list=text_list,
+                source_code=source_code,
+                target_code=target_code,
+                aisendsrt=aisendsrt,
+                uuid=job_id,
+                event_sink=relay,
+                cancellation_token=token,
+            )
+            if text_list
+            else []
         )
 
         if token.is_cancelled():
             send(EventKind.CANCELLED, "Task cancelled")
             return TaskResult(job_id, TaskStatus.CANCELLED, output_dir)
 
-        # 1:1 segment matching preserving all segment metadata
+        translated_by_raw_idx: dict[int, str] = {}
+        if translated_items:
+            for list_idx, raw_idx in enumerate(non_empty_positions):
+                if list_idx >= len(translated_items):
+                    break
+                item = translated_items[list_idx]
+                if isinstance(item, dict):
+                    t_txt = str(item.get("text") or "").strip()
+                elif hasattr(item, "text"):
+                    t_txt = str(getattr(item, "text", "") or "").strip()
+                elif isinstance(item, str):
+                    t_txt = item.strip()
+                else:
+                    t_txt = ""
+                translated_by_raw_idx[raw_idx] = t_txt
+
+        # 1:1 segment matching preserving all segment metadata and blank cues
         updated_segments = []
         for idx, seg in enumerate(raw_segments):
             seg_copy = dict(seg)
-            translated_text = ""
-            if translated_items and idx < len(translated_items):
-                item = translated_items[idx]
-                if isinstance(item, dict):
-                    translated_text = str(item.get("text") or "").strip()
-                elif hasattr(item, "text"):
-                    translated_text = str(getattr(item, "text", "") or "").strip()
-                elif isinstance(item, str):
-                    translated_text = item.strip()
+            src_text = str(seg_copy.get("sourceText") if seg_copy.get("sourceText") is not None else (seg_copy.get("text") or "")).strip()
+            translated_text = translated_by_raw_idx.get(idx, "")
 
-            if translated_text:
+            if not src_text:
+                seg_copy["targetText"] = str(seg_copy.get("targetText") or "").strip()
+                seg_copy["text"] = seg_copy["targetText"]
+            elif translated_text:
                 seg_copy["targetText"] = translated_text
                 seg_copy["text"] = translated_text
             elif not seg_copy.get("targetText"):
-                seg_copy["targetText"] = seg_copy.get("sourceText") or seg_copy.get("text") or ""
+                seg_copy["targetText"] = src_text
+                seg_copy["text"] = src_text
 
-            dur = max(0.1, float(seg_copy.get("endSec", 0.0) or 0.0) - float(seg_copy.get("startSec", 0.0) or 0.0))
+            dur = max(0.1, _seg_seconds(seg_copy, "endSec", "endTime") - _seg_seconds(seg_copy, "startSec", "startTime"))
             target_cps, target_cps_status = calculate_cps(seg_copy["targetText"], dur)
             seg_copy["targetCps"] = target_cps
             seg_copy["cps"] = target_cps
@@ -616,26 +837,35 @@ def run_staged_translation(
         send(EventKind.PROGRESS, "Translation complete", progress=100.0)
         send(EventKind.STAGE_COMPLETED, "Translation stage finished")
 
-        pid = values.get("project_id")
-        if pid:
+        if pid and not token.is_cancelled():
             try:
-                from videotrans.core.project_store import init_project_dirs, update_project_state, get_project
-                import json
-                dirs = init_project_dirs(str(pid))
-                (dirs["transcripts"] / "segments.json").write_text(
-                    json.dumps(updated_segments, ensure_ascii=False, indent=2), encoding="utf-8"
+                from videotrans.core.project_store import update_project_state
+                updated_state = update_project_state(
+                    str(pid),
+                    {"segments": updated_segments},
+                    stage=3,
+                    status="completed",
+                    abort_check=token.is_cancelled,
                 )
-                p = get_project(str(pid))
-                cur_state = dict(p.get("state") or {}) if p else {}
-                cur_state["segments"] = updated_segments
-                update_project_state(str(pid), cur_state, stage=3, status="completed")
+                if updated_state is None and token.is_cancelled():
+                    send(EventKind.CANCELLED, "Task cancelled")
+                    return TaskResult(job_id, TaskStatus.CANCELLED, output_dir)
             except Exception as e:
                 logger.warning("Failed to persist translation stage artifacts for project %s: %s", pid, e)
+        if token.is_cancelled():
+            send(EventKind.CANCELLED, "Task cancelled")
+            return TaskResult(job_id, TaskStatus.CANCELLED, output_dir)
 
         send(EventKind.SUCCEEDED, "Translation succeeded", details={"segments": updated_segments})
         return TaskResult(job_id, TaskStatus.SUCCEEDED, output_dir, segments=tuple(updated_segments))
 
     except Exception as exc:
+        if token.is_cancelled():
+            try:
+                send(EventKind.CANCELLED, "Task cancelled")
+            except Exception:
+                logger.exception("Failed to send terminal cancellation event for task %s", job_id, exc_info=True)
+            return TaskResult(job_id, TaskStatus.CANCELLED, output_dir)
         cause = "".join(traceback.format_exception(exc))
         logger.exception("Translation task %s failed during %s", job_id, stage, exc_info=True)
         failure = TaskFailure(

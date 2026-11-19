@@ -123,7 +123,7 @@ def reset_project_stage(project_id: str, stage: int) -> dict:
     if stage <= 3:
         _remove_files(base / "dubbing")
 
-    updated = update_project_state(project_id, state, stage=stage, status="pending")
+    updated = update_project_state(project_id, state, stage=stage, status="pending", merge=False)
     if stage == 1:
         from videotrans.core.project_store import update_project
         updated = update_project(project_id, audio_hash="")

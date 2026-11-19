@@ -8,6 +8,11 @@ export const WorkflowStepper: React.FC = () => {
   const setStep = useDubDubStore((s) => s.setStep);
   const project = useDubDubStore((s) => s.project);
   const languages = useDubDubStore((s) => s.languages);
+  const backend = useDubDubStore((s) => s.backend);
+  const segments = useDubDubStore((s) => s.segments || []);
+  const dubbingStatus = useDubDubStore((s) => s.dubbingStatus);
+  const assembledDubUrl = useDubDubStore((s) => s.assembledDubUrl);
+  const editVideo = useDubDubStore((s) => s.editVideo);
 
   const steps = [
     { num: 1, label: 'Prepare' },
@@ -16,29 +21,52 @@ export const WorkflowStepper: React.FC = () => {
     { num: 4, label: 'Edit Video' },
   ];
 
+  const asrProvider = backend?.options?.asrProviders?.find(
+    (p: any) => p.recognType === Number(backend?.config?.recognType)
+  );
+  const asrLabel = asrProvider?.label || 'ASR Engine';
+  const translatedCount = segments.filter((seg) => Boolean(seg?.targetText?.trim())).length;
+  const voicedCount = segments.filter((seg) => Boolean(seg?.previewAudioUrl)).length;
+
   const stageTelemetry: Record<number, React.ReactNode> = {
     1: (
       <span className="inline-flex items-center gap-1 text-stone-600 bg-stone-100 px-2.5 py-0.5 rounded-md border border-stone-200 text-[10px] font-medium">
         <Sliders className="w-3 h-3 text-[#8D4B00]" />
-        <span>Stage 01: Pre-Flight Configuration</span>
+        <span>{asrLabel} • {project?.verified ? 'Media Ready' : 'Awaiting Media'}</span>
       </span>
     ),
     2: (
       <span className="inline-flex items-center gap-1 text-amber-800 bg-amber-50 px-2.5 py-0.5 rounded-md border border-amber-200 text-[10px] font-semibold">
         <FileText className="w-3 h-3" />
-        <span>OCR Slide Engine: Active</span>
+        <span>{segments.length} cues • {translatedCount}/{segments.length} translated</span>
       </span>
     ),
     3: (
-      <span className="inline-flex items-center gap-1 text-emerald-800 bg-emerald-50 px-2.5 py-0.5 rounded-md border border-emerald-200 text-[10px] font-semibold">
+      <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md border text-[10px] font-semibold ${
+        dubbingStatus === 'failed'
+          ? 'text-rose-800 bg-rose-50 border-rose-200'
+          : 'text-emerald-800 bg-emerald-50 border-emerald-200'
+      }`}>
         <AudioWaveform className="w-3 h-3" />
-        <span>Neural Voice Sync: 99.8%</span>
+        <span>
+          {dubbingStatus === 'running'
+            ? `Synthesizing (${voicedCount}/${segments.length})`
+            : dubbingStatus === 'failed'
+            ? `Dubbing Failed (${voicedCount}/${segments.length})`
+            : `Voice ${voicedCount}/${segments.length} cues`}
+        </span>
       </span>
     ),
     4: (
       <span className="inline-flex items-center gap-1 text-emerald-800 bg-emerald-50 px-2.5 py-0.5 rounded-md border border-emerald-200 text-[10px] font-semibold">
         <Layers className="w-3 h-3" />
-        <span>Multi-Track Timeline: Synced</span>
+        <span>
+          {editVideo?.exporting
+            ? 'Rendering Video…'
+            : assembledDubUrl
+            ? `Dub Track Ready${editVideo?.backgroundAudio ? ' + BGM' : ''}`
+            : 'Dub Track Pending'}
+        </span>
       </span>
     ),
   };

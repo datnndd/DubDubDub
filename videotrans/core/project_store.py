@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import shutil
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from videotrans.configure.config import ROOT_DIR
 from videotrans.core.db import db_conn
@@ -208,42 +209,127 @@ def update_project(project_id: str, **kwargs: Any) -> Optional[dict[str, Any]]:
     return get_project(project_id)
 
 
+def _segment_srt_timestamp(seg: dict[str, Any], sec_key: str, time_key: str) -> str:
+    from videotrans.util.help_srt import format_time, ms_to_time_string
+
+    if sec_key in seg:
+        raw_sec = seg[sec_key]
+        if raw_sec is None or isinstance(raw_sec, bool):
+            fallback = seg.get(time_key)
+            if isinstance(fallback, str) and fallback.strip():
+                try:
+                    return format_time(fallback)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid segment {time_key}: {fallback!r}") from exc
+            raise ValueError(f"Invalid segment {sec_key}: {raw_sec!r}")
+        try:
+            sec_val = float(raw_sec)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid segment {sec_key}: {raw_sec!r}") from exc
+        if math.isnan(sec_val) or math.isinf(sec_val):
+            raise ValueError(f"Invalid segment {sec_key}: {raw_sec!r}")
+        if sec_val <= 0.0:
+            return ms_to_time_string(ms=0)
+        try:
+            clamped_ms = max(0, int(round(sec_val * 1000.0)))
+            return ms_to_time_string(ms=clamped_ms)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid segment {sec_key}: {raw_sec!r}") from exc
+
+    raw_time = seg.get(time_key)
+    if raw_time is None:
+        return format_time("")
+    if not isinstance(raw_time, str):
+        raise ValueError(f"Invalid segment {time_key}: {raw_time!r}")
+    try:
+        return format_time(raw_time)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid segment {time_key}: {raw_time!r}") from exc
+
+
 def update_project_state(
     project_id: str,
     state_dict: dict[str, Any],
     stage: Optional[int] = None,
     status: Optional[str] = None,
+    *,
+    merge: bool = True,
+    abort_check: Optional[Callable[[], bool]] = None,
+    default_if_missing: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     """Update state snapshot and optionally advance the workflow stage."""
-    if isinstance(state_dict, dict):
-        dirs = init_project_dirs(project_id)
-        if "segments" in state_dict and isinstance(state_dict["segments"], list):
-            from videotrans.util.help_srt import format_time, ms_to_time_string
-            srt_lines = []
-            for idx, seg in enumerate(state_dict["segments"]):
-                start = (ms_to_time_string(ms=int(round(float(seg["startSec"]) * 1000)))
-                         if "startSec" in seg else format_time(str(seg.get("startTime") or "")))
-                end = (ms_to_time_string(ms=int(round(float(seg["endSec"]) * 1000)))
-                       if "endSec" in seg else format_time(str(seg.get("endTime") or "")))
-                text = seg.get("sourceText", seg.get("text", "")) or ""
-                srt_lines.append(
-                    f"{idx + 1}\n{start} --> {end}\n{text}\n"
-                )
-            (dirs["transcripts"] / "source.srt").write_text("\n".join(srt_lines), encoding="utf-8")
-            (dirs["transcripts"] / "segments.json").write_text(
-                json.dumps(state_dict["segments"], ensure_ascii=False, indent=2), encoding="utf-8",
-            )
-        if "transcript_options" in state_dict and state_dict["transcript_options"]:
-            (dirs["transcripts"] / "transcript_options.json").write_text(
-                json.dumps(state_dict["transcript_options"], ensure_ascii=False, indent=2), encoding="utf-8",
-            )
+    with db_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if abort_check is not None and abort_check():
+            return None
+        row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        if row is None:
+            return None
 
-    kwargs: dict[str, Any] = {"state": state_dict}
-    if stage is not None:
-        kwargs["stage"] = stage
-    if status is not None:
-        kwargs["status"] = status
-    return update_project(project_id, **kwargs)
+        existing = _row_to_dict(row)
+        merged_state: Any = state_dict
+        if merge and isinstance(state_dict, dict):
+            existing_state = existing.get("state")
+            if isinstance(existing_state, dict):
+                merged_state = {**existing_state, **state_dict}
+                if isinstance(existing_state.get("languages"), dict) and isinstance(state_dict.get("languages"), dict):
+                    merged_state["languages"] = {
+                        **existing_state["languages"],
+                        **state_dict["languages"],
+                    }
+            else:
+                merged_state = dict(state_dict)
+            if isinstance(default_if_missing, dict):
+                for k, v in default_if_missing.items():
+                    merged_state.setdefault(k, v)
+        elif isinstance(state_dict, dict):
+            merged_state = dict(state_dict)
+            if isinstance(default_if_missing, dict):
+                for k, v in default_if_missing.items():
+                    merged_state.setdefault(k, v)
+
+        if abort_check is not None and abort_check():
+            return None
+
+        has_segs = isinstance(state_dict, dict) and "segments" in state_dict and isinstance(state_dict["segments"], list)
+        has_opts = isinstance(state_dict, dict) and bool(state_dict.get("transcript_options"))
+        srt_lines: list[str] = []
+        if has_segs:
+            for idx, seg in enumerate(state_dict["segments"]):
+                if not isinstance(seg, dict):
+                    raise ValueError(f"Invalid segment at index {idx}: expected dict")
+                start = _segment_srt_timestamp(seg, "startSec", "startTime")
+                end = _segment_srt_timestamp(seg, "endSec", "endTime")
+                text = seg.get("sourceText", seg.get("text", "")) or ""
+                srt_lines.append(f"{idx + 1}\n{start} --> {end}\n{text}\n")
+
+        updates: dict[str, Any] = {
+            "state_json": json.dumps(merged_state or {}),
+            "updated_at": time.time(),
+        }
+        if stage is not None:
+            updates["stage"] = stage
+        if status is not None:
+            updates["status"] = status
+
+        set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+        values = list(updates.values()) + [project_id]
+        conn.execute(f"UPDATE projects SET {set_clause} WHERE id = ?", values)
+
+        if has_segs or has_opts:
+            dirs = init_project_dirs(project_id)
+            if has_segs:
+                (dirs["transcripts"] / "source.srt").write_text("\n".join(srt_lines), encoding="utf-8")
+                (dirs["transcripts"] / "segments.json").write_text(
+                    json.dumps(state_dict["segments"], ensure_ascii=False, indent=2), encoding="utf-8",
+                )
+            if has_opts:
+                (dirs["transcripts"] / "transcript_options.json").write_text(
+                    json.dumps(state_dict["transcript_options"], ensure_ascii=False, indent=2), encoding="utf-8",
+                )
+
+        updated_row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        return _row_to_dict(updated_row) if updated_row else None
 
 
 def delete_project(project_id: str, delete_files: bool = True) -> bool:

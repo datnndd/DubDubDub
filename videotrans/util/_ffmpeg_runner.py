@@ -90,6 +90,10 @@ def runffmpeg(arg, *, noextname=None, force_cpu=True, cmd_dir=None, job_id=None,
             except subprocess.TimeoutExpired:
                 continue
 
+        if app_cfg.exit_soft or (cancellation_token and cancellation_token.is_cancelled()):
+            from videotrans.configure.excepts import FFmpegError
+            raise FFmpegError("FFmpeg execution was cancelled")
+
         if proc.returncode != 0:
             raise subprocess.CalledProcessError(proc.returncode, cmd, output=stdout, stderr=stderr)
 
@@ -113,6 +117,10 @@ def runffmpeg(arg, *, noextname=None, force_cpu=True, cmd_dir=None, job_id=None,
         from videotrans.configure.excepts import FFmpegError
         raise FFmpegError(err) from e
     except Exception as e:
+        if app_cfg.exit_soft or (cancellation_token and cancellation_token.is_cancelled()):
+            if noextname:
+                app_cfg.queue_novice[noextname] = "cancelled"
+            raise
         if noextname:
             app_cfg.queue_novice[noextname] = f"error:{e}"
         logger.error(f"执行 ffmpeg 时发生未知错误,{cmd=}:\n{e}")

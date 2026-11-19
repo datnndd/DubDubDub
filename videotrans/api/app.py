@@ -130,6 +130,13 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown sequence
     try:
+        import videotrans.ocr as _ocr_pkg
+        fn = getattr(_ocr_pkg, "release_cached_providers", None)
+        if callable(fn):
+            fn()
+    except Exception:
+        pass
+    try:
         from videotrans.process.process_manager import GlobalProcessManager
         GlobalProcessManager.shutdown()
     except Exception:

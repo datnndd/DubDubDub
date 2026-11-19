@@ -8,6 +8,7 @@ from pathlib import Path
 # Import soundfile and audio processing
 import soundfile as sf
 import numpy as np  # Added numpy for channel processing
+import wave
 from pydub import AudioSegment
 
 # Try importing pyrubberband
@@ -173,9 +174,56 @@ def _change_speed_rubberband(input_path, target_duration):
         return False
     return True
 
+def get_audio_duration_ms(audio_path) -> int:
+    """Read audio duration in milliseconds from header without decoding full PCM into RAM."""
+    if not audio_path:
+        return 0
+    path_obj = Path(audio_path)
+    if not path_obj.is_file() or path_obj.stat().st_size == 0:
+        return 0
+
+    try:
+        info = sf.info(str(path_obj))
+        if info.samplerate > 0 and info.frames >= 0:
+            return int(round(info.frames * 1000.0 / info.samplerate))
+    except Exception:
+        pass
+
+    try:
+        with wave.open(str(path_obj), "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+            if rate > 0:
+                return int(round(frames * 1000.0 / rate))
+    except Exception:
+        pass
+
+    try:
+        return max(0, int(round(float(tools.get_audio_time(str(path_obj)) or 0) * 1000.0)))
+    except Exception:
+        return 0
+
+
+def _resample_audio_array(data: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """Resample 1D or 2D float32 audio array from orig_sr to target_sr deterministically."""
+    if orig_sr == target_sr or data.size == 0:
+        return np.asarray(data, dtype=np.float32)
+    try:
+        import soxr
+        resampled = soxr.resample(data, orig_sr, target_sr)
+        return np.asarray(resampled, dtype=np.float32)
+    except Exception:
+        from scipy.signal import resample_poly
+        g = math.gcd(target_sr, orig_sr)
+        axis = 0
+        resampled = resample_poly(data, target_sr // g, orig_sr // g, axis=axis)
+        return np.asarray(resampled, dtype=np.float32)
+
+
 def _precise_speed_up_audio(input_path=None, target_duration=None):
-    # Use pydub to get current duration (avoids duplicate reads)
-    current_duration_ms = len(AudioSegment.from_file(input_path, format='wav'))
+    current_duration_ms = get_audio_duration_ms(input_path)
+    if current_duration_ms <= 0 or not target_duration or target_duration <= 0:
+        return False
 
     # Construct atempo filter chain
     # atempo constraint: parameter must be in [0.5, 2.0]
@@ -187,11 +235,16 @@ def _precise_speed_up_audio(input_path=None, target_duration=None):
         atempo_list.append("atempo=2.0")
         speed_factor /= 2.0
 
+    while 0 < speed_factor < 0.5:
+        atempo_list.append("atempo=0.5")
+        speed_factor /= 0.5
+
     # Append remaining speed factor
     atempo_list.append(f"atempo={speed_factor}")
 
     # Join filters with comma to chain them, e.g. "atempo=2.0,atempo=1.5"
     filter_str = ",".join(atempo_list)
+    after_path = Path(f"{input_path}-after.wav")
 
     cmd = [
         '-y',
@@ -202,14 +255,18 @@ def _precise_speed_up_audio(input_path=None, target_duration=None):
         '-ar', "48000",
         '-ac', "2",
         '-c:a', 'pcm_s16le',
-        f'{input_path}-after.wav'
+        str(after_path),
     ]
     try:
         tools.runffmpeg(cmd)
-        shutil.copy2(f'{input_path}-after.wav', input_path)
+        if not after_path.is_file() or after_path.stat().st_size == 0:
+            return False
+        os.replace(after_path, input_path)
     except Exception as e:
         logger.exception(f'音频加速失败:{e}')
         return False
+    finally:
+        after_path.unlink(missing_ok=True)
     return True
 
 
@@ -346,6 +403,8 @@ class SpeedRate:
         for i,current in  enumerate(self.queue_tts):
             current['source_duration'] = current['end_time'] - current['start_time']
             current['dubb_time']=0
+            current.setdefault('start_time_source', current['start_time'])
+            current.setdefault('end_time_source', current['end_time'])
             if current['start_time']>=current['end_time']:
                 logger.error(f'第 {i} 行字幕时间轴<=0，不正确，跳过处理:{current=}\n')
                 continue
@@ -370,14 +429,10 @@ class SpeedRate:
             
             # Check dubbing file
             if not current.get('filename') or not Path(current['filename']).exists():
-                # Generate placeholder silence
-                dummy_wav = Path(self.cache_folder, f'silent_place_{i}.wav').as_posix()
-                AudioSegment.silent(duration=current['source_duration']).export(dummy_wav, format="wav")
-                current['filename'] = dummy_wav
                 current['dubb_time'] = current['source_duration']
-                logger.debug(f"[Prepare] 字幕[{current['line']}] 无配音，生成 {current['source_duration']}ms 静音占位")
+                logger.debug(f"[Prepare] 字幕[{current['line']}] 无配音，预留 {current['source_duration']}ms 静音占位")
             else:
-                current['dubb_time'] = len(AudioSegment.from_file(current['filename']))
+                current['dubb_time'] = get_audio_duration_ms(current['filename'])
 
     def _calculate_adjustments(self):
         """Calculation strategy."""
@@ -591,101 +646,159 @@ class SpeedRate:
         logger.debug(f"清理视频慢速中生成的视频片段，共删除了 {deleted_count} 个文件。")
 
     def _concat_audio_aligned(self):
-        audio_list = []
-        dubbing_total=self.queue_tts[0]['start_time']
-        if self.queue_tts[0]['start_time'] > 0:            
-            audio_list.append(self._create_silen_file("head_0", self.queue_tts[0]['start_time']))
-
+        timeline = []
+        dubbing_total = self.queue_tts[0]['start_time']
+        if self.queue_tts[0]['start_time'] > 0:
+            timeline.append(("silence", self.queue_tts[0]['start_time']))
 
         for i, it in enumerate(self.queue_tts):
-            if it['source_duration']<=0:
+            if it['source_duration'] <= 0:
                 continue
-            it['start_time']=dubbing_total
-            if not it['filename'] or not Path(it['filename']).exists():
-                # File does not exist, create silence file
-                it['end_time']=it['start_time']+it['source_duration']
-                audio_list.append(self._create_silen_file(f"nofilename_{i}", it['source_duration']))
-                dubbing_total+=it['source_duration']
+            it['start_time'] = dubbing_total
+            if not it.get('filename') or not Path(it['filename']).exists():
+                it['end_time'] = it['start_time'] + it['source_duration']
+                timeline.append(("silence", it['source_duration']))
+                dubbing_total += it['source_duration']
                 continue
-            # Read actual dubbed duration after speed change
-            seg = AudioSegment.from_file(it['filename'])
-            audio_list.append(it['filename'])
-            _len=len(seg)
-            # Update subtitle timeline to align
-            it['end_time']=it['start_time']+_len
-            dubbing_total+=_len
-            if _len<it['source_duration']:
-                # Dubbing duration shorter than subtitle interval, add silence; longer duration already handled by speed change
-                audio_list.append(self._create_silen_file(f"tail_{i}", it['source_duration']-_len))
-                dubbing_total+=it['source_duration']-_len
-            
-        logger.debug(f"{len(audio_list)=}: 配音列表累积总时长={dubbing_total}ms")
-        self._exec_concat_audio(audio_list)
-    
+            _len = get_audio_duration_ms(it['filename'])
+            timeline.append(("file", it['filename']))
+            it['end_time'] = it['start_time'] + _len
+            dubbing_total += _len
+            if _len < it['source_duration']:
+                timeline.append(("silence", it['source_duration'] - _len))
+                dubbing_total += it['source_duration'] - _len
+
+        logger.debug(f"{len(timeline)=}: 配音列表累积总时长={dubbing_total}ms")
+        self._exec_concat_audio(timeline)
+
     def _run_no_rate_change_mode(self):
         # Concatenate directly when speed is unchanged
         self.signal(tr("Merging audio (No Speed Change)..."))
-        
-        audio_concat_list = []
+
+        timeline = []
         total_audio_duration = 0
 
         for i, it in enumerate(self.queue_tts):
-
-            prev_end = 0 if i == 0 else self.queue_tts[i-1].get('end_pos_for_concat', 0)
+            prev_end = 0 if i == 0 else self.queue_tts[i - 1].get('end_pos_for_concat', 0)
             start_time = it['start_time']
-            # Leading silence interval
             gap = start_time - prev_end
-            
+
             if not self.remove_silent_mid and gap > 0:
-                audio_concat_list.append(self._create_silen_file(f"gap_{i}", gap))
+                timeline.append(("silence", gap))
                 total_audio_duration += gap
-            
+
             dubb_len = 0
             if it.get('filename') and Path(it['filename']).exists():
-                audio_concat_list.append(it['filename'])
-                dubb_len = len(AudioSegment.from_file(it['filename']))
+                timeline.append(("file", it['filename']))
+                dubb_len = get_audio_duration_ms(it['filename'])
             elif it.get('filename'):
                 dur = max(0, it['end_time'] - it['start_time'])
                 if dur > 0:
-                    audio_concat_list.append(self._create_silen_file(f"sub_{i}", dur))
+                    timeline.append(("silence", dur))
                     dubb_len = dur
-            
+
             total_audio_duration += dubb_len
             it['end_pos_for_concat'] = total_audio_duration
-            
+
             if self.align_sub_audio:
                 it['start_time'] = total_audio_duration - dubb_len
                 it['end_time'] = total_audio_duration
 
         if self.raw_total_time > total_audio_duration:
-            audio_concat_list.append(self._create_silen_file("tail_end", self.raw_total_time - total_audio_duration))
+            timeline.append(("silence", self.raw_total_time - total_audio_duration))
 
-        self._exec_concat_audio(audio_concat_list)
+        self._exec_concat_audio(timeline)
 
     def _create_silen_file(self, name, duration_ms):
         path = Path(self.cache_folder, f"silence_{name}.wav").as_posix()
         duration_ms = max(1, int(duration_ms))
-        AudioSegment.silent(duration=duration_ms, frame_rate=self.AUDIO_SAMPLE_RATE) \
-                    .set_channels(self.AUDIO_CHANNELS) \
-                    .export(path, format="wav")
+        n_frames = max(1, int(round(duration_ms * self.AUDIO_SAMPLE_RATE / 1000.0)))
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(self.AUDIO_CHANNELS)
+            wf.setsampwidth(2)
+            wf.setframerate(self.AUDIO_SAMPLE_RATE)
+            chunk_frames = min(n_frames, self.AUDIO_SAMPLE_RATE)
+            zero_chunk = b"\x00" * (chunk_frames * self.AUDIO_CHANNELS * 2)
+            rem = n_frames
+            while rem > 0:
+                take = min(rem, chunk_frames)
+                wf.writeframes(zero_chunk if take == chunk_frames else b"\x00" * (take * self.AUDIO_CHANNELS * 2))
+                rem -= take
         return path
 
+    def _write_audio_timeline(self, timeline):
+        if not timeline or not self.target_audio:
+            return
+        target_path = Path(self.target_audio)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_wav = Path(self.cache_folder, f"final_audio_temp_{os.getpid()}.wav")
+        sr_out = self.AUDIO_SAMPLE_RATE
+        ch_out = self.AUDIO_CHANNELS
+        silence_chunk_frames = sr_out  # 1 second chunk (~384KB float32)
+        zero_block = np.zeros((silence_chunk_frames, ch_out), dtype=np.float32)
+
+        try:
+            with sf.SoundFile(
+                str(temp_wav),
+                mode="w",
+                samplerate=sr_out,
+                channels=ch_out,
+                subtype="PCM_16",
+                format="WAV",
+            ) as sf_out:
+                for item in timeline:
+                    if isinstance(item, tuple) and len(item) == 2:
+                        kind, val = item
+                    else:
+                        kind, val = "file", item
+
+                    if kind == "silence":
+                        dur_ms = int(round(float(val or 0)))
+                        if dur_ms <= 0:
+                            continue
+                        rem_frames = max(1, int(round(dur_ms * sr_out / 1000.0)))
+                        while rem_frames > 0:
+                            take = min(rem_frames, silence_chunk_frames)
+                            sf_out.write(zero_block[:take])
+                            rem_frames -= take
+                    elif kind == "file" and val and Path(val).is_file():
+                        try:
+                            data, sr = sf.read(str(val), dtype="float32", always_2d=False)
+                        except Exception:
+                            seg = AudioSegment.from_file(str(val))
+                            sr = seg.frame_rate
+                            samples = np.array(seg.get_array_of_samples(), dtype=np.float32)
+                            denom = float(1 << (8 * seg.sample_width - 1))
+                            data = samples / denom
+                            if seg.channels > 1:
+                                data = data.reshape((-1, seg.channels))
+                        if data.size == 0 or sr <= 0:
+                            continue
+                        if not np.all(np.isfinite(data)):
+                            data = np.nan_to_num(data, nan=0.0, posinf=1.0, neginf=-1.0)
+                        if int(sr) != sr_out:
+                            data = _resample_audio_array(data, int(sr), sr_out)
+                        if data.ndim == 1:
+                            data = np.column_stack((data, data))
+                        elif data.shape[1] == 1:
+                            data = np.repeat(data, ch_out, axis=1)
+                        elif data.shape[1] > ch_out:
+                            data = data[:, :ch_out]
+                        np.clip(data, -1.0, 1.0, out=data)
+                        sf_out.write(data)
+
+            if temp_wav.is_file() and temp_wav.stat().st_size > 44:
+                os.replace(temp_wav, target_path)
+                logger.debug(f"[Audio-Concat] 最终音频已生成到: {self.target_audio}")
+            else:
+                logger.error("[Audio-Concat] 最终音频生成失败")
+        finally:
+            temp_wav.unlink(missing_ok=True)
+
     def _exec_concat_audio(self, file_list):
-        if not file_list: return
-        
-        concat_txt = Path(self.cache_folder, 'final_audio_concat.txt').as_posix()
-        tools.create_concat_txt(file_list, concat_txt=concat_txt)
-        
-        temp_wav = Path(self.cache_folder, 'final_audio_temp.wav').as_posix()
-        # Force cache_folder as cwd to avoid relative path issues
-        cmd = ['-y', '-f', 'concat', '-safe', '0', '-i', concat_txt, '-c:a', 'copy', temp_wav]
-        tools.runffmpeg(cmd, force_cpu=True, cmd_dir=self.cache_folder)
-        
-        if Path(temp_wav).exists():
-            shutil.move(temp_wav, self.target_audio)
-            logger.debug(f"[Audio-Concat] 最终音频已生成到: {self.target_audio}")
-        else:
-            logger.error("[Audio-Concat] 最终音频生成失败")
+        if not file_list:
+            return
+        self._write_audio_timeline(file_list)
 
 
 # Dedicated handling for subtitle dubbing
@@ -743,14 +856,10 @@ class TtsSpeedRate(SpeedRate):
 
             # Check dubbing file
             if not current.get('filename') or not Path(current['filename']).exists():
-                # Generate placeholder silence
-                dummy_wav = Path(self.cache_folder, f'silent_place_{i}.wav').as_posix()
-                AudioSegment.silent(duration=current['source_duration']).export(dummy_wav, format="wav")
-                current['filename'] = dummy_wav
                 current['dubb_time'] = current['source_duration']
-                logger.debug(f"[Prepare] 字幕[{current['line']}] 无配音，生成 {current['source_duration']}ms 静音占位")
+                logger.debug(f"[Prepare] 字幕[{current['line']}] 无配音，预留 {current['source_duration']}ms 静音占位")
             else:
-                current['dubb_time'] = len(AudioSegment.from_file(current['filename']))
+                current['dubb_time'] = get_audio_duration_ms(current['filename'])
 
     def _calculate_adjustments(self):
         """Calculation strategy."""
@@ -782,23 +891,23 @@ class TtsSpeedRate(SpeedRate):
     def _concat_audio_aligned(self):
         logger.debug("[Audio] 开始对齐拼接...")
 
-        audio_concat_list = []
+        timeline = []
 
         # Restore original timeline
         for i, it in enumerate(self.queue_tts):
             # Add leading silence
-            if i == 0 and it['start_time']>0:
-                audio_concat_list.append(self._create_silen_file(f"gap_{i}", it['start_time']))
+            if i == 0 and it['start_time'] > 0:
+                timeline.append(("silence", it['start_time']))
 
             # Actual dubbing duration
             if it.get('filename') and Path(it['filename']).exists():
-                audio_concat_list.append(it['filename'])
-                dubb_len = len(AudioSegment.from_file(it['filename']))
+                timeline.append(("file", it['filename']))
+                dubb_len = get_audio_duration_ms(it['filename'])
             else:
-                audio_concat_list.append(self._create_silen_file(f"sub_{i}", it['source_duration']))
+                timeline.append(("silence", it['source_duration']))
                 dubb_len = it['source_duration']
             # If actual dubbing is shorter than subtitle interval, append silence at the end
-            if dubb_len<it['source_duration']:
-                audio_concat_list.append(self._create_silen_file(f"end_{i}", it['source_duration']-dubb_len))
-        self._exec_concat_audio(audio_concat_list)
+            if dubb_len < it['source_duration']:
+                timeline.append(("silence", it['source_duration'] - dubb_len))
+        self._exec_concat_audio(timeline)
 

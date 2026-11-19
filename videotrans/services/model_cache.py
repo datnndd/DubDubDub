@@ -31,7 +31,7 @@ def _configure_offline_hf() -> None:
 def get_cached_vieneu_engine(
     device: str = "auto",
     backend: str = "auto",
-    max_batch_size: int = 1,
+    max_batch_size: int = 4,
 ) -> Any:
     """Return a cached Vieneu instance for the requested device and backend."""
     _configure_offline_hf()
@@ -49,10 +49,14 @@ def get_cached_vieneu_engine(
     if bak in ("auto", ""):
         bak = "pytorch" if "cuda" in dev else "onnx"
 
-    cache_key = (dev, bak, max_batch_size)
+    cache_key = (dev, bak)
     with _lock:
         if cache_key in _vieneu_cache:
-            return _vieneu_cache[cache_key]
+            engine = _vieneu_cache[cache_key]
+            cur_max = getattr(engine, "max_batch_size", None)
+            if isinstance(cur_max, int) and not isinstance(cur_max, bool) and cur_max < max_batch_size:
+                engine.max_batch_size = max_batch_size
+            return engine
 
         logger.info("Initializing and caching VieNeu engine (device=%s, backend=%s, max_batch=%s)...", dev, bak, max_batch_size)
         from vieneu import Vieneu

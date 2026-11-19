@@ -22,10 +22,12 @@ export interface ProjectRecord {
   status: 'pending' | 'processing' | 'completed' | 'failed' | 'paused' | 'active';
   parent_id?: string | null;
   parentId?: string | null;
+  media_id?: string | null;
+  mediaId?: string | null;
   media_path?: string;
   duration?: number;
-  created_at?: string;
-  updated_at?: string;
+  created_at?: string | number;
+  updated_at?: string | number;
   state_json?: string;
   state?: any;
   subprojects?: ProjectRecord[];
@@ -51,5 +53,6 @@ export interface BackendOptions {
   asrProviders: BackendOptionItem[];
   translationProviders: BackendOptionItem[];
   translationModes: Array<{ id: string; label: string }>;
-  voices: Array<{ id: string; name: string; lang?: string; gender?: string }>;
+  voices: Array<[number, string] | { id: string | number; name: string; lang?: string; gender?: string }>;
+  hardware?: { cudaAvailable: boolean; gpuCount: number };
 }

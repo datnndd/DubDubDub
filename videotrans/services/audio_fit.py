@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -17,6 +19,32 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _EPS = 1e-6
+
+
+def _is_transient_lock_error(exc: OSError) -> bool:
+    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in (5, 32)
+
+
+def _replace_file_with_retry(src: Path, dst: Path, retries: int = 8, delay: float = 0.01) -> None:
+    for attempt in range(retries):
+        try:
+            os.replace(str(src), str(dst))
+            return
+        except OSError as exc:
+            if not _is_transient_lock_error(exc) or attempt + 1 >= retries:
+                raise
+            time.sleep(delay * (attempt + 1))
+
+
+def _unlink_with_retry(path: Path, retries: int = 5, delay: float = 0.005) -> None:
+    for attempt in range(retries):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except OSError as exc:
+            if not _is_transient_lock_error(exc) or attempt + 1 >= retries:
+                return
+            time.sleep(delay * (attempt + 1))
 
 
 @dataclass(frozen=True)
@@ -128,7 +156,8 @@ def get_audio_duration_seconds(audio_path: Path | str) -> float:
     try:
         import soundfile as sf
         info = sf.info(str(p))
-        return float(info.duration)
+        if info.samplerate > 0 and info.frames >= 0:
+            return float(info.frames) / float(info.samplerate)
     except Exception:
         pass
 
@@ -182,7 +211,12 @@ def apply_pitch_preserving_stretch(
 
     filter_str = build_atempo_chain(speed_factor)
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=str(out_path.parent)) as tmp_f:
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{out_path.stem}.",
+        suffix=".tmp",
+        delete=False,
+        dir=str(out_path.parent),
+    ) as tmp_f:
         tmp_output = Path(tmp_f.name)
 
     cmd = [
@@ -198,24 +232,21 @@ def apply_pitch_preserving_stretch(
     ]
     if max_duration_s is not None and max_duration_s > 0:
         cmd.extend(["-t", f"{max_duration_s:.6f}"])
-    cmd.append(str(tmp_output))
+    cmd.extend(["-f", "wav", str(tmp_output)])
 
     try:
         from videotrans.util.help_ffmpeg import runffmpeg
         runffmpeg(cmd, force_cpu=True)
         if tmp_output.is_file() and tmp_output.stat().st_size > 0:
-            shutil.move(str(tmp_output), str(out_path))
+            _replace_file_with_retry(tmp_output, out_path)
             return True
-        else:
-            logger.warning("ffmpeg speedup produced empty output: %s", tmp_output)
-            if tmp_output.is_file():
-                tmp_output.unlink(missing_ok=True)
-            return False
+        logger.warning("ffmpeg speedup produced empty output: %s", tmp_output)
+        return False
     except Exception as exc:
         logger.exception("Failed to apply atempo stretch: %s", exc)
-        if tmp_output.is_file():
-            tmp_output.unlink(missing_ok=True)
         return False
+    finally:
+        _unlink_with_retry(tmp_output)
 
 
 def smart_fit_audio_file(

@@ -26,15 +26,20 @@ export function formatSrtTime(sec: number): string {
   return `${pad(h)}:${pad(m)}:${pad(s)},${pad(ms, 3)}`;
 }
 
-export function generateSrtContent(segments: any[], field: 'targetText' | 'sourceText' = 'targetText'): string {
+export function generateSrtContent(
+  segments: any[],
+  field: 'targetText' | 'rawTranslation' | 'sourceText' = 'targetText'
+): string {
   if (!Array.isArray(segments) || segments.length === 0) return '';
   return (
     segments
       .map((seg, idx) => {
         const text =
-          (field === 'targetText'
-            ? seg.targetText || seg.sourceText
-            : seg.sourceText || seg.targetText) || '';
+          field === 'rawTranslation'
+            ? String(seg.rawTranslation ?? '').trim() || String(seg.targetText ?? '').trim() || ''
+            : field === 'targetText'
+            ? String(seg.targetText ?? '').trim() || String(seg.sourceText ?? '').trim() || ''
+            : String(seg.sourceText ?? '').trim() || String(seg.targetText ?? '').trim() || '';
         const start = formatSrtTime(seg.startSec ?? 0);
         const end = formatSrtTime(seg.endSec ?? (seg.startSec ?? 0) + 1);
         return `${idx + 1}\n${start} --> ${end}\n${text.trim()}\n`;
@@ -72,7 +77,7 @@ export const CapCutExportModal: React.FC = () => {
   };
 
   const handleDownloadTargetSrt = () => {
-    const srt = generateSrtContent(segments, 'sourceText');
+    const srt = generateSrtContent(segments, 'rawTranslation');
     triggerBlobDownload(srt, 'subtitles_target.srt');
   };
 

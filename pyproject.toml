@@ -238,6 +238,11 @@ lint = [
   "ruff",
 ]
 
+[tool.pytest.ini_options]
+markers = [
+    "e2e: End-to-end integration tests",
+]
+
 # Override conflicting dependencies
 [tool.uv]
 override-dependencies = [

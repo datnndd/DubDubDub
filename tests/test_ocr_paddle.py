@@ -92,8 +92,8 @@ def test_recognize_orders_lines_and_averages_confidence(monkeypatch):
     p._require_engine = lambda dev: FakeEngine()
     result = p.recognize("img.bgr", "vi-vn")
     assert calls["image"] == "img.bgr"
-    assert calls["cls"] is True
-    assert result.text == "Top Bottom"
+    assert calls["cls"] is False
+    assert result.text == "Top\nBottom"
     assert round(result.confidence, 3) == 0.85
     assert [l.text for l in result.lines] == ["Top", "Bottom"]
 
@@ -120,4 +120,54 @@ def test_is_available_returns_false_when_paddle_missing():
     # paddleocr is optional; without it report False without raising.
     p = PaddleOcrProvider()
     assert p.is_available() is False or isinstance(p.is_available(), bool)
+
+
+def test_recognize_concurrent_threads_lock_language_and_device():
+    import threading
+    import time
+
+    p = PaddleOcrProvider(device="cpu")
+    barrier = threading.Barrier(2)
+    errors = []
+    results = {"en": [], "zh-cn": []}
+
+    class FakeEngine:
+        def __init__(self, lang_tag):
+            self.lang_tag = lang_tag
+
+        def ocr(self, image, cls=False):
+            # Inside self._lock, _current_lang must remain equal to this engine's lang.
+            time.sleep(0.004)
+            assert p._current_lang == self.lang_tag
+            assert p._active_device == "cpu"
+            return [[[[0, 0], [50, 0], [50, 20], [0, 20]], (f"{self.lang_tag}:{image}", 0.95)]]
+
+    def fake_require_engine(dev):
+        lang_tag = p._current_lang
+        time.sleep(0.004)
+        assert p._current_lang == lang_tag
+        p._active_device = dev
+        return FakeEngine(lang_tag)
+
+    p._require_engine = fake_require_engine
+
+    def worker(lang_code, img_label):
+        try:
+            barrier.wait(timeout=5)
+            for _ in range(8):
+                res = p.recognize(img_label, lang_code)
+                results[lang_code].append((res.text, res.device))
+        except Exception as exc:
+            errors.append(exc)
+
+    t1 = threading.Thread(target=worker, args=("en", "img_en"))
+    t2 = threading.Thread(target=worker, args=("zh-cn", "img_zh"))
+    t1.start()
+    t2.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
+
+    assert not errors
+    assert results["en"] == [("en:img_en", "cpu")] * 8
+    assert results["zh-cn"] == [("ch:img_zh", "cpu")] * 8
 

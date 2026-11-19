@@ -1,18 +1,25 @@
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+import sys
+import types
 from typing import Any, Dict, List, Tuple
 
+import numpy as np
 import soundfile as sf
 
 from videotrans.tts._base import BaseTTS
 from videotrans.util.help_role import get_vieneu_custom_voice_path
-from videotrans.services.voice_preview import resolve_vieneu_preset_voice
+from videotrans.services.voice_preview import resolve_vieneu_preset_voice, _gpu_thread_lock
 
 
 @dataclass
 class VieNeuTTS(BaseTTS):
     engine: Any = field(init=False, repr=False)
+    _owns_engine: bool = field(default=True, init=False, repr=False)
+    _voice_options_cache: Dict[Tuple[Any, ...], Tuple[Tuple[Any, ...], Dict[str, Any]]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -21,11 +28,23 @@ class VieNeuTTS(BaseTTS):
     def _create_engine(self):
         from videotrans.tts._vieneu_compat import setup_vieneu_environment
         setup_vieneu_environment()
-        from vieneu import Vieneu
 
         device = "cuda" if self.is_cuda else "cpu"
         backend = "pytorch" if self.is_cuda else "onnx"
-        return Vieneu(
+
+        vieneu_mod = sys.modules.get("vieneu")
+        if vieneu_mod is None or isinstance(vieneu_mod, types.ModuleType):
+            from videotrans.services.model_cache import get_cached_vieneu_engine
+            self._owns_engine = False
+            return get_cached_vieneu_engine(
+                device=device,
+                backend=backend,
+                max_batch_size=4,
+            )
+
+        # Test double (e.g. SimpleNamespace) — instantiate and close directly
+        self._owns_engine = True
+        return vieneu_mod.Vieneu(
             mode="v3turbo",
             device=device,
             backend=backend,
@@ -37,7 +56,23 @@ class VieNeuTTS(BaseTTS):
     ) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
         role = str(item.get("role") or "").strip()
         item_style = str(item.get("style") or "").strip()
+        if role.lower() == "clone":
+            ref_wav, _ = self.get_ref_wav(item)
+            cache_key: Tuple[Any, ...] = ("clone", ref_wav, item_style)
+        else:
+            cache_key = (role, item_style)
 
+        cached = self._voice_options_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        result = self._resolve_inference_options(item, role, item_style)
+        self._voice_options_cache[cache_key] = result
+        return result
+
+    def _resolve_inference_options(
+        self, item: Dict[str, Any], role: str, item_style: str
+    ) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
         # Check if role maps to a recorded custom voice (cloned or designed)
         from videotrans.core import voice_store
         resolved = voice_store.resolve_voice_params(role)
@@ -54,7 +89,7 @@ class VieNeuTTS(BaseTTS):
             cached_emb = voice_store.get_voice_embedding(eff_id) if eff_id else None
 
             if cached_emb and cached_emb[0] is not None:
-                v_key = ("custom_cached", str(eff_id), style) if style else ("custom_cached", str(eff_id))
+                v_key: Tuple[Any, ...] = ("custom_cached", str(eff_id), style) if style else ("custom_cached", str(eff_id))
                 opts: Dict[str, Any] = {"voice": {"speaker_emb": cached_emb[0], "codes": cached_emb[1]}}
                 if style:
                     opts["style"] = style
@@ -110,7 +145,7 @@ class VieNeuTTS(BaseTTS):
 
     def _exec(self) -> None:
         queue_by_voice: Dict[
-            Tuple[str, str], List[Tuple[Dict[str, Any], Dict[str, Any]]]
+            Tuple[Any, ...], List[Tuple[Dict[str, Any], Dict[str, Any]]]
         ] = defaultdict(list)
         for item in self.queue_tts:
             if not item.get("text", "").strip() or Path(item["filename"]).is_file():
@@ -118,23 +153,49 @@ class VieNeuTTS(BaseTTS):
             voice_key, options = self._inference_options(item)
             queue_by_voice[voice_key].append((item, options))
 
+        chunk_size = max(4, int(getattr(self.engine, "max_batch_size", 4) or 4))
+
         try:
             completed = 0
             for items in queue_by_voice.values():
+                if self._exit():
+                    return
                 queue = [item for item, _ in items]
                 options = items[0][1]
-                audios = self.engine.infer_batch(
-                    [item["text"] for item in queue],
-                    **options,
-                )
-                if len(audios) != len(queue):
-                    raise RuntimeError(
-                        "VieNeu-TTS returned an unexpected number of audio segments"
-                    )
-                for item, audio in zip(queue, audios):
-                    sf.write(item["filename"], audio, self.engine.sample_rate)
-                    completed += 1
+                for start in range(0, len(queue), chunk_size):
+                    if self._exit():
+                        return
+                    sub_queue = queue[start : start + chunk_size]
+                    texts = [it["text"] for it in sub_queue]
+                    try:
+                        if not self._owns_engine:
+                            with _gpu_thread_lock:
+                                audios = self.engine.infer_batch(texts, **options)
+                        else:
+                            audios = self.engine.infer_batch(texts, **options)
+                    except Exception:
+                        if not self._owns_engine and self.is_cuda:
+                            from videotrans.services.model_cache import evict_vieneu_engine
+                            evict_vieneu_engine(device="cuda")
+                        raise
+
+                    if len(audios) != len(sub_queue):
+                        raise RuntimeError(
+                            "VieNeu-TTS returned an unexpected number of audio segments"
+                        )
+                    for item, audio in zip(sub_queue, audios):
+                        if hasattr(audio, "detach"):
+                            audio = audio.detach().cpu().numpy()
+                        arr = np.asarray(audio, dtype=np.float32).squeeze()
+                        if np.isnan(arr).any() or np.isinf(arr).any():
+                            arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0)
+                        peak = float(np.max(np.abs(arr))) if arr.size > 0 else 0.0
+                        if peak >= 1e-4:
+                            arr = (arr / peak) * 0.90
+                        sf.write(item["filename"], arr, self.engine.sample_rate)
+                        completed += 1
                     self.signal(text=f"TTS[{completed}/{self.len}]")
             self.signal(text="TTS ended")
         finally:
-            self.engine.close()
+            if self._owns_engine and hasattr(self.engine, "close"):
+                self.engine.close()

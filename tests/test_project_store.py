@@ -149,3 +149,43 @@ def test_delete_project_and_dirs():
     assert deleted is True
     assert get_project(proj["id"]) is None
     assert not pdir.exists()
+
+
+def test_update_project_state_merges_by_default_and_replaces_when_merge_false(tmp_path, monkeypatch):
+    monkeypatch.setattr("videotrans.core.project_store.get_projects_root", lambda: tmp_path)
+    proj = create_project(
+        name="Partial Merge Test",
+        parent_id="parent_2026-11-18",
+        state={
+            "parent_id": "parent_2026-11-18",
+            "project": {"filename": "clip.mp4", "verified": True},
+            "languages": {"source": {"code": "zh-cn"}, "target": {"code": "vi"}},
+            "backend": {"mediaId": "m_1", "config": {"recognType": 1}},
+            "engines": {"speakerDiarization": True},
+            "ocrCrop": {"roi": [0.1, 0.7, 0.8, 0.2]},
+        },
+    )
+
+    merged = update_project_state(
+        proj["id"],
+        {"segments": [{"id": 1, "startSec": 0, "endSec": 1, "sourceText": "Hi"}], "currentStep": 2},
+        stage=2,
+    )
+    assert merged is not None
+    assert merged["state"]["parent_id"] == "parent_2026-11-18"
+    assert merged["state"]["project"]["filename"] == "clip.mp4"
+    assert merged["state"]["languages"]["target"]["code"] == "vi"
+    assert merged["state"]["backend"]["mediaId"] == "m_1"
+    assert merged["state"]["engines"]["speakerDiarization"] is True
+    assert merged["state"]["currentStep"] == 2
+    assert len(merged["state"]["segments"]) == 1
+
+    replaced = update_project_state(
+        proj["id"],
+        {"currentStep": 2, "segments": []},
+        stage=2,
+        merge=False,
+    )
+    assert replaced is not None
+    assert "ocrCrop" not in replaced["state"]
+    assert "engines" not in replaced["state"]

@@ -136,6 +136,7 @@ export const Stage2ReviewTranscript: React.FC = () => {
   const [ocrDetectedEntries, setOcrDetectedEntries] = useState<OcrSubtitleEntry[] | null>(null);
   const [ocrBatchResults, setOcrBatchResults] = useState<BatchOcrResult[]>([]);
   const [ocrProgress, setOcrProgress] = useState(0);
+  const [exportError, setExportError] = useState<string | null>(null);
   const ocrRequestId = useRef(0);
   const runBatchTranslation = useDubDubStore((s) => s.runBatchTranslation);
   const translateSingleSegment = useDubDubStore((s) => s.translateSingleSegment);
@@ -264,12 +265,35 @@ export const Stage2ReviewTranscript: React.FC = () => {
     }
 
     await extractSelectedOcrSegments(snapshot, ocrRoi, extractOcrForSegment, async (entry) => {
-      const applied = await applyExtractedOcrResult(entry, () => useDubDubStore.getState().segments, applyOcrText);
       if (requestId !== ocrRequestId.current) return;
-      setOcrBatchResults((results) => [...results, applied]);
+      const previewEntry: BatchOcrResult = { ...entry, applied: entry.error ? undefined : false };
+      setOcrBatchResults((results) => [...results, previewEntry]);
       setOcrProgress((progress) => progress + 1);
     }, () => requestId === ocrRequestId.current);
     if (requestId === ocrRequestId.current) setOcrLoading(false);
+  };
+
+  const handleConfirmBatchApply = async () => {
+    if (!ocrBatchResults.length) return;
+    setOcrLoading(true);
+    try {
+      const updatedResults: BatchOcrResult[] = [];
+      for (const entry of ocrBatchResults) {
+        if (entry.applied || entry.error || !entry.text?.trim()) {
+          updatedResults.push(entry);
+          continue;
+        }
+        const applied = await applyExtractedOcrResult(
+          entry,
+          () => useDubDubStore.getState().segments,
+          applyOcrText,
+        );
+        updatedResults.push(applied);
+      }
+      setOcrBatchResults(updatedResults);
+    } finally {
+      setOcrLoading(false);
+    }
   };
 
   return (
@@ -359,7 +383,14 @@ export const Stage2ReviewTranscript: React.FC = () => {
               type="button"
               data-testid="export-translated-srt-btn"
               disabled={!canExportSrt}
-              onClick={() => exportTranslatedSrt(segments)}
+              onClick={() => {
+                setExportError(null);
+                try {
+                  exportTranslatedSrt(segments);
+                } catch (err: any) {
+                  setExportError(err instanceof Error ? err.message : 'Failed to export translated SRT');
+                }
+              }}
               title={canExportSrt ? 'Download the current translated subtitles as an SRT file' : 'Translate every segment before exporting'}
               className="px-3 py-1.5 rounded-md border border-[#8D4B00] text-[#8D4B00] bg-white text-xs font-bold flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
             >
@@ -367,6 +398,11 @@ export const Stage2ReviewTranscript: React.FC = () => {
               Export Translated SRT
             </button>
           </div>
+          {exportError && (
+            <p role="alert" data-testid="export-srt-error" className="text-[11px] font-semibold text-rose-700">
+              {exportError}
+            </p>
+          )}
           {untranslated.length > 0 && (
             <p data-testid="untranslated-segments" className="text-[11px] text-amber-800">
               Translate segment{untranslated.length === 1 ? '' : 's'} {untranslated.join(', ')} before exporting the SRT.
@@ -706,7 +742,7 @@ export const Stage2ReviewTranscript: React.FC = () => {
 
       {ocrSegment && (
         <Stage2OcrDialog
-          key={`${ocrSegment.id}-${ocrResult?.text ?? ''}`}
+          key={ocrSegment.id}
           segment={ocrSegment}
           videoUrl={project.previewUrl || ''}
           batchSegments={ocrDialogSegments || undefined}
@@ -727,6 +763,7 @@ export const Stage2ReviewTranscript: React.FC = () => {
           }}
           onExtract={() => void runOcr()}
           onConfirmReplace={handleConfirmReplace}
+          onConfirmBatchApply={() => void handleConfirmBatchApply()}
           onClose={closeOcr}
           loading={ocrLoading}
           result={ocrResult}
@@ -759,6 +796,16 @@ export const Stage2ReviewTranscript: React.FC = () => {
             </div>
 
             <p className="text-xs text-stone-600">{translationModal.message}</p>
+
+            {translationModal.error && (
+              <div
+                role="alert"
+                data-testid="translation-modal-error"
+                className="p-2.5 rounded-lg bg-rose-50 border border-rose-200 text-xs text-rose-800 whitespace-pre-wrap break-words"
+              >
+                {translationModal.error}
+              </div>
+            )}
 
             {translationModal.status === 'translating' && (
               <div className="w-full h-1.5 bg-stone-100 rounded-full overflow-hidden">

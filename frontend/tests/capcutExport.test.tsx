@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import { useDubDubStore } from '../src/store';
@@ -24,7 +24,16 @@ const mockSegment = {
   speakerId: 'spk_1',
 };
 
+let originalFetch: typeof globalThis.fetch;
+
 beforeEach(() => {
+  originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })) as any;
+
   useDubDubStore.setState({
     currentStep: 4,
     maxUnlockedStep: 4,
@@ -68,6 +77,10 @@ beforeEach(() => {
       isCapCutModalOpen: false,
     },
   });
+});
+
+afterEach(() => {
+  globalThis.fetch = originalFetch;
 });
 
 describe('Stage 4 Subtitle Customization & CapCut Export Suite', () => {

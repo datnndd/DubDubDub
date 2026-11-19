@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import uuid
 from pathlib import Path
@@ -14,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from videotrans.configure import config as runtime_config
 from videotrans.configure.config import TEMP_DIR
 from videotrans.core.edit_asset_store import EDIT_ASSET_STORE
+from videotrans.core.job_executor import TERMINAL_STATUSES
 from videotrans.core.job_manager import ActiveJobError, JOBS
 from videotrans.core.media_store import MEDIA, MediaRecord
 from videotrans.core.job_store import (
@@ -107,7 +109,13 @@ async def create_job_handler(
         task_params_builder = getattr(request.app.state, "task_params_builder", None)
         params = task_params_builder(media.path, options, job_type=job_type, project_id=project_id)
 
-        if job_type not in {"render", "translation"}:
+        subtitle_source = str(
+            params.get("subtitle_source")
+            or options.get("subtitleSource")
+            or options.get("subtitle_source")
+            or "audio_asr"
+        ).strip().lower()
+        if job_type not in {"render", "translation"} and subtitle_source != "video_ocr":
             asr_validator = getattr(request.app.state, "asr_validator", None)
             if asr_validator:
                 asr_validator(params["recogn_type"], getattr(request.app.state, "settings_store", None))
@@ -124,10 +132,15 @@ async def create_job_handler(
         manager = getattr(request.app.state, "job_manager", None) or JOBS
         job = manager.submit(params, media_id=media.id, job_type=job_type, project_id=project_id)
         if project_id:
-            try:
-                update_project(project_id, status="processing")
-            except Exception:
-                pass
+            tx_lock = getattr(job, "_tx_lock", None) or contextlib.nullcontext()
+            with tx_lock:
+                with job._lock:
+                    is_terminal = job.status in TERMINAL_STATUSES
+                if not is_terminal:
+                    try:
+                        update_project(project_id, status="processing")
+                    except Exception:
+                        pass
     except ActiveJobError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (ValueError, TypeError, OverflowError) as exc:
@@ -152,9 +165,12 @@ async def job_transcript_handler(job_id: str, request: Request) -> JSONResponse:
     job = manager.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    with job._lock:
+        segments = list(job.segments)
+        transcript_options = getattr(job, "transcript_options", None)
     return JSONResponse({
-        "segments": list(job.segments),
-        "transcriptOptions": getattr(job, "transcript_options", None),
+        "segments": segments,
+        "transcriptOptions": transcript_options,
     })
 
 
@@ -174,7 +190,8 @@ async def output_handler(job_id: str, index: int, request: Request) -> FileRespo
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     try:
-        output = job.outputs[index]
+        with job._lock:
+            output = job.outputs[index]
     except (ValueError, IndexError):
         raise HTTPException(status_code=404, detail="Output not found")
     if not output.is_file():
@@ -195,60 +212,133 @@ async def job_stream_handler(
         raise HTTPException(status_code=404, detail="Job not found")
 
     async def event_generator():
-        past_events = events_since(job_id, after_seq=after_seq)
-        last_seq = after_seq
-        for ev in past_events:
-            seq = ev["seq"]
-            payload = ev["payload"]
-            raw = payload if isinstance(payload, str) else json.dumps(payload)
-            yield f"id: {seq}\nevent: message\ndata: {raw}\n\n"
-            last_seq = max(last_seq, seq)
-
-        cur_job_mem = manager.get(job_id)
-        cur_job_db = db_get_job(job_id)
-        status = (cur_job_mem.status if cur_job_mem else (cur_job_db.get("status") if cur_job_db else None)) or "unknown"
-
-        if status in {"succeeded", "failed", "cancelled"}:
-            close_payload = json.dumps({"status": status, "terminal": True, "seq": last_seq})
-            yield f"id: {last_seq + 1}\nevent: done\ndata: {close_payload}\n\n"
-            return
-
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
+        cur_job_mem = manager.get(job_id)
         if cur_job_mem:
             cur_job_mem.subscribe(queue, loop)
 
+        last_seq = after_seq
+        seen_seqs: set[int] = set()
+        status = "unknown"
+        disconnected = False
+
+        async def _drain_remaining() -> list[str]:
+            nonlocal last_seq
+            await asyncio.sleep(0)
+            chunks: list[str] = []
+            for ev in events_since(job_id, after_seq=last_seq):
+                seq = ev["seq"]
+                if seq not in seen_seqs and (seq > last_seq or (last_seq == 0 and seq >= 0)):
+                    payload = ev["payload"]
+                    raw = payload if isinstance(payload, str) else json.dumps(payload)
+                    chunks.append(f"id: {seq}\nevent: message\ndata: {raw}\n\n")
+                    last_seq = max(last_seq, seq)
+                    seen_seqs.add(seq)
+            while not queue.empty():
+                seq, payload = queue.get_nowait()
+                if seq not in seen_seqs and (seq > last_seq or (last_seq == 0 and seq >= 0)):
+                    raw_data = json.dumps(payload) if isinstance(payload, dict) else str(payload)
+                    chunks.append(f"id: {seq}\nevent: message\ndata: {raw_data}\n\n")
+                    last_seq = max(last_seq, seq)
+                    seen_seqs.add(seq)
+            return chunks
+
+        def _build_close_payload(final_status: str, mem_job: Any, db_row: Any) -> str:
+            err = None
+            msg = None
+            if mem_job is not None:
+                with mem_job._lock:
+                    err = getattr(mem_job, "error", None)
+                    msg = getattr(mem_job, "message", None)
+            if not err and db_row:
+                err = db_row.get("error")
+            if not msg and db_row:
+                msg = db_row.get("message")
+            body: dict[str, Any] = {
+                "status": final_status,
+                "terminal": True,
+                "seq": last_seq,
+            }
+            if err:
+                body["error"] = err
+            if msg:
+                body["message"] = msg
+            return json.dumps(body)
+
         try:
+            past_events = events_since(job_id, after_seq=after_seq)
+            for ev in past_events:
+                seq = ev["seq"]
+                payload = ev["payload"]
+                raw = payload if isinstance(payload, str) else json.dumps(payload)
+                yield f"id: {seq}\nevent: message\ndata: {raw}\n\n"
+                last_seq = max(last_seq, seq)
+                seen_seqs.add(seq)
+
+            cur_job_mem = manager.get(job_id) or cur_job_mem
+            cur_job_db = db_get_job(job_id)
+            if cur_job_mem:
+                with cur_job_mem._lock:
+                    status = cur_job_mem.status or "unknown"
+            else:
+                status = (cur_job_db.get("status") if cur_job_db else None) or "unknown"
+
+            if status in {"succeeded", "failed", "cancelled"}:
+                for chunk in await _drain_remaining():
+                    yield chunk
+                cur_job_db = db_get_job(job_id) or cur_job_db
+                close_payload = _build_close_payload(status, cur_job_mem, cur_job_db)
+                yield f"id: {last_seq + 1}\nevent: done\ndata: {close_payload}\n\n"
+                return
+
             while True:
                 if await request.is_disconnected():
+                    disconnected = True
                     break
                 try:
                     seq, payload = await asyncio.wait_for(queue.get(), timeout=15.0)
                     is_terminal = isinstance(payload, dict) and payload.get("status") in {"succeeded", "failed", "cancelled"}
-                    if seq > last_seq or (last_seq == 0 and seq >= 0):
+                    if seq not in seen_seqs and (seq > last_seq or (last_seq == 0 and seq >= 0)):
                         raw_data = json.dumps(payload) if isinstance(payload, dict) else str(payload)
                         yield f"id: {seq}\nevent: message\ndata: {raw_data}\n\n"
                         last_seq = max(last_seq, seq)
+                        seen_seqs.add(seq)
                     if is_terminal:
                         break
                 except asyncio.TimeoutError:
                     yield ": keep-alive\n\n"
                     check_db = db_get_job(job_id)
                     check_mem = manager.get(job_id)
-                    check_status = (check_mem.status if check_mem else (check_db.get("status") if check_db else None))
+                    if check_mem:
+                        with check_mem._lock:
+                            check_status = check_mem.status
+                    else:
+                        check_status = check_db.get("status") if check_db else None
                     if check_status in {"succeeded", "failed", "cancelled"}:
                         break
         except (ConnectionResetError, asyncio.CancelledError):
-            pass
+            disconnected = True
         finally:
             if cur_job_mem:
                 cur_job_mem.unsubscribe(queue)
 
+        if disconnected:
+            return
+
         check_done_db = db_get_job(job_id)
         final_mem = manager.get(job_id)
-        final_status = (final_mem.status if final_mem else (check_done_db.get("status") if check_done_db else None)) or status
+        if final_mem:
+            with final_mem._lock:
+                final_status = final_mem.status or status
+        else:
+            final_status = (check_done_db.get("status") if check_done_db else None) or status
         if final_status in {"succeeded", "failed", "cancelled"}:
-            close_payload = json.dumps({"status": final_status, "terminal": True, "seq": last_seq})
+            for chunk in await _drain_remaining():
+                yield chunk
+            check_done_db = db_get_job(job_id) or check_done_db
+            final_mem = manager.get(job_id) or final_mem
+            close_payload = _build_close_payload(final_status, final_mem, check_done_db)
             yield f"id: {last_seq + 1}\nevent: done\ndata: {close_payload}\n\n"
 
     headers = {

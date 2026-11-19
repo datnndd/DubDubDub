@@ -131,3 +131,19 @@ def test_deepgram_diarization_request_has_only_supported_task_fields(tmp_path):
     assert "auto_speed" not in values and "max_speed_rate" not in values
     with pytest.raises(ValueError, match="Unsupported task parameters: unknown_option"):
         TaskRequest({**params, "unknown_option": True}).normalize()
+
+
+def test_stage2_reset_clears_ocr_crop_permanently(isolated_projects):
+    _project(isolated_projects)
+    proj = get_project("reset-test")
+    update_project("reset-test", state={**proj["state"], "ocrCrop": {"roi": [0.1, 0.7, 0.8, 0.2]}})
+    assert "ocrCrop" in get_project("reset-test")["state"]
+
+    with TestClient(create_app()) as client:
+        reset_res = client.post("/api/projects/reset-test/stages/2/reset")
+        assert reset_res.status_code == 200
+        assert "ocrCrop" not in reset_res.json()["state"]
+
+        get_res = client.get("/api/projects/reset-test")
+        assert get_res.status_code == 200
+        assert "ocrCrop" not in get_res.json()["state"]

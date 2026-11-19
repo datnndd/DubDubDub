@@ -198,17 +198,31 @@ class BaseRecogn(BaseCon):
 
 
     def cut_audio(self) -> List[SrtItem]:
-        from pydub import AudioSegment
         import numpy as np
 
-        dir_name = f"{config.TEMP_DIR}/clip_{time.time()}"
+        base_dir = Path(self.cache_folder) if self.cache_folder else Path(config.TEMP_DIR)
+        dir_name = str(base_dir / f"clip_{time.time_ns()}")
         Path(dir_name).mkdir(parents=True, exist_ok=True)
+        self._last_cut_dir = dir_name
 
         if not self.speech_timestamps:
             self._vad_split()
 
-        # Load audio (16k mono)
-        audio = AudioSegment.from_wav(self.audio_file)
+        # Load audio (16k mono) without eager full-file float32/abs copies
+        try:
+            import soundfile as sf
+            samples, samplerate = sf.read(self.audio_file, dtype='int16', always_2d=False)
+            if samples.ndim > 1:
+                samples = np.mean(samples, axis=1).astype(np.int16)
+        except Exception:
+            import wave
+            with wave.open(self.audio_file, 'rb') as wf:
+                samplerate = wf.getframerate()
+                n_channels = wf.getnchannels()
+                raw = wf.readframes(wf.getnframes())
+            samples = np.frombuffer(raw, dtype=np.int16)
+            if n_channels > 1:
+                samples = samples.reshape(-1, n_channels).mean(axis=1).astype(np.int16)
 
         # Minimum segment duration (at least 1000ms, at most 25000ms)
         min_speech_duration_ms = min(25000, max(int(settings.get('min_speech_duration_ms', 1000)), 1000))
@@ -238,11 +252,8 @@ class BaseRecogn(BaseCon):
                 merged.append(seg)
         segs = merged
 
-        # Truncate overly long segments (based on audio energy)
+        # Truncate overly long segments (compute energy only for slices exceeding max_speech_duration_ms)
         final_segs = []
-        raw_samples = np.array(audio.get_array_of_samples(), dtype=np.float32)
-        energy = np.abs(raw_samples)
-
         for s, e in segs:
             dur = e - s
             if dur <= max_speech_duration_ms:
@@ -250,37 +261,44 @@ class BaseRecogn(BaseCon):
                 continue
 
             # Search for lowest energy point in the 70%~100% time region as a safe cut point
-            start_sample = int(s * audio.frame_rate / 1000)
-            end_sample = int(e * audio.frame_rate / 1000)
-            segment_energy = energy[start_sample:end_sample]
+            start_sample = max(0, int(s * samplerate / 1000))
+            end_sample = min(len(samples), int(e * samplerate / 1000))
+            segment_energy = np.abs(samples[start_sample:end_sample].astype(np.float32))
             search_start = int(len(segment_energy) * 0.7)
             search_end = len(segment_energy) - 1
             if search_end > search_start:
-                min_idx = search_start + np.argmin(segment_energy[search_start:search_end])
+                min_idx = search_start + int(np.argmin(segment_energy[search_start:search_end]))
             else:
                 min_idx = len(segment_energy) // 2   # Fallback: split in half
 
-            cut_ms = s + int(min_idx * 1000 / audio.frame_rate)
+            cut_ms = s + int(min_idx * 1000 / samplerate)
             # Avoid creating extremely short segments (keep at least 1 second)
             cut_ms = max(s + 1000, min(cut_ms, e - 1000))
             final_segs.append([s, cut_ms])
             final_segs.append([cut_ms, e])
 
         # Add 500ms silence head/tail to each segment and export
-        # Audio is 16k mono
-        silent_segment = AudioSegment.silent(
-            duration=500,
-            frame_rate=audio.frame_rate
-        ).set_channels(audio.channels).set_sample_width(audio.sample_width)
+        pad_samples = int(samplerate * 0.5)
+        silence_pad = np.zeros(pad_samples, dtype=np.int16)
 
         data = []
         for i, (start_ms, end_ms) in enumerate(final_segs):
             startraw = ms_to_time_string(ms=start_ms)
             endraw = ms_to_time_string(ms=end_ms)
-            chunk = audio[start_ms:end_ms]
+            s_idx = max(0, int(start_ms * samplerate / 1000))
+            e_idx = min(len(samples), int(end_ms * samplerate / 1000))
+            padded = np.concatenate([silence_pad, samples[s_idx:e_idx], silence_pad])
             file_name = f"{dir_name}/audio_{i}.wav"
-            final_audio = silent_segment + chunk + silent_segment
-            final_audio.export(file_name, format="wav")
+            try:
+                import soundfile as sf
+                sf.write(file_name, padded, samplerate, subtype='PCM_16')
+            except Exception:
+                import wave
+                with wave.open(file_name, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(samplerate)
+                    wf.writeframes(padded.tobytes())
             data.append(SrtItem(
                 line=i + 1,
                 text="",
@@ -298,6 +316,12 @@ class BaseRecogn(BaseCon):
 
     def _merge_sub(self, srt_list: List[SrtItem]) -> List[SrtItem]:
         """Merge overly short subtitles and redistribute fragments by punctuation."""
+        def _finalize(items: List[SrtItem]) -> List[SrtItem]:
+            out = [it for it in items if it['text'].strip()]
+            for idx, item in enumerate(out):
+                item['line'] = idx + 1
+            return out
+
         post_srt_raws = []
         min_speech = max(300, int(float(settings.get('min_speech_duration_ms', 1000))))
         max_speech = int(1000*float(settings.get('max_speech_duration_s', 5)))
@@ -307,17 +331,17 @@ class BaseRecogn(BaseCon):
         post_srt_raws = self._phase1_merge_short(srt_list, min_speech, post_srt_raws,max_speech)
 
         if len(post_srt_raws) < 2:
-            return post_srt_raws
+            return _finalize(post_srt_raws)
 
         # Phase 2: handle first item if too short
         post_srt_raws = self._phase2_merge_first(post_srt_raws, min_speech)
         if len(post_srt_raws) < 2:
-            return post_srt_raws
+            return _finalize(post_srt_raws)
 
         # Phase 3: handle last item if too short
         post_srt_raws = self._phase3_merge_last(post_srt_raws, min_speech)
         if len(post_srt_raws) < 2:
-            return post_srt_raws
+            return _finalize(post_srt_raws)
 
         # Phase 4: redistribute punctuation fragments forward
         post_srt_raws = self._phase4_redistribute_by_punct(post_srt_raws, forward=True)
@@ -329,7 +353,7 @@ class BaseRecogn(BaseCon):
             for it in post_srt_raws:
                 # Remove trailing punctuation
                 it['text'] = it['text'].strip('。,.').strip()
-        return [it for it in post_srt_raws if it['text'].strip()]
+        return _finalize(post_srt_raws)
 
     def _phase1_merge_short(self, srt_list, min_speech, post_srt_raws,max_speech=5000):
         """Iterate over original list, merging short subtitles into adjacent neighbors."""
@@ -338,15 +362,17 @@ class BaseRecogn(BaseCon):
                 continue
             
             _words_len=len(it['text'].strip()) if self.is_cjk else len(it['text'].strip().split(' '))
-            if  idx == 0 or idx == len(srt_list) - 1 or (it['end_time'] - it['start_time'] >= min_speech and _words_len>1 ):
+            if idx == 0 or idx == len(srt_list) - 1 or not post_srt_raws or (it['end_time'] - it['start_time'] >= min_speech and _words_len>1):
                 post_srt_raws.append(it)
                 continue
 
             prev_diff = it['start_time'] - post_srt_raws[-1]['end_time']
             next_diff = srt_list[idx + 1]['start_time'] - it['end_time']
+            prev_text = post_srt_raws[-1]['text'].strip()
+            cur_text = it['text'].strip()
             merge_forward = (
-                    (post_srt_raws[-1]['text'][-1] not in self.flag and it['text'][-1] in self.flag)
-                    or (post_srt_raws[-1]['text'][-1] in self.half_flag and it['text'][-1] in self.end_flag)
+                    (bool(prev_text) and prev_text[-1] not in self.flag and bool(cur_text) and cur_text[-1] in self.flag)
+                    or (bool(prev_text) and prev_text[-1] in self.half_flag and bool(cur_text) and cur_text[-1] in self.end_flag)
                     or prev_diff <= next_diff
             )
             # If should merge forward, but previous item length exceeds max allowed duration and difference <= 2s, merge backward instead; otherwise merge forward
@@ -365,10 +391,10 @@ class BaseRecogn(BaseCon):
                 post_srt_raws[-1]['end_time'] = it['end_time']
                 post_srt_raws[-1]['endraw'] = ms_to_time_string(ms=it['end_time'])
                 post_srt_raws[-1]['time'] = f"{post_srt_raws[-1]['startraw']} --> {post_srt_raws[-1]['endraw']}"
-                post_srt_raws[-1]['text'] += ' ' + it['text']
+                post_srt_raws[-1]['text'] += self.join_word_flag + it['text']
             else:
                 self._log_merge('后', it, srt_list[idx + 1], prev_diff, next_diff)
-                srt_list[idx + 1]['text'] = it['text'] + ' ' + srt_list[idx + 1]['text']
+                srt_list[idx + 1]['text'] = it['text'] + self.join_word_flag + srt_list[idx + 1]['text']
                 srt_list[idx + 1]['start_time'] = it['start_time']
                 srt_list[idx + 1]['startraw'] = ms_to_time_string(ms=it['start_time'])
                 srt_list[idx + 1]['time'] = f"{srt_list[idx + 1]['startraw']} --> {srt_list[idx + 1]['endraw']}"
@@ -379,6 +405,11 @@ class BaseRecogn(BaseCon):
         if (post_srt_raws[0]['end_time'] - post_srt_raws[0]['start_time'] < min_speech
                 and post_srt_raws[1]['start_time'] - post_srt_raws[0]['end_time'] < 2000) or len(post_srt_raws[0]['text'].strip())<2:
             post_srt_raws[1]['start_time'] = post_srt_raws[0]['start_time']
+            startraw = ms_to_time_string(ms=post_srt_raws[1]['start_time'])
+            endraw = ms_to_time_string(ms=post_srt_raws[1]['end_time'])
+            post_srt_raws[1]['startraw'] = startraw
+            post_srt_raws[1]['endraw'] = endraw
+            post_srt_raws[1]['time'] = f"{startraw} --> {endraw}"
             post_srt_raws[1]['text'] = post_srt_raws[0]['text'] + self.join_word_flag + post_srt_raws[1]['text']
             post_srt_raws.pop(0)
         return post_srt_raws
@@ -388,6 +419,11 @@ class BaseRecogn(BaseCon):
         if (post_srt_raws[-1]['end_time'] - post_srt_raws[-1]['start_time'] < min_speech
                 and post_srt_raws[-1]['start_time'] - post_srt_raws[-2]['end_time'] < 2000) or len(post_srt_raws[-1]['text'].strip())<2:
             post_srt_raws[-2]['end_time'] = post_srt_raws[-1]['end_time']
+            startraw = ms_to_time_string(ms=post_srt_raws[-2]['start_time'])
+            endraw = ms_to_time_string(ms=post_srt_raws[-2]['end_time'])
+            post_srt_raws[-2]['startraw'] = startraw
+            post_srt_raws[-2]['endraw'] = endraw
+            post_srt_raws[-2]['time'] = f"{startraw} --> {endraw}"
             post_srt_raws[-2]['text'] += self.join_word_flag + post_srt_raws[-1]['text']
             post_srt_raws.pop(-1)
         return post_srt_raws
@@ -396,6 +432,8 @@ class BaseRecogn(BaseCon):
         """Redistribute short fragments from current subtitle to previous/next neighbor based on punctuation."""
         for i, it in enumerate(post_srt_raws):
             if i == 0 or i == len(post_srt_raws) - 1:
+                continue
+            if not it['text'].strip():
                 continue
             neighbour = i - 1 if forward else i + 1
             if post_srt_raws[neighbour]['end_time' if forward else 'start_time'] != it[
@@ -418,21 +456,27 @@ class BaseRecogn(BaseCon):
                 if len(target_fragment.strip().split(' ')) > 3:
                     continue
 
-            # Skip if neighbor ends/starts with terminal punctuation
-            if forward and post_srt_raws[i - 1]['text'][-1] in self.flag:
+            # Skip if neighbor ends/starts with terminal punctuation or is empty
+            prev_text = post_srt_raws[i - 1]['text'].strip()
+            cur_text = it['text'].strip()
+            if forward and (not prev_text or prev_text[-1] in self.flag):
                 continue
-            if not forward and it['text'][-1] in self.flag:
+            if not forward and (not cur_text or cur_text[-1] in self.flag):
                 continue
-
-            cut_len = len(fragments[0]) + 1 if forward else len(fragments[-1]) + 1
-            moved_text = it['text'][:cut_len] if forward else it['text'][-len(fragments[-1]):]
 
             if forward:
-                post_srt_raws[i - 1]['text'] += self.join_word_flag + moved_text
-                it['text'] = it['text'][cut_len:]
+                cut_len = len(fragments[0]) + 1
+                moved_text = it['text'][:cut_len].strip()
+                post_srt_raws[i - 1]['text'] = (
+                    post_srt_raws[i - 1]['text'].rstrip() + self.join_word_flag + moved_text
+                ).strip()
+                it['text'] = it['text'][cut_len:].strip()
             else:
-                post_srt_raws[i + 1]['text'] = moved_text + self.join_word_flag + post_srt_raws[i + 1]['text']
-                it['text'] = it['text'][:-len(fragments[-1])]
+                moved_text = fragments[-1].strip()
+                post_srt_raws[i + 1]['text'] = (
+                    moved_text + self.join_word_flag + post_srt_raws[i + 1]['text'].lstrip()
+                ).strip()
+                it['text'] = it['text'][:-len(fragments[-1])].strip()
 
             logger.warning(f'该字幕原始文字={it["text"]}, 合并进{"前" if forward else "后"}条字幕的文字={moved_text}')
         return post_srt_raws

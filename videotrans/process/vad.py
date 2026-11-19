@@ -64,6 +64,69 @@ def get_speech_timestamp_silero(input_wav,
 
 
 
+def _prepare_pcm_frames(data, hop_size=256):
+    """Convert audio samples to mono int16 and reshape into contiguous (num_frames, hop_size) frames."""
+    arr = np.asarray(data)
+    orig_dtype = arr.dtype
+    if arr.ndim > 1:
+        arr = np.mean(arr, axis=1)
+    if np.issubdtype(orig_dtype, np.floating):
+        arr = np.round(np.clip(arr, -1.0, 1.0) * 32767.0).astype(np.int16)
+    elif orig_dtype == np.int32:
+        arr = np.clip(arr / 65536.0, -32768.0, 32767.0).astype(np.int16)
+    elif orig_dtype == np.uint8:
+        arr = np.clip((arr - 128.0) * 256.0, -32768.0, 32767.0).astype(np.int16)
+    elif orig_dtype == np.int8:
+        arr = np.clip(arr * 256.0, -32768.0, 32767.0).astype(np.int16)
+    elif orig_dtype == np.uint16:
+        arr = np.clip(arr - 32768.0, -32768.0, 32767.0).astype(np.int16)
+    elif arr.dtype != np.int16:
+        arr = np.clip(arr, -32768, 32767).astype(np.int16)
+    num_frames = arr.shape[0] // hop_size
+    if num_frames <= 0:
+        return np.empty((0, hop_size), dtype=np.int16), arr
+    frames = np.ascontiguousarray(arr[:num_frames * hop_size], dtype=np.int16).reshape(num_frames, hop_size)
+    return frames, arr
+
+
+def _segments_from_flags(flags, min_silent_frames, max_speech_frames=None):
+    """Run speech/silence state machine over a sequence of 0/1 speech flags."""
+    segments = []
+    triggered = False
+    speech_start_frame = 0
+    silence_frame_count = 0
+
+    for i, is_speech in enumerate(flags):
+        if triggered:
+            if is_speech == 1:
+                silence_frame_count = 0
+            else:
+                silence_frame_count += 1
+
+            is_silence_timeout = silence_frame_count >= min_silent_frames
+            is_max_timeout = (
+                max_speech_frames is not None
+                and (i - speech_start_frame) >= max_speech_frames
+            )
+
+            if is_silence_timeout or is_max_timeout:
+                end_frame = i if is_max_timeout else i - silence_frame_count
+                segments.append([speech_start_frame, end_frame])
+                triggered = False
+                silence_frame_count = 0
+        else:
+            if is_speech == 1:
+                triggered = True
+                speech_start_frame = i
+                silence_frame_count = 0
+
+    if triggered:
+        end_frame = len(flags) - silence_frame_count
+        segments.append([speech_start_frame, end_frame])
+
+    return segments
+
+
 def get_speech_timestamp(input_wav=None,
                          threshold=None,
                          min_speech_duration_ms=None,
@@ -82,6 +145,10 @@ def get_speech_timestamp(input_wav=None,
     frame_duration_ms = (hop_size / sr) * 1000.0
 
     # Normalize parameters
+    if threshold is None:
+        threshold = 0.5
+    else:
+        threshold = float(threshold)
     min_speech_duration_ms = int(max(500, min_speech_duration_ms if min_speech_duration_ms else 1000))
     min_silent_duration_ms = int(max(50, min_silent_duration_ms if min_silent_duration_ms else 200))
     if max_speech_duration_ms is None:
@@ -90,8 +157,13 @@ def get_speech_timestamp(input_wav=None,
     logger.debug(
         f'[Ten-VAD]: Segmentation params: {threshold=},{min_speech_duration_ms=}ms,{max_speech_duration_ms=}ms,{min_silent_duration_ms=}ms')
 
-    # Energy-adaptive threshold
-    audio_energy = np.mean(np.abs(data)) if len(data) > 0 else 0
+    frames, mono_pcm = _prepare_pcm_frames(data, hop_size=hop_size)
+    num_frames = frames.shape[0]
+    if num_frames <= 0:
+        return False, None
+
+    # Energy-adaptive threshold (cast to int32 to avoid int16 -32768 overflow)
+    audio_energy = float(np.mean(np.abs(mono_pcm.astype(np.int32)))) if mono_pcm.size > 0 else 0.0
     adjusted_threshold = threshold
     if audio_energy > 10000:
         adjusted_threshold = max(threshold * 1.2, 0.3)
@@ -100,17 +172,31 @@ def get_speech_timestamp(input_wav=None,
 
     logger.debug(f'[Ten-VAD] Audio energy: {audio_energy}, adjusted threshold: {adjusted_threshold}')
 
-    # --- Initial VAD detection (no max limit to allow natural segmentation) ---
+    # --- Single-pass TenVad inference over contiguous frames ---
     min_sil_frames = max(1, int(min_silent_duration_ms / frame_duration_ms))
-    initial_segments = _detect_raw_segments(data, adjusted_threshold, min_sil_frames, max_speech_frames=None)
+    ten_vad_instance = TenVad(hop_size, adjusted_threshold)
+    probs = np.empty(num_frames, dtype=np.float64)
+    flags = np.empty(num_frames, dtype=np.uint8)
+    for i in range(num_frames):
+        prob, is_speech = ten_vad_instance.process(frames[i])
+        probs[i] = float(prob)
+        flags[i] = 1 if is_speech == 1 else 0
+
+    initial_segments = _segments_from_flags(flags.tolist(), min_sil_frames, max_speech_frames=None)
 
     if not initial_segments:
         # Completely no speech detected
         return False, None
 
+    # Verify prob/flag consistency so mocked TenVad instances with dummy probs fall back safely
+    can_reuse_probs = bool(
+        np.all((probs >= float(np.float32(adjusted_threshold))) == (flags == 1))
+    ) and (float(probs.max()) > 0.0 or not np.any(flags))
+
     # --- Process overlong segments ---
     # Use recursion queue to find micro-pauses; fallback to minimum energy cut
-    max_speech_frames = int(max_speech_duration_ms / frame_duration_ms)
+    max_speech_frames = max(1, int(max_speech_duration_ms / frame_duration_ms))
+    min_speech_frames = max(1, int(min_speech_duration_ms / frame_duration_ms))
     segments_ms = []
     chunk_queue = [list(seg) for seg in initial_segments]
 
@@ -123,7 +209,6 @@ def get_speech_timestamp(input_wav=None,
             continue
 
         # Exceeds max duration, attempt to find breathing points / micro-pauses
-        sub_data = data[s_frame * hop_size : e_frame * hop_size]
         sub_segs = []
         # Try 3 tiers: standard silence -> half silence -> ultra-short silence (~30ms)
         test_conditions = [
@@ -131,15 +216,26 @@ def get_speech_timestamp(input_wav=None,
             (0.5, 1.2),                     # Half silence duration, slightly stricter threshold
             (max(30 / min_silent_duration_ms, 0.2), 1.5)  # ~30ms, stricter threshold
         ]
-        
+
         for sil_ratio, thresh_mult in test_conditions:
             test_sil_frames = max(1, int((min_silent_duration_ms * sil_ratio) / frame_duration_ms))
             test_thresh = min(adjusted_threshold * thresh_mult, 0.9)
-            
-            temp_segs = _detect_raw_segments(
-                sub_data, test_thresh, test_sil_frames,
-                max_speech_frames=max_speech_frames   # Pass max frame limit to prevent sub-segments from being overlong
-            )
+
+            if can_reuse_probs:
+                sub_flags = (
+                    flags[s_frame:e_frame]
+                    if test_thresh == adjusted_threshold
+                    else (probs[s_frame:e_frame] >= float(np.float32(test_thresh))).astype(np.uint8)
+                )
+                temp_segs = _segments_from_flags(
+                    sub_flags.tolist(), test_sil_frames, max_speech_frames=max_speech_frames
+                )
+            else:
+                sub_data = frames[s_frame:e_frame].ravel()
+                temp_segs = _detect_raw_segments(
+                    sub_data, test_thresh, test_sil_frames,
+                    max_speech_frames=max_speech_frames
+                )
             if len(temp_segs) > 1:
                 max_sub_dur = max((se - ss) for ss, se in temp_segs)
                 if max_sub_dur < dur_frames:  # Successfully shortened
@@ -151,17 +247,28 @@ def get_speech_timestamp(input_wav=None,
             chunk_queue = new_chunks + chunk_queue
         else:
             # Ultimate fallback: find minimum energy point in safety zone to cut
-            # Safety zone is between 50% and 100% of max duration
-            search_start = int(max_speech_frames * 0.5)
-            search_end = min(max_speech_frames, dur_frames)
-            
-            if search_end > search_start:
-                energies = [np.sum(np.abs(sub_data[i * hop_size : (i+1) * hop_size]))
-                            for i in range(search_start, search_end)]
-                best_cut_idx = search_start + np.argmin(energies)
+            # Keep both halves >= min_speech_frames when dur_frames >= 2 * min_speech_frames
+            half_max = max(1, int(max_speech_frames * 0.5))
+            if dur_frames >= 2 * min_speech_frames and max_speech_frames >= min_speech_frames:
+                search_start = max(half_max, min_speech_frames)
+                search_end = min(max_speech_frames, dur_frames - min_speech_frames)
+                if search_end > search_start:
+                    window = frames[s_frame + search_start : s_frame + search_end]
+                    energies = np.abs(window.astype(np.int32)).sum(axis=1)
+                    best_cut_idx = search_start + int(np.argmin(energies))
+                else:
+                    best_cut_idx = min(max_speech_frames, max(min_speech_frames, dur_frames // 2))
             else:
-                best_cut_idx = max_speech_frames
-                
+                search_start = min(half_max, max(1, dur_frames - 1))
+                search_end = min(max_speech_frames, dur_frames)
+                if search_end > search_start:
+                    window = frames[s_frame + search_start : s_frame + search_end]
+                    energies = np.abs(window.astype(np.int32)).sum(axis=1)
+                    best_cut_idx = search_start + int(np.argmin(energies))
+                else:
+                    best_cut_idx = min(max_speech_frames, max(1, dur_frames // 2))
+
+            best_cut_idx = max(1, min(best_cut_idx, dur_frames - 1))
             cut_point = s_frame + best_cut_idx
             # Place latter half first, then former half, to ensure chronological processing
             chunk_queue.insert(0, [cut_point, e_frame])
@@ -170,11 +277,12 @@ def get_speech_timestamp(input_wav=None,
     logger.debug(f'[Ten-VAD] Initial segmentation and overlong processing took {int(time.time() - st_)}s')
 
     # --- Short segment merging ---
-    # Ensure all segment durations >= min_speech_duration_ms
+    # Merge short segments into neighbors ONLY when combined span <= max_speech_duration_ms
     segs = [seg.copy() for seg in segments_ms]
     # Filter out invalid segments (start >= end)
     segs = [[int(max(0, s)), int(max(0, e))] for s, e in segs if e > s]
-    
+    max_merged_span_ms = int(max_speech_duration_ms)
+
     # Merging algorithm: using stack, dynamically check if stack top segment is too short
     merged = []
     for seg in segs:
@@ -183,31 +291,28 @@ def get_speech_timestamp(input_wav=None,
             continue
         # Check if top segment of stack is too short
         while merged and (merged[-1][1] - merged[-1][0]) < min_speech_duration_ms:
-            # Top segment is short, must merge with current seg
-            prev = merged.pop()
-            # Merge into current seg (forward merge)
-            seg[0] = prev[0]
-            # If stack is non-empty and gap is small, consider merging; here we absorb prev into seg
+            if (seg[1] - merged[-1][0]) <= max_merged_span_ms:
+                prev = merged.pop()
+                seg[0] = prev[0]
+            else:
+                break
         # Now check if current seg itself is too short
         if (seg[1] - seg[0]) < min_speech_duration_ms:
-            if merged:
-                # Check whether merging to previous is better or deferring to later
-                # Merge directly to previous since deferring may still require merge
+            if merged and (seg[1] - merged[-1][0]) <= max_merged_span_ms:
                 merged[-1][1] = seg[1]
             else:
-                # First segment itself is short, hold temporarily
                 merged.append(seg)
         else:
             merged.append(seg)
-    
-    # Handle potentially remaining short segment at stack top (retained since no subsequent segments exist)
-    # Or retain if it is the only segment
+
     _vail_segments = []
     for s, e in merged:
-        if e > s and s>=0:
-            # Ensure non-negative and valid timestamps again
+        if e > s and s >= 0:
             _vail_segments.append([max(0, s), max(0, e)])
-            
+
+    if not _vail_segments:
+        return False, None
+
     logger.debug(f'[Ten-VAD] Segmentation and merging total time: {int(time.time() - st_)}s')
     return _vail_segments, None
 
@@ -217,54 +322,20 @@ def _detect_raw_segments(data, threshold, min_silent_frames, max_speech_frames=N
     Internal VAD detection.
     """
     hop_size = 256
+    if threshold is None:
+        threshold = 0.5
+    frames, _ = _prepare_pcm_frames(data, hop_size=hop_size)
+    num_frames = frames.shape[0]
+    if num_frames <= 0:
+        return []
+
     ten_vad_instance = TenVad(hop_size, threshold)
-
-    if len(data.shape) > 1:
-        data = np.mean(data, axis=1)
-
-    # Performance optimization: one-time type cast
-    if data.dtype != np.int16:
-        data = data.astype(np.int16)
-
-    num_frames = (data.shape[0] - hop_size) // hop_size + 1
-    segments = []
-    triggered = False
-    speech_start_frame = 0
-    silence_frame_count = 0
-
+    flags = [0] * num_frames
     for i in range(num_frames):
-        audio_frame = data[i * hop_size: (i + 1) * hop_size]
-        if len(audio_frame) != hop_size:
-            continue
+        _, is_speech = ten_vad_instance.process(frames[i])
+        flags[i] = 1 if is_speech == 1 else 0
 
-        _, is_speech = ten_vad_instance.process(audio_frame)
-
-        if triggered:
-            if is_speech == 1:
-                silence_frame_count = 0
-            else:
-                silence_frame_count += 1
-
-            is_silence_timeout = silence_frame_count >= min_silent_frames
-            is_max_timeout = (max_speech_frames is not None and 
-                              (i - speech_start_frame) >= max_speech_frames)
-
-            if is_silence_timeout or is_max_timeout:
-                end_frame = i if is_max_timeout else i - silence_frame_count
-                segments.append([speech_start_frame, end_frame])
-                triggered = False
-                silence_frame_count = 0
-        else:
-            if is_speech == 1:
-                triggered = True
-                speech_start_frame = i
-                silence_frame_count = 0
-
-    if triggered:
-        end_frame = num_frames - silence_frame_count
-        segments.append([speech_start_frame, end_frame])
-
-    return segments
+    return _segments_from_flags(flags, min_silent_frames, max_speech_frames=max_speech_frames)
 
 def get_speech_timestamp0(input_wav=None,
                          threshold=None,

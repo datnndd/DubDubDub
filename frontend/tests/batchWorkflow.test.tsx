@@ -9,6 +9,7 @@ import { StatusFooter } from '../src/components/StatusFooter';
 import { ProjectsScreen } from '../src/screens/ProjectsScreen';
 import { Header } from '../src/components/Header';
 import { Stage3VoiceDubbing } from '../src/screens/Stage3VoiceDubbing';
+import { formatLocalDateYmd } from '../src/utils/date';
 
 describe('Batch Video Workflow & Multi-Video Session', () => {
   beforeEach(() => {
@@ -213,7 +214,7 @@ describe('Batch Video Workflow & Multi-Video Session', () => {
   });
 
   test('ProjectsScreen renders Date Parent Project containers with subprojects grouped inside', () => {
-    const today = new Date().toISOString().split('T')[0];
+    const today = formatLocalDateYmd();
     useDubDubStore.setState({
       projectsList: [
         {
@@ -262,7 +263,7 @@ describe('Batch Video Workflow & Multi-Video Session', () => {
 
   test('openDateParentSession loads subprojects into sessionSubprojects and transitions to dubbing view', async () => {
     const originalFetch = globalThis.fetch;
-    const today = new Date().toISOString().split('T')[0];
+    const today = formatLocalDateYmd();
     const parentId = `parent_${today}`;
     const subprojects = [
       { id: 'sub_1', name: 'clip_a.mp4', parent_id: parentId, stage: 1, status: 'pending' },

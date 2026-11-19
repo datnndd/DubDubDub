@@ -47,16 +47,22 @@ def extract_ocr_segment_text(
         ffmpeg_exe = FFMPEG_BIN or getattr(runtime_config, "FFMPEG_BIN", None) or runtime_config.settings.get("ffmpeg_cmd") or "ffmpeg"
     except ImportError:
         ffmpeg_exe = getattr(runtime_config, "FFMPEG_BIN", None) or runtime_config.settings.get("ffmpeg_cmd") or "ffmpeg"
-    from videotrans.ocr import PADDLE_OCR, crop_roi, get_provider
-    from videotrans.ocr._frame_source import frame_at
-    from videotrans.ocr._text import representative_text
+    from videotrans import ocr as ocr_pkg
+    from videotrans.ocr import PADDLE_OCR, crop_roi
+    from videotrans.ocr._frame_source import frame_at, sampled_roi_iter
+    from videotrans.ocr._scanner import _roi_signature, _sig_is_static
+    from videotrans.ocr._text import join_ordered_lines, order_lines, representative_text
 
     if isinstance(roi, dict):
+        rx = roi.get("x")
+        ry = roi.get("y")
+        rw = roi.get("width") if roi.get("width") is not None else roi.get("w")
+        rh = roi.get("height") if roi.get("height") is not None else roi.get("h")
         roi_tuple = (
-            float(roi.get("x", 0.0)),
-            float(roi.get("y", 0.0)),
-            float(roi.get("width", roi.get("w", 1.0))),
-            float(roi.get("height", roi.get("h", 1.0))),
+            float(0.0 if rx is None else rx),
+            float(0.0 if ry is None else ry),
+            float(1.0 if rw is None else rw),
+            float(1.0 if rh is None else rh),
         )
     elif isinstance(roi, (list, tuple)) and len(roi) == 4:
         roi_tuple = (float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3]))
@@ -94,9 +100,55 @@ def extract_ocr_segment_text(
     successful_ocr_calls = 0
     first_ocr_error: Exception | None = None
     provider = None
-    for ts in sample_times:
-        frame, w, h = None, 0, 0
-        if frame_fetcher is not None:
+
+    def _run_ocr_on_crop(ts: int, cropped: Any) -> float | None:
+        nonlocal successful_ocr_calls, first_ocr_error, provider
+        try:
+            if ocr_runner is not None:
+                ocr_res = ocr_runner(cropped)
+            else:
+                if provider is None:
+                    provider = ocr_pkg.get_cached_provider(provider=PADDLE_OCR)
+                ocr_res = provider.recognize(cropped, language)
+            successful_ocr_calls += 1
+
+            frame_text = ""
+            frame_conf = 0.0
+            if ocr_res:
+                if isinstance(ocr_res, list):
+                    non_empty = [
+                        x for x in ocr_res
+                        if str(x.get("text") if isinstance(x, dict) else getattr(x, "text", x) or "").strip()
+                    ]
+                    ordered = order_lines(non_empty)
+                    frame_text = join_ordered_lines(ordered, paragraph_mode="preserve_lines")
+                    confs = [
+                        float(x.get("confidence") if isinstance(x, dict) else getattr(x, "confidence", 0.0) or 0.0)
+                        for x in ordered
+                    ]
+                    frame_conf = sum(confs) / len(confs) if confs else 0.0
+                    if frame_text:
+                        observations.append((frame_text, frame_conf))
+                elif isinstance(ocr_res, dict):
+                    observations.append(ocr_res)
+                    frame_text = str(ocr_res.get("text") or "").strip()
+                    frame_conf = float(ocr_res.get("confidence") or 0.0)
+                elif getattr(ocr_res, "text", None):
+                    observations.append(ocr_res)
+                    frame_text = str(getattr(ocr_res, "text", "") or "").strip()
+                    frame_conf = float(getattr(ocr_res, "confidence", 0.0) or 0.0)
+
+            builder.observe(ts, OcrResult(text=frame_text, confidence=frame_conf))
+            return frame_conf
+        except Exception as exc:
+            if first_ocr_error is None:
+                first_ocr_error = exc
+            runtime_config.logger.debug(f"OCR frame error at {ts}ms: {exc}")
+            return None
+
+    if frame_fetcher is not None:
+        for ts in sample_times:
+            frame, w, h = None, 0, 0
             try:
                 res = frame_fetcher(media_path, ts / 1000.0)
             except TypeError:
@@ -111,53 +163,61 @@ def extract_ocr_segment_text(
                     w, h = frame.size[:2]
                 else:
                     w, h = 0, 0
-        else:
-            frame, w, h = frame_at(ffmpeg_exe, str(media_path), ts, end_ms=end_ms)
-        if frame is None or w <= 0 or h <= 0:
-            continue
-        decoded_frames += 1
-        try:
-            cropped = crop_roi(frame, roi_tuple)
-        except Exception as exc:
-            raise RuntimeError(f"Could not crop the selected video region: {exc}") from exc
-        if cropped is None:
-            if ocr_runner is not None and (hasattr(frame, "shape") or hasattr(frame, "size")):
-                cropped = frame
-            else:
-                raise RuntimeError("The selected OCR region contains no video pixels")
-        try:
-            if ocr_runner is not None:
-                ocr_res = ocr_runner(cropped)
-            else:
-                if provider is None:
-                    provider = get_provider(provider=PADDLE_OCR)
-                ocr_res = provider.recognize(cropped, language)
-            successful_ocr_calls += 1
+            if frame is None or w <= 0 or h <= 0:
+                continue
+            decoded_frames += 1
+            try:
+                cropped = crop_roi(frame, roi_tuple)
+            except Exception as exc:
+                raise RuntimeError(f"Could not crop the selected video region: {exc}") from exc
+            if cropped is None:
+                if ocr_runner is not None and (hasattr(frame, "shape") or hasattr(frame, "size")):
+                    cropped = frame
+                else:
+                    raise RuntimeError("The selected OCR region contains no video pixels")
+            _run_ocr_on_crop(ts, cropped)
+    else:
+        last_sig = None
+        last_conf = 0.0
+        step_idx = 0
+        for ts, cropped in sampled_roi_iter(
+            ffmpeg_exe,
+            str(media_path),
+            roi=roi_tuple,
+            coarse_interval_ms=step,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            duration_ms=end_ms,
+            max_roi_width=1280,
+        ):
+            if cropped is None:
+                continue
+            decoded_frames += 1
+            step_idx += 1
+            sig = _roi_signature(cropped)
+            needs_heartbeat = (step_idx % 20 == 0 and last_conf < 0.85)
+            if last_sig is not None and _sig_is_static(last_sig, sig) and not needs_heartbeat:
+                builder.on_dedup_skip(ts)
+                continue
+            conf_out = _run_ocr_on_crop(ts, cropped)
+            if conf_out is not None:
+                last_conf = conf_out
+                last_sig = sig
 
-            frame_text = ""
-            frame_conf = 0.0
-            if ocr_res:
-                if isinstance(ocr_res, list):
-                    observations.extend(ocr_res)
-                    texts = [str(x.get("text") if isinstance(x, dict) else getattr(x, "text", x) or "").strip() for x in ocr_res]
-                    texts = [t for t in texts if t]
-                    frame_text = " ".join(texts)
-                    confs = [float(x.get("confidence") if isinstance(x, dict) else getattr(x, "confidence", 0.0) or 0.0) for x in ocr_res]
-                    frame_conf = sum(confs) / len(confs) if confs else 0.0
-                elif isinstance(ocr_res, dict):
-                    observations.append(ocr_res)
-                    frame_text = str(ocr_res.get("text") or "").strip()
-                    frame_conf = float(ocr_res.get("confidence") or 0.0)
-                elif getattr(ocr_res, "text", None):
-                    observations.append(ocr_res)
-                    frame_text = str(getattr(ocr_res, "text", "") or "").strip()
-                    frame_conf = float(getattr(ocr_res, "confidence", 0.0) or 0.0)
-
-            builder.observe(ts, OcrResult(text=frame_text, confidence=frame_conf))
-        except Exception as exc:
-            if first_ocr_error is None:
-                first_ocr_error = exc
-            runtime_config.logger.debug(f"OCR frame error at {ts}ms: {exc}")
+        if decoded_frames == 0:
+            frame, w, h = frame_at(ffmpeg_exe, str(media_path), start_ms, end_ms=end_ms)
+            if frame is not None and w > 0 and h > 0:
+                decoded_frames += 1
+                try:
+                    cropped = crop_roi(frame, roi_tuple)
+                except Exception as exc:
+                    raise RuntimeError(f"Could not crop the selected video region: {exc}") from exc
+                if cropped is None:
+                    if ocr_runner is not None and (hasattr(frame, "shape") or hasattr(frame, "size")):
+                        cropped = frame
+                    else:
+                        raise RuntimeError("The selected OCR region contains no video pixels")
+                _run_ocr_on_crop(start_ms, cropped)
 
     if decoded_frames == 0:
         raise RuntimeError("No video frames could be decoded for this segment")

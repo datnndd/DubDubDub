@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator, Optional
@@ -15,9 +17,10 @@ logger = logging.getLogger("videotrans.db")
 
 DEFAULT_DB_PATH = Path(os.environ.get("DB_PATH", Path(ROOT_DIR) / "projects.db"))
 _current_db_path: Path = DEFAULT_DB_PATH
+_DB_INIT_LOCK = threading.RLock()
+_WAL_INITIALIZED: set[str] = set()
 
 _BASE_SCHEMA = """
-PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -108,16 +111,46 @@ def get_db_path() -> Path:
     return _current_db_path
 
 
+def _ensure_wal_mode(conn: sqlite3.Connection, key: str) -> None:
+    with _DB_INIT_LOCK:
+        if key in _WAL_INITIALIZED:
+            return
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+        cur_mode = str(row[0]).lower() if row and row[0] is not None else ""
+        if cur_mode == "wal":
+            _WAL_INITIALIZED.add(key)
+            return
+        last_err: Exception | None = None
+        for attempt in range(5):
+            try:
+                res = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                if res and str(res[0]).lower() == "wal":
+                    _WAL_INITIALIZED.add(key)
+                    return
+            except sqlite3.OperationalError as exc:
+                last_err = exc
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+        if last_err is not None:
+            raise last_err
+
+
 def get_db(db_path: Optional[str | Path] = None) -> sqlite3.Connection:
-    """Open a SQLite connection configured with WAL mode, foreign keys, and busy timeout."""
+    """Open a SQLite connection configured with busy timeout, foreign keys, NORMAL sync, and WAL mode."""
     target_path = Path(db_path) if db_path is not None else _current_db_path
-    if str(target_path) != ":memory:":
+    is_memory = str(target_path) == ":memory:"
+    if not is_memory:
         target_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(target_path), timeout=5.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    if not is_memory:
+        key = str(target_path.resolve())
+        if key not in _WAL_INITIALIZED:
+            _ensure_wal_mode(conn, key)
     return conn
 
 
@@ -140,11 +173,27 @@ def db_conn(db_path: Optional[str | Path] = None) -> Generator[sqlite3.Connectio
 
 def init_db(db_path: Optional[str | Path] = None) -> None:
     """Initialize database tables and indexes idempotently."""
-    with db_conn(db_path) as conn:
-        conn.executescript(_BASE_SCHEMA)
-        # Check and migrate existing projects table if parent_id is missing
-        cols = [r["name"] for r in conn.execute("PRAGMA table_info(projects)").fetchall()]
-        if "parent_id" not in cols:
-            conn.execute("ALTER TABLE projects ADD COLUMN parent_id TEXT")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_parent ON projects(parent_id)")
+    target_path = Path(db_path) if db_path is not None else _current_db_path
+    with _DB_INIT_LOCK:
+        if str(target_path) != ":memory:" and not target_path.exists():
+            _WAL_INITIALIZED.discard(str(target_path.resolve()))
+        last_err: Exception | None = None
+        for attempt in range(5):
+            try:
+                with db_conn(db_path) as conn:
+                    conn.executescript(_BASE_SCHEMA)
+                    # Check and migrate existing projects table if parent_id is missing
+                    cols = [r["name"] for r in conn.execute("PRAGMA table_info(projects)").fetchall()]
+                    if "parent_id" not in cols:
+                        conn.execute("ALTER TABLE projects ADD COLUMN parent_id TEXT")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_parent ON projects(parent_id)")
+                break
+            except sqlite3.OperationalError as exc:
+                last_err = exc
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+        else:
+            if last_err is not None:
+                raise last_err
     logger.debug("Database initialized at %s", db_path or _current_db_path)

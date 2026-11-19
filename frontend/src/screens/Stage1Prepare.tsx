@@ -20,8 +20,11 @@ import {
   FileVideo,
   FolderTree,
   ListFilter,
+  Crop,
+  FileText,
 } from 'lucide-react';
 import { ProviderDocLink } from '../components/ProviderDocLink';
+import { normalizePointerPoint, roiFromDrag } from '../components/Stage2OcrDialog';
 
 export const Stage1Prepare: React.FC = () => {
   const help = {
@@ -43,6 +46,10 @@ export const Stage1Prepare: React.FC = () => {
     extra: 'Optional advanced Deepgram settings. Leave blank for the standard behavior.',
   };
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const dragStartRef = useRef<[number, number] | null>(null);
+  const [dragRoi, setDragRoi] = useState<[number, number, number, number] | null>(null);
+  const [videoCurrentTime, setVideoCurrentTime] = useState(0);
   const [isDragOver, setIsDragOver] = useState(false);
   const [isDeepgramModalOpen, setIsDeepgramModalOpen] = useState(false);
 
@@ -55,6 +62,11 @@ export const Stage1Prepare: React.FC = () => {
   const jobStage = useDubDubStore((s) => s.jobStage);
   const jobMessage = useDubDubStore((s) => s.jobMessage);
   const elapsedSeconds = useDubDubStore((s) => s.elapsedSeconds);
+  const subtitleSource = useDubDubStore((s) => s.subtitleSource || 'audio_asr');
+  const ocrCrop = useDubDubStore((s) => s.ocrCrop);
+  const ocrRoiConfirmed = useDubDubStore((s) => Boolean(s.ocrRoiConfirmed));
+  const ocrOptions = useDubDubStore((s) => s.ocrOptions || { coarseIntervalMs: 500, useAngleCls: false, paragraphMode: 'preserve_lines' });
+  const stage1OcrTest = useDubDubStore((s) => s.stage1OcrTest || { loading: false, error: null, text: null });
   const selectMedia = useDubDubStore((s) => s.selectMedia);
   const updateSourceLanguage = useDubDubStore((s) => s.updateSourceLanguage);
   const updateTargetLanguage = useDubDubStore((s) => s.updateTargetLanguage);
@@ -63,6 +75,11 @@ export const Stage1Prepare: React.FC = () => {
   const updateUseCuda = useDubDubStore((s) => s.updateUseCuda);
   const updateEngineConfig = useDubDubStore((s) => s.updateEngineConfig);
   const updateDeepgramOptions = useDubDubStore((s) => s.updateDeepgramOptions);
+  const setSubtitleSource = useDubDubStore((s) => s.setSubtitleSource);
+  const setOcrCropRoi = useDubDubStore((s) => s.setOcrCropRoi);
+  const setOcrRoiConfirmed = useDubDubStore((s) => s.setOcrRoiConfirmed);
+  const updateOcrOptions = useDubDubStore((s) => s.updateOcrOptions);
+  const testStage1OcrFrame = useDubDubStore((s) => s.testStage1OcrFrame);
   const cancelActiveJob = useDubDubStore((s) => s.cancelActiveJob);
   const openSettings = useDubDubStore((s) => s.openSettings);
   const sessionSubprojects = useDubDubStore((s) => s.sessionSubprojects || []);
@@ -74,6 +91,18 @@ export const Stage1Prepare: React.FC = () => {
   const isAnalyzing = backend.status === 'analyzing';
   const isRunning = jobStatus === 'running';
   const isFailed = jobStatus === 'failed';
+  const isVideoOcr = subtitleSource === 'video_ocr';
+  const roi: [number, number, number, number] = ocrCrop?.roi || [0.05, 0.75, 0.9, 0.2];
+  const visibleRoi = dragRoi ?? roi;
+
+  const changeRoiCoordinate = (index: number, percent: number) => {
+    if (!Number.isFinite(percent)) return;
+    const next = [...roi] as [number, number, number, number];
+    next[index] = Math.max(0, Math.min(1, percent / 100));
+    if (next[0] + next[2] > 1) next[index === 0 ? 2 : 0] = 1 - next[index === 0 ? 0 : 2];
+    if (next[1] + next[3] > 1) next[index === 1 ? 3 : 1] = 1 - next[index === 1 ? 1 : 3];
+    setOcrCropRoi(next);
+  };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -181,8 +210,17 @@ export const Stage1Prepare: React.FC = () => {
 
             <div className="flex items-center gap-2">
               <div className="flex items-center gap-1.5 font-mono text-[10px] text-stone-600 mr-1">
-                <span className={`w-2 h-2 rounded-full ${project.hasAudio ? 'bg-emerald-500' : 'bg-amber-500'}`} />
-                <span>{project.hasAudio ? `Audio: ${project.audioCodec}` : 'No verified audio stream'}</span>
+                {isVideoOcr ? (
+                  <>
+                    <span className={`w-2 h-2 rounded-full ${project.hasVideo ? 'bg-emerald-500' : 'bg-amber-500'}`} />
+                    <span>{project.hasVideo ? 'Video Ready for OCR (Audio optional)' : 'Video OCR Mode (Audio optional)'}</span>
+                  </>
+                ) : (
+                  <>
+                    <span className={`w-2 h-2 rounded-full ${project.hasAudio ? 'bg-emerald-500' : 'bg-amber-500'}`} />
+                    <span>{project.hasAudio ? `Audio: ${project.audioCodec}` : 'No verified audio stream'}</span>
+                  </>
+                )}
               </div>
               <button
                 type="button"
@@ -218,13 +256,66 @@ export const Stage1Prepare: React.FC = () => {
             }}
           >
             {project.previewUrl ? (
-              <video
-                data-source-preview="true"
-                className="w-full h-full object-contain bg-black max-h-[500px]"
-                src={project.previewUrl}
-                controls
-                preload="metadata"
-              />
+              <div className="relative inline-block max-w-full max-h-[500px]">
+                <video
+                  ref={videoRef}
+                  data-source-preview="true"
+                  className="block max-w-full max-h-[500px] bg-black"
+                  src={project.previewUrl}
+                  controls
+                  preload="metadata"
+                  onTimeUpdate={(e) => setVideoCurrentTime(e.currentTarget.currentTime)}
+                />
+                {isVideoOcr && (
+                  <>
+                    <div
+                      data-testid="ocr-roi-drag-layer"
+                      className="absolute inset-x-0 top-0 bottom-10 cursor-crosshair touch-none select-none"
+                      onPointerDown={(event) => {
+                        const bounds = videoRef.current?.getBoundingClientRect();
+                        const pt = normalizePointerPoint(event.clientX, event.clientY, bounds);
+                        if (!pt) return;
+                        dragStartRef.current = pt;
+                        event.currentTarget.setPointerCapture?.(event.pointerId);
+                      }}
+                      onPointerMove={(event) => {
+                        if (!dragStartRef.current) return;
+                        const bounds = videoRef.current?.getBoundingClientRect();
+                        const pt = normalizePointerPoint(event.clientX, event.clientY, bounds);
+                        if (!pt) return;
+                        const next = roiFromDrag(dragStartRef.current, pt);
+                        if (next[2] > 0.01 && next[3] > 0.01) setDragRoi(next);
+                      }}
+                      onPointerUp={(event) => {
+                        if (dragStartRef.current) {
+                          const bounds = videoRef.current?.getBoundingClientRect();
+                          const pt = normalizePointerPoint(event.clientX, event.clientY, bounds);
+                          if (pt) {
+                            const next = roiFromDrag(dragStartRef.current, pt);
+                            if (next[2] > 0.01 && next[3] > 0.01) setOcrCropRoi(next);
+                          }
+                        }
+                        dragStartRef.current = null;
+                        setDragRoi(null);
+                      }}
+                      onPointerCancel={() => {
+                        dragStartRef.current = null;
+                        setDragRoi(null);
+                      }}
+                    />
+                    <div
+                      data-testid="ocr-roi-overlay"
+                      className="absolute border-2 border-amber-400 bg-amber-300/20 pointer-events-none"
+                      style={{
+                        left: `${visibleRoi[0] * 100}%`,
+                        top: `${visibleRoi[1] * 100}%`,
+                        width: `${visibleRoi[2] * 100}%`,
+                        height: `${visibleRoi[3] * 100}%`,
+                      }}
+                    />
+                  </>
+                )}
+              </div>
             ) : (
               <div className="flex flex-col items-center justify-center gap-3 p-8 text-center select-none max-w-sm">
                 <div
@@ -294,7 +385,7 @@ export const Stage1Prepare: React.FC = () => {
                 <div className="flex items-center justify-between font-bold text-xs text-[#8D4B00]">
                   <span className="flex items-center gap-1.5">
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    <span>Stage: {jobStage || 'Transcribing Speech'}</span>
+                    <span>Stage: {jobStage || (isVideoOcr ? 'Extracting Video Subtitles' : 'Transcribing Speech')}</span>
                   </span>
                   <div className="flex items-center gap-1.5 font-mono text-[11px]">
                     <span className="px-1.5 py-0.5 rounded bg-amber-200/70 text-[#8D4B00] font-bold">
@@ -312,7 +403,7 @@ export const Stage1Prepare: React.FC = () => {
                 </div>
 
                 <div className="flex items-center justify-between text-[11px] text-stone-600 font-mono">
-                  <span className="truncate pr-2">{jobMessage || 'Processing audio stream with Deepgram ASR...'}</span>
+                  <span className="truncate pr-2">{jobMessage || (isVideoOcr ? 'Running Hard-Subtitle Video OCR...' : 'Processing audio stream with Deepgram ASR...')}</span>
                   <button
                     type="button"
                     onClick={() => cancelActiveJob()}
@@ -332,7 +423,7 @@ export const Stage1Prepare: React.FC = () => {
                 <div className="flex-1 min-w-0">
                   <div className="font-bold text-xs text-rose-800">Processing Failed</div>
                   <div className="text-[11px] text-rose-700 mt-0.5 leading-snug">{jobMessage}</div>
-                  {selectedProvider.requiresSettings && !selectedProvider.configured && (
+                  {!isVideoOcr && selectedProvider.requiresSettings && !selectedProvider.configured && (
                     <button
                       type="button"
                       onClick={() => openSettings('providers', String(selectedProvider.id || ''))}
@@ -393,7 +484,13 @@ export const Stage1Prepare: React.FC = () => {
             <div className="mt-auto p-2 rounded-lg bg-amber-50/50 border border-amber-200/50 text-[11px] text-stone-600 flex items-start gap-1.5">
               <Sparkles className="w-3.5 h-3.5 text-[#8D4B00] shrink-0 mt-0.5" />
               <span>
-                {project.verified
+                {isVideoOcr
+                  ? !project.verified
+                    ? 'Upload a video to draw the subtitle ROI and run Test Frame OCR.'
+                    : ocrRoiConfirmed
+                    ? 'ROI confirmed — ready for Hard-Subtitle Video OCR.'
+                    : 'Draw subtitle ROI on the video and run Test Frame OCR to confirm.'
+                  : project.verified
                   ? `Ready for automated speech recognition with ${selectedProvider.label}.`
                   : 'Upload video to verify audio tracks and enable transcription.'}
               </span>
@@ -472,124 +569,310 @@ export const Stage1Prepare: React.FC = () => {
           </div>
         </div>
 
-        {/* 2. ASR Speech Recognition Engine (4 cols) */}
+        {/* 2. Subtitle Source & ASR / Video OCR Engine (4 cols) */}
         <div className="col-span-12 md:col-span-4 bg-white rounded-xl border border-[#E7E4DC] p-3.5 shadow-xs flex flex-col justify-between">
-          <div className="flex items-center justify-between mb-2.5">
+          <div className="flex items-center justify-between mb-2">
             <div className="flex items-center gap-1.5 font-bold text-xs text-stone-900">
-              <Mic className="w-3.5 h-3.5 text-[#8D4B00]" />
-              <span>ASR Engine</span>
+              {isVideoOcr ? (
+                <>
+                  <Crop className="w-3.5 h-3.5 text-[#8D4B00]" />
+                  <span>Hard-Subtitle Video OCR</span>
+                </>
+              ) : (
+                <>
+                  <Mic className="w-3.5 h-3.5 text-[#8D4B00]" />
+                  <span>ASR Engine</span>
+                </>
+              )}
             </div>
-            <div className="flex items-center gap-1.5">
-              {selectedProvider.requiresSettings && (
+            {!isVideoOcr && (
+              <div className="flex items-center gap-1.5">
+                {selectedProvider.requiresSettings && (
+                  <button
+                    type="button"
+                    onClick={() => openSettings('providers', String(selectedProvider.id || ''))}
+                    className={`px-2 py-0.5 rounded text-[9px] font-bold flex items-center gap-1 cursor-pointer transition-colors ${
+                      selectedProvider.configured
+                        ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                        : 'bg-amber-100 text-[#8D4B00] border border-amber-300 animate-pulse'
+                    }`}
+                  >
+                    <Key className="w-2.5 h-2.5" />
+                    <span>{selectedProvider.configured ? 'Key Set' : 'Key Needed'}</span>
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => openSettings('providers', String(selectedProvider.id || ''))}
-                  className={`px-2 py-0.5 rounded text-[9px] font-bold flex items-center gap-1 cursor-pointer transition-colors ${
-                    selectedProvider.configured
-                      ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                      : 'bg-amber-100 text-[#8D4B00] border border-amber-300 animate-pulse'
-                  }`}
+                  className="p-1 rounded text-stone-400 hover:text-stone-700 hover:bg-stone-100 transition-colors cursor-pointer"
+                  title="Configure Provider Settings"
                 >
-                  <Key className="w-2.5 h-2.5" />
-                  <span>{selectedProvider.configured ? 'Key Set' : 'Key Needed'}</span>
+                  <Settings2 className="w-3.5 h-3.5 text-[#8D4B00]" />
                 </button>
-              )}
-              <button
-                type="button"
-                onClick={() => openSettings('providers', String(selectedProvider.id || ''))}
-                className="p-1 rounded text-stone-400 hover:text-stone-700 hover:bg-stone-100 transition-colors cursor-pointer"
-                title="Configure Provider Settings"
-              >
-                <Settings2 className="w-3.5 h-3.5 text-[#8D4B00]" />
-              </button>
-            </div>
+              </div>
+            )}
           </div>
 
           <div className="space-y-2.5 flex-1">
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label title={help.provider} className="text-[10px] text-stone-500 font-semibold">
-                    Engine Provider
-                  </label>
-                  <ProviderDocLink providerId={backend.config.recognType} category="asr" />
-                </div>
-                <select
-                  title={help.provider}
-                  value={backend.config.recognType}
-                  onChange={(e) => {
-                    const p = options.asrProviders?.find((x: any) => x.recognType === Number(e.target.value));
-                    updateAsrProvider(Number(e.target.value), p?.models?.[0] || 'default');
-                  }}
-                  className="w-full text-xs font-semibold p-2 bg-stone-50 rounded-lg border border-stone-200 focus:bg-white focus:outline-none focus:border-amber-400"
+            <div data-testid="subtitle-source-selector">
+              <span className="text-[10px] text-stone-500 font-semibold block mb-1">
+                Subtitle Source
+              </span>
+              <div className="grid grid-cols-2 gap-1.5 p-1 rounded-lg bg-stone-100 border border-stone-200">
+                <button
+                  type="button"
+                  data-testid="subtitle-source-audio-asr"
+                  aria-pressed={!isVideoOcr}
+                  onClick={() => setSubtitleSource('audio_asr')}
+                  className={`px-2 py-1.5 rounded-md text-[11px] font-bold transition-colors cursor-pointer ${
+                    !isVideoOcr
+                      ? 'bg-white text-[#8D4B00] shadow-2xs border border-amber-200'
+                      : 'text-stone-600 hover:text-stone-900'
+                  }`}
                 >
-                  {(options.asrProviders || []).map((p: any) => (
-                    <option key={p.recognType} value={p.recognType}>
-                      {p.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label title={help.model} className="text-[10px] text-stone-500 font-semibold block mb-1">
-                  Model Variant
-                </label>
-                <select
-                  title={help.model}
-                  value={backend.config.modelName}
-                  onChange={(e) => updateAsrProvider(backend.config.recognType, e.target.value)}
-                  className="w-full text-xs font-semibold p-2 bg-stone-50 rounded-lg border border-stone-200 focus:bg-white focus:outline-none focus:border-amber-400"
+                  Audio Speech Recognition (ASR)
+                </button>
+                <button
+                  type="button"
+                  data-testid="subtitle-source-video-ocr"
+                  aria-pressed={isVideoOcr}
+                  onClick={() => setSubtitleSource('video_ocr')}
+                  className={`px-2 py-1.5 rounded-md text-[11px] font-bold transition-colors cursor-pointer ${
+                    isVideoOcr
+                      ? 'bg-white text-[#8D4B00] shadow-2xs border border-amber-200'
+                      : 'text-stone-600 hover:text-stone-900'
+                  }`}
                 >
-                  {(selectedProvider.models || []).map((m: string) => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </select>
+                  Hard-Subtitle Video OCR
+                </button>
               </div>
             </div>
 
-            {/* Deepgram Dedicated Parameters Bar */}
-            {isDeepgram && (
-              <div className="flex flex-col gap-2 pt-0.5">
-                <button
-                  type="button"
-                  data-testid="deepgram-options-btn"
-                  title={help.deepgram}
-                  onClick={() => setIsDeepgramModalOpen(true)}
-                  className="w-full py-1.5 px-2.5 rounded-lg border border-amber-300 bg-amber-50/70 hover:bg-amber-100 text-[#8D4B00] text-xs font-semibold flex items-center justify-between transition-colors cursor-pointer shadow-2xs"
-                >
-                  <div className="flex items-center gap-1.5">
-                    <Sliders className="w-3.5 h-3.5" />
-                    <span>Deepgram Parameters</span>
+            {!isVideoOcr ? (
+              <>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label title={help.provider} className="text-[10px] text-stone-500 font-semibold">
+                        Engine Provider
+                      </label>
+                      <ProviderDocLink providerId={backend.config.recognType} category="asr" />
+                    </div>
+                    <select
+                      title={help.provider}
+                      value={backend.config.recognType}
+                      onChange={(e) => {
+                        const p = options.asrProviders?.find((x: any) => x.recognType === Number(e.target.value));
+                        updateAsrProvider(Number(e.target.value), p?.models?.[0] || 'default');
+                      }}
+                      className="w-full text-xs font-semibold p-2 bg-stone-50 rounded-lg border border-stone-200 focus:bg-white focus:outline-none focus:border-amber-400"
+                    >
+                      {(options.asrProviders || []).map((p: any) => (
+                        <option key={p.recognType} value={p.recognType}>
+                          {p.label}
+                        </option>
+                      ))}
+                    </select>
                   </div>
-                  <span className="font-mono text-[10px] bg-amber-200/80 px-1.5 py-0.5 rounded font-bold">
-                    utt_split={backend.config.deepgramOptions?.utt_split ?? 0.8}s
-                  </span>
-                </button>
 
-                {/* Inline Quick Switches for Deepgram */}
+                  <div>
+                    <label title={help.model} className="text-[10px] text-stone-500 font-semibold block mb-1">
+                      Model Variant
+                    </label>
+                    <select
+                      title={help.model}
+                      value={backend.config.modelName}
+                      onChange={(e) => updateAsrProvider(backend.config.recognType, e.target.value)}
+                      className="w-full text-xs font-semibold p-2 bg-stone-50 rounded-lg border border-stone-200 focus:bg-white focus:outline-none focus:border-amber-400"
+                    >
+                      {(selectedProvider.models || []).map((m: string) => (
+                        <option key={m} value={m}>
+                          {m}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {/* Deepgram Dedicated Parameters Bar */}
+                {isDeepgram && (
+                  <div className="flex flex-col gap-2 pt-0.5">
+                    <button
+                      type="button"
+                      data-testid="deepgram-options-btn"
+                      title={help.deepgram}
+                      onClick={() => setIsDeepgramModalOpen(true)}
+                      className="w-full py-1.5 px-2.5 rounded-lg border border-amber-300 bg-amber-50/70 hover:bg-amber-100 text-[#8D4B00] text-xs font-semibold flex items-center justify-between transition-colors cursor-pointer shadow-2xs"
+                    >
+                      <div className="flex items-center gap-1.5">
+                        <Sliders className="w-3.5 h-3.5" />
+                        <span>Deepgram Parameters</span>
+                      </div>
+                      <span className="font-mono text-[10px] bg-amber-200/80 px-1.5 py-0.5 rounded font-bold">
+                        utt_split={backend.config.deepgramOptions?.utt_split ?? 0.8}s
+                      </span>
+                    </button>
+
+                    {/* Inline Quick Switches for Deepgram */}
+                    <div className="grid grid-cols-2 gap-2 text-[11px]">
+                      <label title={help.smartFormat} className="flex items-center justify-between p-1.5 rounded-lg bg-stone-50 border border-stone-200 cursor-pointer">
+                        <span className="text-stone-700 font-medium">Smart Format</span>
+                        <input
+                          type="checkbox"
+                          checked={backend.config.deepgramOptions?.smart_format ?? true}
+                          onChange={(e) => updateDeepgramOptions({ smart_format: e.target.checked })}
+                          className="rounded text-[#8D4B00] focus:ring-[#8D4B00]"
+                        />
+                      </label>
+                      <label title={help.punctuate} className="flex items-center justify-between p-1.5 rounded-lg bg-stone-50 border border-stone-200 cursor-pointer">
+                        <span className="text-stone-700 font-medium">Punctuate</span>
+                        <input
+                          type="checkbox"
+                          checked={backend.config.deepgramOptions?.punctuate ?? true}
+                          onChange={(e) => updateDeepgramOptions({ punctuate: e.target.checked })}
+                          className="rounded text-[#8D4B00] focus:ring-[#8D4B00]"
+                        />
+                      </label>
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="space-y-2.5" data-testid="video-ocr-panel">
+                {project.verified && project.hasVideo === false && (
+                  <div role="alert" className="p-2 rounded-lg bg-rose-50 border border-rose-200 text-[11px] text-rose-800 font-medium">
+                    Uploaded file has no video stream for OCR.
+                  </div>
+                )}
+
+                <div className="grid grid-cols-4 gap-1.5">
+                  {(['Left', 'Top', 'Width', 'Height'] as const).map((label, index) => (
+                    <label key={label} className="text-[10px] text-stone-600 font-semibold">
+                      {label} %
+                      <input
+                        type="number"
+                        min="0"
+                        max="100"
+                        step="1"
+                        aria-label={`OCR ROI ${label} percent`}
+                        value={Math.round((roi[index] ?? 0) * 100)}
+                        onChange={(e) => changeRoiCoordinate(index, Number(e.target.value))}
+                        className="mt-0.5 w-full rounded border border-stone-300 bg-stone-50 px-1.5 py-1 text-xs font-mono font-bold focus:bg-white focus:outline-none focus:border-amber-400"
+                      />
+                    </label>
+                  ))}
+                </div>
+
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <button
+                    type="button"
+                    data-testid="test-frame-ocr-btn"
+                    disabled={!backend.mediaId || (project.verified && project.hasVideo === false) || stage1OcrTest.loading || roi[2] <= 0 || roi[3] <= 0}
+                    onClick={() => void testStage1OcrFrame(videoRef.current?.currentTime ?? videoCurrentTime)}
+                    className="px-3 py-1.5 rounded-lg bg-[#8D4B00] hover:bg-[#743D00] text-white text-xs font-bold flex items-center gap-1.5 disabled:opacity-50 cursor-pointer shadow-2xs"
+                  >
+                    {stage1OcrTest.loading ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <span>Testing Frame…</span>
+                      </>
+                    ) : (
+                      <>
+                        <FileText className="w-3.5 h-3.5" />
+                        <span>Test Frame OCR</span>
+                      </>
+                    )}
+                  </button>
+
+                  <span
+                    data-testid="ocr-roi-status"
+                    className={`px-2 py-1 rounded text-[10px] font-bold flex items-center gap-1 ${
+                      ocrRoiConfirmed
+                        ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                        : 'bg-amber-100 text-[#8D4B00] border border-amber-300'
+                    }`}
+                  >
+                    {ocrRoiConfirmed ? (
+                      <>
+                        <CheckCircle2 className="w-3 h-3" />
+                        <span>ROI Confirmed</span>
+                      </>
+                    ) : (
+                      <>
+                        <AlertCircle className="w-3 h-3" />
+                        <span>ROI Unconfirmed — Run Test Frame OCR</span>
+                      </>
+                    )}
+                  </span>
+                </div>
+
+                {stage1OcrTest.error && (
+                  <div role="alert" data-testid="stage1-ocr-test-error" className="p-2 rounded-lg bg-rose-50 border border-rose-200 text-[11px] text-rose-800 space-y-1">
+                    <p>{stage1OcrTest.error}</p>
+                    {stage1OcrTest.text === '' && !ocrRoiConfirmed && (
+                      <button
+                        type="button"
+                        data-testid="confirm-ocr-roi-anyway-btn"
+                        onClick={() => setOcrRoiConfirmed(true)}
+                        className="px-2 py-0.5 rounded bg-white border border-amber-300 text-[#8D4B00] font-bold text-[10px] hover:bg-amber-50 cursor-pointer"
+                      >
+                        Confirm ROI Manually
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {stage1OcrTest.text !== null && stage1OcrTest.text !== undefined && stage1OcrTest.text.trim().length > 0 && (
+                  <div data-testid="stage1-ocr-test-result" className="p-2 rounded-lg bg-emerald-50/70 border border-emerald-200 text-[11px] text-stone-800 space-y-1">
+                    <div className="flex items-center justify-between text-[10px] font-mono text-emerald-800 font-semibold">
+                      <span>
+                        Window {Number(stage1OcrTest.startSec ?? 0).toFixed(2)}s–{Number(stage1OcrTest.endSec ?? 1).toFixed(2)}s
+                      </span>
+                      {stage1OcrTest.confidence != null && (
+                        <span>{Math.round(stage1OcrTest.confidence * 100)}% conf</span>
+                      )}
+                    </div>
+                    <p className="whitespace-pre-wrap font-medium text-stone-900">{stage1OcrTest.text}</p>
+                  </div>
+                )}
+
                 <div className="grid grid-cols-2 gap-2 text-[11px]">
-                  <label title={help.smartFormat} className="flex items-center justify-between p-1.5 rounded-lg bg-stone-50 border border-stone-200 cursor-pointer">
-                    <span className="text-stone-700 font-medium">Smart Format</span>
-                    <input
-                      type="checkbox"
-                      checked={backend.config.deepgramOptions?.smart_format ?? true}
-                      onChange={(e) => updateDeepgramOptions({ smart_format: e.target.checked })}
-                      className="rounded text-[#8D4B00] focus:ring-[#8D4B00]"
-                    />
+                  <label className="text-[10px] text-stone-600 font-semibold">
+                    Scan Interval
+                    <select
+                      aria-label="OCR scan interval ms"
+                      value={ocrOptions.coarseIntervalMs}
+                      onChange={(e) => updateOcrOptions({ coarseIntervalMs: Number(e.target.value) })}
+                      className="mt-0.5 w-full rounded border border-stone-200 bg-stone-50 px-1.5 py-1 text-xs font-semibold"
+                    >
+                      <option value={250}>250 ms (Fine)</option>
+                      <option value={500}>500 ms (Balanced)</option>
+                      <option value={1000}>1000 ms (Fast)</option>
+                    </select>
                   </label>
-                  <label title={help.punctuate} className="flex items-center justify-between p-1.5 rounded-lg bg-stone-50 border border-stone-200 cursor-pointer">
-                    <span className="text-stone-700 font-medium">Punctuate</span>
-                    <input
-                      type="checkbox"
-                      checked={backend.config.deepgramOptions?.punctuate ?? true}
-                      onChange={(e) => updateDeepgramOptions({ punctuate: e.target.checked })}
-                      className="rounded text-[#8D4B00] focus:ring-[#8D4B00]"
-                    />
+                  <label className="text-[10px] text-stone-600 font-semibold">
+                    Paragraph Joining
+                    <select
+                      aria-label="OCR paragraph mode"
+                      value={ocrOptions.paragraphMode}
+                      onChange={(e) => updateOcrOptions({ paragraphMode: e.target.value as 'preserve_lines' | 'unwrap' })}
+                      className="mt-0.5 w-full rounded border border-stone-200 bg-stone-50 px-1.5 py-1 text-xs font-semibold"
+                    >
+                      <option value="preserve_lines">Preserve line breaks</option>
+                      <option value="unwrap">Unwrap paragraph</option>
+                    </select>
                   </label>
                 </div>
+
+                <label className="flex items-center justify-between p-1.5 rounded-lg bg-stone-50 border border-stone-200 text-[11px] cursor-pointer">
+                  <span className="text-stone-700 font-medium">Enable 180° angle classifier (slower)</span>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(ocrOptions.useAngleCls)}
+                    onChange={(e) => updateOcrOptions({ useAngleCls: e.target.checked })}
+                    className="rounded text-[#8D4B00] focus:ring-[#8D4B00]"
+                  />
+                </label>
               </div>
             )}
           </div>
@@ -604,21 +887,26 @@ export const Stage1Prepare: React.FC = () => {
 
           <div className="space-y-2.5 flex-1">
             {/* Speaker Diarization with Speaker Count */}
-            <div className="p-2 rounded-lg bg-stone-50 border border-stone-200 flex flex-col gap-2">
-              <label title={help.diarization} className="flex items-center justify-between text-xs cursor-pointer">
+            <div className={`p-2 rounded-lg bg-stone-50 border border-stone-200 flex flex-col gap-2 ${isVideoOcr ? 'opacity-60' : ''}`}>
+              <label title={help.diarization} className={`flex items-center justify-between text-xs ${isVideoOcr ? 'cursor-not-allowed' : 'cursor-pointer'}`}>
                 <div className="flex items-center gap-1.5">
                   <Users className="w-3.5 h-3.5 text-[#8D4B00]" />
                   <span className="font-semibold text-stone-800">Speaker Diarization</span>
                 </div>
                 <input
                   type="checkbox"
+                  disabled={isVideoOcr}
                   checked={engines.speakerDiarization}
                   onChange={(e) => updateEngineConfig('speakerDiarization', e.target.checked)}
                   className="rounded text-[#8D4B00] focus:ring-[#8D4B00]"
                 />
               </label>
 
-              {engines.speakerDiarization && (
+              {isVideoOcr && (
+                <p className="text-[10px] text-stone-500">Audio diarization applies to ASR mode only.</p>
+              )}
+
+              {!isVideoOcr && engines.speakerDiarization && (
                 <div title={help.speakerCount} className="flex items-center justify-between pt-1 border-t border-stone-200/80 text-[11px]">
                   <span className="text-stone-600 font-medium">Expected Speakers:</span>
                   <select

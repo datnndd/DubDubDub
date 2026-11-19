@@ -4,9 +4,102 @@
 # Success: first value has desired return value or True, second value is None
 import json, traceback
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from videotrans.configure.config import logger, ROOT_DIR
+
+
+QWEN3_ASR_SUPPORTED_LANGUAGES = (
+    "Chinese", "English", "Cantonese", "Arabic", "German", "French",
+    "Spanish", "Portuguese", "Indonesian", "Italian", "Korean", "Russian",
+    "Thai", "Vietnamese", "Japanese", "Turkish", "Hindi", "Malay", "Dutch",
+    "Swedish", "Danish", "Finnish", "Polish", "Czech", "Filipino", "Persian",
+    "Greek", "Romanian", "Hungarian", "Macedonian",
+)
+_QWEN3_ASR_LANG_MAP = {lang.lower(): lang for lang in QWEN3_ASR_SUPPORTED_LANGUAGES}
+_QWEN3_ASR_OVERRIDES = {
+    "zh": "Chinese",
+    "zh-cn": "Chinese",
+    "zh-tw": "Chinese",
+    "zh-hans": "Chinese",
+    "zh-hant": "Chinese",
+    "chinese": "Chinese",
+    "simplified chinese": "Chinese",
+    "traditional chinese": "Chinese",
+    "en": "English",
+    "yue": "Cantonese",
+    "cantonese": "Cantonese",
+    "ar": "Arabic",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "pt": "Portuguese",
+    "id": "Indonesian",
+    "it": "Italian",
+    "ko": "Korean",
+    "ru": "Russian",
+    "th": "Thai",
+    "vi": "Vietnamese",
+    "ja": "Japanese",
+    "tr": "Turkish",
+    "hi": "Hindi",
+    "ms": "Malay",
+    "nl": "Dutch",
+    "sv": "Swedish",
+    "da": "Danish",
+    "fi": "Finnish",
+    "pl": "Polish",
+    "cs": "Czech",
+    "fa": "Persian",
+    "persian": "Persian",
+    "western persian": "Persian",
+    "fil": "Filipino",
+    "tl": "Filipino",
+    "filipino": "Filipino",
+    "el": "Greek",
+    "ro": "Romanian",
+    "hu": "Hungarian",
+    "mk": "Macedonian",
+}
+
+
+def _resolve_qwen_asr_language(detect_language: Optional[str]) -> Optional[str]:
+    """Map repo language code/name to Qwen3-ASR's 30 canonical language names, or None for auto."""
+    if not detect_language:
+        return None
+    code = str(detect_language).strip().lower().replace("_", "-")
+    if code in ("", "auto", "-", "no", "none"):
+        return None
+    if code in _QWEN3_ASR_OVERRIDES:
+        return _QWEN3_ASR_OVERRIDES[code]
+    if code in _QWEN3_ASR_LANG_MAP:
+        return _QWEN3_ASR_LANG_MAP[code]
+
+    try:
+        from videotrans.translator._lang_utils import get_language_qwen
+    except Exception:
+        get_language_qwen = None
+
+    candidates = [code]
+    if "-" in code:
+        candidates.append(code.split("-", 1)[0])
+
+    for cand in candidates:
+        if cand in _QWEN3_ASR_OVERRIDES:
+            return _QWEN3_ASR_OVERRIDES[cand]
+        if cand in _QWEN3_ASR_LANG_MAP:
+            return _QWEN3_ASR_LANG_MAP[cand]
+        if get_language_qwen is not None:
+            mapped = get_language_qwen(cand)
+            if mapped:
+                mapped_low = str(mapped).strip().lower()
+                if mapped_low in _QWEN3_ASR_OVERRIDES:
+                    return _QWEN3_ASR_OVERRIDES[mapped_low]
+                if mapped_low in _QWEN3_ASR_LANG_MAP:
+                    return _QWEN3_ASR_LANG_MAP[mapped_low]
+
+    logger.debug(f"[Qwen3-ASR] Language '{detect_language}' not in Qwen3-ASR 30-language allowlist; falling back to auto-detect (None)")
+    return None
 
 
 def _load_qwen3_asr_model():
@@ -24,7 +117,8 @@ def qwen3asr_fun(
         audio_file=None,
         model_name="1.7B",
         device_index=0,  # GPU index
-        hotword=None
+        hotword=None,
+        detect_language=None,
 ):
     import torch
     from videotrans.task.taskcfg import SrtItem
@@ -39,7 +133,8 @@ def qwen3asr_fun(
         device_map = 'cpu'
         dtype = torch.float32
 
-    logger.debug(f'QwenASR本地渠道 {model_name} 模型，{device_map=}')
+    qwen_lang = _resolve_qwen_asr_language(detect_language)
+    logger.debug(f'QwenASR本地渠道 {model_name} 模型，{device_map=}, {detect_language=}, {qwen_lang=}')
     try:
         """
         之所以未使用 Qwen/Qwen3-ForcedAligner-0.6B 返回字级时间戳，长语音例如1个小时、2个小时可能OOM，为避免需提前裁切
@@ -62,7 +157,7 @@ def qwen3asr_fun(
         for i, it_list in enumerate(srts_chunk):
             results = model.transcribe(
                 audio=[it['filename'] for it in it_list],
-                language=[None for it in it_list],  # can also be set to None for automatic language detection
+                language=[qwen_lang for _ in it_list],
                 return_time_stamps=False,
                 # context=hotword.split(',') if hotword else []
             )

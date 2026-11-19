@@ -25,9 +25,11 @@ class BaseCon:
         self.proxy_str = self._set_proxy(type='set')
 
     def _exit(self) -> bool:
+        if app_cfg.exit_soft:
+            return True
         if self.cancellation_token is not None:
             return self.cancellation_token.is_cancelled()
-        if app_cfg.exit_soft or (self.uuid and self.uuid in app_cfg.stoped_uuid_set):
+        if self.uuid and self.uuid in app_cfg.stoped_uuid_set:
             return True
         return False
     # All window and task information interacts via queue

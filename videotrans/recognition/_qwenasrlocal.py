@@ -1,11 +1,12 @@
 import json
+import shutil
 from dataclasses import dataclass, asdict
-from typing import List,  Union
+from typing import List, Union
 
 from pathlib import Path
-import  time
+import time
 
-from videotrans.configure.config import logger, defaulelang, ROOT_DIR, settings
+from videotrans.configure.config import logger, ROOT_DIR, settings
 from videotrans.configure import config
 
 from videotrans.recognition._base import BaseRecogn
@@ -35,18 +36,39 @@ class QwenasrlocalRecogn(BaseRecogn):
         if self._exit(): return
 
         logs_file = f'{config.TEMP_DIR}/{self.uuid}/qwen3tts-{time.time()}.log'
+        Path(logs_file).parent.mkdir(parents=True, exist_ok=True)
         title = "Qwen3-ASR"
-        cut_audio_list_file = f'{config.TEMP_DIR}/{self.uuid}/cut_audio_list_{time.time()}.json'
-        Path(cut_audio_list_file).write_text(json.dumps([ asdict(item) for item in self.cut_audio()]), encoding='utf-8')
-        kwargs = {
-            "cut_audio_list": cut_audio_list_file,
-            "logs_file": logs_file,
-            "is_cuda": self.is_cuda,
-            "audio_file": self.audio_file,
-            "model_name": self.model_name,
-            "hotword":settings.get('hotwords'),
-        }
-        from videotrans.process.stt_qwen import qwen3asr_fun
-        jsdata = self._new_process(callback=qwen3asr_fun, title=title, is_cuda=self.is_cuda, kwargs=kwargs)
-        logger.debug(f'Qwen-asr返回的字词时间戳数据:{jsdata=}')
-        return jsdata
+        cut_audio_list_file = f'{config.TEMP_DIR}/{self.uuid}/cut_audio_list_{time.time_ns()}.json'
+        clip_dir = None
+        try:
+            seg_list = self.cut_audio()
+            if seg_list:
+                candidate = Path(seg_list[0]['filename']).parent
+                if candidate.name.startswith("clip_"):
+                    clip_dir = candidate
+            Path(cut_audio_list_file).write_text(
+                json.dumps([asdict(item) for item in seg_list]),
+                encoding='utf-8'
+            )
+            kwargs = {
+                "cut_audio_list": cut_audio_list_file,
+                "logs_file": logs_file,
+                "is_cuda": self.is_cuda,
+                "audio_file": self.audio_file,
+                "model_name": self.model_name,
+                "hotword": settings.get('hotwords'),
+                "detect_language": self.detect_language,
+            }
+            from videotrans.process.stt_qwen import qwen3asr_fun
+            jsdata = self._new_process(callback=qwen3asr_fun, title=title, is_cuda=self.is_cuda, kwargs=kwargs)
+            logger.debug(f'Qwen-asr返回的字词时间戳数据:{jsdata=}')
+            return jsdata
+        finally:
+            if clip_dir is not None:
+                shutil.rmtree(clip_dir, ignore_errors=True)
+            elif getattr(self, "_last_cut_dir", None):
+                shutil.rmtree(self._last_cut_dir, ignore_errors=True)
+            try:
+                Path(cut_audio_list_file).unlink(missing_ok=True)
+            except OSError:
+                pass

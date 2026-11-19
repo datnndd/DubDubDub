@@ -16,6 +16,7 @@ Usage examples:
 """
 
 import asyncio
+import math
 import multiprocessing
 import sys
 import re
@@ -23,7 +24,7 @@ import argparse
 from dataclasses import asdict
 from multiprocessing import freeze_support
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -107,6 +108,9 @@ TEXT_DB: Dict[str, Dict[str, str]] = {
     "help_nums_diariz":    {"zh": "指定说话人数量", "en": "Number of speakers"},
     "help_rephrase":       {"zh": "重新断句 (0=默认, 1=LLM断句)", "en": "Rephrase (0=default, 1=LLM)"},
     "help_fix_punc":       {"zh": "恢复标点符号", "en": "Restore punctuation"},
+    "help_subtitle_source": {"zh": "字幕来源: audio_asr(语音识别) 或 video_ocr(画面硬字幕OCR)", "en": "Subtitle source: audio_asr or video_ocr"},
+    "help_ocr_roi":        {"zh": "视频OCR归一化区域 x,y,w,h (例如 0.1,0.75,0.8,0.2)", "en": "Normalized video OCR ROI x,y,w,h (e.g. 0.1,0.75,0.8,0.2)"},
+    "help_ocr_interval_ms": {"zh": "视频OCR粗采样间隔毫秒数 (默认: 500)", "en": "Video OCR coarse sampling interval in ms (default: 500)"},
 
     # --- TTS params ---
     "group_tts":         {"zh": "TTS (文字配音) 参数", "en": "TTS (Text-to-Speech) Parameters"},
@@ -153,6 +157,14 @@ TEXT_DB: Dict[str, Dict[str, str]] = {
     "err_vtv_missing": {
         "zh": "VTV 模式缺少必选参数: {}",
         "en": "VTV mode missing required params: {}"
+    },
+    "err_ocr_roi_required": {
+        "zh": "使用 --subtitle_source video_ocr 时必须提供 --ocr_roi (格式: x,y,w,h)",
+        "en": "--ocr_roi is required when --subtitle_source is video_ocr (format: x,y,w,h)"
+    },
+    "err_ocr_roi_invalid": {
+        "zh": "--ocr_roi 格式无效, 需为 [0,1] 范围内的4个数值 x,y,w,h 且 w,h > 0",
+        "en": "Invalid --ocr_roi format; expected 4 normalized floats x,y,w,h in [0,1] with w,h > 0"
     },
     "miss_source_lang": {"zh": "--source_language_code", "en": "--source_language_code"},
     "miss_target_lang": {"zh": "--target_language_code", "en": "--target_language_code"},
@@ -347,6 +359,9 @@ def build_parser() -> argparse.ArgumentParser:
     stt_group.add_argument('--nums_diariz', type=int, default=-1, help=tr("help_nums_diariz"))
     stt_group.add_argument('--rephrase', type=int, default=0, help=tr("help_rephrase"))
     stt_group.add_argument('--fix_punc', action='store_true', help=tr("help_fix_punc"))
+    stt_group.add_argument('--subtitle_source', type=str, default='audio_asr', choices=['audio_asr', 'video_ocr'], help=tr("help_subtitle_source"))
+    stt_group.add_argument('--ocr_roi', type=str, default=None, help=tr("help_ocr_roi"))
+    stt_group.add_argument('--ocr_interval_ms', type=int, default=500, help=tr("help_ocr_interval_ms"))
 
     # --- TTS ---
     tts_group = parser.add_argument_group(tr("group_tts"))
@@ -380,6 +395,36 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # Parameter validation
 # ---------------------------------------------------------------------------
+def _parse_ocr_roi(raw: Any) -> Tuple[float, float, float, float]:
+    """Parse and validate normalized ROI x,y,w,h from string or sequence."""
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(",")]
+    elif isinstance(raw, (list, tuple)):
+        parts = list(raw)
+    else:
+        raise ValueError("Invalid ROI")
+    if len(parts) != 4:
+        raise ValueError("ROI must have 4 elements")
+    vals: List[float] = []
+    for p in parts:
+        if isinstance(p, bool):
+            raise ValueError("Invalid ROI element")
+        f = float(p)
+        if not math.isfinite(f):
+            raise ValueError("Non-finite ROI element")
+        vals.append(f)
+    x, y, w, h = vals
+    if x < 0.0 or y < 0.0 or w <= 0.0 or h <= 0.0 or x + w > 1.001 or y + h > 1.001:
+        raise ValueError("ROI out of bounds")
+    if x + w > 1.0:
+        w = 1.0 - x
+    if y + h > 1.0:
+        h = 1.0 - y
+    if w <= 0.0 or h <= 0.0:
+        raise ValueError("ROI out of bounds")
+    return (x, y, w, h)
+
+
 def validate_task_params(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     """Validate required parameters for the given task type."""
     if not args.name:
@@ -402,6 +447,21 @@ def validate_task_params(args: argparse.Namespace, parser: argparse.ArgumentPars
             missing.append(tr("miss_target_lang"))
         if missing:
             parser.error(tr("err_vtv_missing", ', '.join(missing)))
+
+    sub_src = getattr(args, "subtitle_source", "audio_asr")
+    raw_roi = getattr(args, "ocr_roi", None)
+    if args.task in {"stt", "vtv"} and sub_src == "video_ocr":
+        if not raw_roi:
+            parser.error(tr("err_ocr_roi_required"))
+        try:
+            _parse_ocr_roi(raw_roi)
+        except (ValueError, TypeError):
+            parser.error(tr("err_ocr_roi_invalid"))
+    elif raw_roi is not None:
+        try:
+            _parse_ocr_roi(raw_roi)
+        except (ValueError, TypeError):
+            parser.error(tr("err_ocr_roi_invalid"))
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +492,7 @@ def build_common_params(args: argparse.Namespace, output_dir: Optional[str] = No
 
 def build_stt_params(args: argparse.Namespace) -> dict:
     """Build STT-specific parameters."""
-    return {
+    params: Dict[str, Any] = {
         "recogn_type": args.recogn_type,
         "detect_language": args.detect_language,
         "model_name": args.model_name,
@@ -443,6 +503,21 @@ def build_stt_params(args: argparse.Namespace) -> dict:
         "rephrase": args.rephrase,
         "fix_punc": args.fix_punc,
     }
+    raw_sub_src = getattr(args, "subtitle_source", None)
+    if isinstance(raw_sub_src, str):
+        params["subtitle_source"] = raw_sub_src
+        raw_roi = getattr(args, "ocr_roi", None)
+        roi_tuple = _parse_ocr_roi(raw_roi) if isinstance(raw_roi, (str, list, tuple)) else None
+        if roi_tuple is not None:
+            params["ocr_roi"] = roi_tuple
+            params["ocr_roi_confirmed"] = True
+        elif raw_sub_src == "video_ocr":
+            params["ocr_roi"] = None
+            params["ocr_roi_confirmed"] = False
+        raw_interval = getattr(args, "ocr_interval_ms", None)
+        if isinstance(raw_interval, (int, float)) and not isinstance(raw_interval, bool):
+            params["ocr_options"] = {"coarse_interval_ms": max(100, min(5000, int(raw_interval)))}
+    return params
 
 
 def build_tts_params(args: argparse.Namespace) -> dict:

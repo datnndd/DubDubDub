@@ -200,6 +200,7 @@ def faster_whisper(
             logger.debug('Resegmentation complete, returning results')
         # Save recognition results to temporary directory to prevent deadlock if child process crashes
         if subtitle_srt:
+            Path(subtitle_srt).parent.mkdir(parents=True, exist_ok=True)
             Path(subtitle_srt).write_text("\n\n".join([f'{i+1}\n{it.startraw} --> {it.endraw}\n{it.text}' for i,it in enumerate(raws)]),encoding="utf-8")
             logger.debug(f'faster-whisper saved temporary results to {subtitle_srt} to prevent subprocess hang')
         
