@@ -541,6 +541,7 @@ class TestBackendTTSProvidersAndRate:
             json.dumps([
                 {"text": "A", "role": "SpeakerA", "filename": str(out1)},
                 {"text": "B", "role": "SpeakerA", "filename": str(out2)},
+                {"text": "C", "role": "clone", "ref_wav": str(ref_wav), "ref_text": " ", "filename": str(tmp_path / "o3.wav")},
             ]),
             encoding="utf-8",
         )
@@ -558,12 +559,15 @@ class TestBackendTTSProvidersAndRate:
             lambda: (_ for _ in ()).throw(AssertionError("get_f5tts_role must not be called in loop")),
         )
 
+        received_ref_texts = []
+
         class FakeOmniModel:
             @classmethod
             def from_pretrained(cls, *a, **kw):
                 return cls()
 
             def generate(self, **kw):
+                received_ref_texts.append(kw["ref_text"])
                 return [np.ones(2400, dtype=np.float32) * 0.2]
 
         fake_omni_mod = types.ModuleType("omnivoice")
@@ -578,6 +582,7 @@ class TestBackendTTSProvidersAndRate:
         )
         assert ok is True and err is None
         assert role_info_calls["n"] == 1
+        assert received_ref_texts == ["ref", "ref", None]
         assert (Path(str(out1) + "-24k.wav")).is_file()
 
         # OmniVoice._exec cleans -24k.wav and omnivoice-*.json

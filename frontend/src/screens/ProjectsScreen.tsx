@@ -38,6 +38,11 @@ export interface ProjectsScreenProps {
   initialSortBy?: SortOption;
 }
 
+const projectDuration = (duration: unknown): number => {
+  const value = Number(duration);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+};
+
 interface DateProjectGroup {
   date: string;
   parentId: string;
@@ -252,7 +257,7 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
     }
 
     const computeGroupTotals = (subs: ProjectRecord[]) => ({
-      totalDuration: subs.reduce((acc, item) => acc + (item.duration || 0), 0),
+      totalDuration: subs.reduce((acc, item) => acc + projectDuration(item.duration), 0),
       completedCount: subs.filter((item) => item.stage >= 2 || item.status === 'completed').length,
       processingCount: subs.filter((item) => item.status === 'processing').length,
     });
@@ -528,9 +533,9 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
           </div>
 
           {/* Bottom Duration Badge */}
-          {p.duration ? (
+          {projectDuration(p.duration) ? (
             <span className="absolute bottom-2 right-2 px-1.5 py-0.5 bg-black/60 backdrop-blur-xs text-white rounded text-[10px] font-mono font-medium">
-              {p.duration.toFixed(1)}s
+              {projectDuration(p.duration).toFixed(1)}s
             </span>
           ) : null}
         </div>
@@ -629,7 +634,7 @@ export const ProjectsScreen: React.FC<ProjectsScreenProps> = ({
         <td className="py-2.5 px-3 whitespace-nowrap">{getStageBadge(p.stage)}</td>
         <td className="py-2.5 px-3 whitespace-nowrap">{getStatusBadge(p.status)}</td>
         <td className="py-2.5 px-3 font-mono text-stone-500 whitespace-nowrap">
-          {p.duration ? `${p.duration.toFixed(1)}s` : '—'}
+          {projectDuration(p.duration) ? `${projectDuration(p.duration).toFixed(1)}s` : '—'}
         </td>
         <td className="py-2.5 px-3 text-stone-500 whitespace-nowrap">
           {formatDate(p.updated_at || (p as any).updatedAt)}

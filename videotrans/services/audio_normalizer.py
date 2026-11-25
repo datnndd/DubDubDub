@@ -2,6 +2,7 @@
 """Audio normalization and duration validation service for custom voice cloning."""
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 import subprocess
@@ -40,6 +41,25 @@ def probe_audio_duration(file_path: str | Path) -> float:
     p = Path(file_path).resolve()
     if not p.is_file():
         raise FileNotFoundError(f"Audio file does not exist: {p}")
+
+    if p.suffix.lower() == ".mp3":
+        # MP3 duration estimates can include ID3 metadata or assume a constant bitrate.
+        # Count decoded samples from the audio stream that FFmpeg will normalize.
+        try:
+            audio = json.loads(runffprobe([
+                "-v", "error",
+                "-select_streams", "a:0",
+                "-show_frames",
+                "-show_entries", "frame=nb_samples:stream=sample_rate",
+                "-of", "json",
+                str(p),
+            ]))
+            sample_rate = int(audio["streams"][0]["sample_rate"])
+            samples = sum(int(frame["nb_samples"]) for frame in audio["frames"])
+            if sample_rate > 0 and samples > 0:
+                return samples / sample_rate
+        except (FFmpegError, ValueError, TypeError, KeyError, IndexError) as exc:
+            logger.debug("Could not count decoded MP3 samples in %s: %s", p, exc)
 
     # Method 1: Try soundfile first (fast, header-based, no process spawn)
     try:

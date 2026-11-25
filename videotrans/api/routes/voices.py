@@ -978,13 +978,7 @@ async def preview_clone_handler(request: Request) -> JSONResponse:
     provider = _parse_provider_or_400(fields.get("provider"))
     text = fields.get("text") or fields.get("sample_text") or None
     language = str(fields.get("language") or "vi").strip()
-    ref_text = str(fields.get("ref_text") or "").strip()
-
-    if provider == tts.OMNIVOICE_TTS and not ref_text:
-        raise HTTPException(
-            status_code=400,
-            detail="OmniVoice requires reference text transcript to prevent acoustic hallucinations",
-        )
+    ref_text = str(fields.get("ref_text") or "").strip() or None
 
     cut_start_raw = fields.get("cut_start") or fields.get("start_time")
     cut_end_raw = fields.get("cut_end") or fields.get("end_time")
@@ -1088,6 +1082,12 @@ async def preview_clone_handler(request: Request) -> JSONResponse:
             denoise=denoise,
         )
     except Exception as exc:
+        if provider == tts.OMNIVOICE_TTS and ref_text is None:
+            logger.exception("OmniVoice preview with automatic transcription failed")
+            raise HTTPException(
+                status_code=503,
+                detail="OmniVoice could not generate a preview with automatic transcription. Try again or enter the reference transcript.",
+            ) from exc
         logger.exception("Clone preview synthesis failed, generating emergency fallback: %s", exc)
         preview_filename = f"{preview_id}.wav"
         preview_path = voice_store.get_preview_audio_path(preview_filename)

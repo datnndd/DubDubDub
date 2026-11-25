@@ -21,13 +21,13 @@ def omnivoice_fun(
     from videotrans.util.help_role import get_omnivoice_voice_info
     from videotrans.util.help_misc import vail_file
     import torch
-    from omnivoice import OmniVoice
+    from videotrans.services.model_cache import load_omnivoice_model
     from videotrans.util import gpus
     import soundfile as sf
 
-    model = OmniVoice.from_pretrained(
+    model = load_omnivoice_model(
         f'{ROOT_DIR}/models/models--k2-fsa--OmniVoice',
-        device_map=f'cuda:{device_index}' if is_cuda else gpus.mps_or_cpu(),
+        device=f'cuda:{device_index}' if is_cuda else gpus.mps_or_cpu(),
         dtype=torch.float32 if not is_cuda else torch.float16
     )
     logger.debug(f'OmniVoice-TTS本地内置渠道，{is_cuda=}')
@@ -76,7 +76,7 @@ def omnivoice_fun(
                 wav = model.generate(
                     text=it['text'],
                     ref_audio=wavfile,
-                    ref_text=ref_text,
+                    ref_text=(ref_text or "").strip() or None,
                     speed=speed
                 )
                 if not wav or len(wav) == 0:

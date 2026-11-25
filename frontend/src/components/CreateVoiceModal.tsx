@@ -10,7 +10,6 @@ import {
   AlertCircle,
   CheckCircle2,
   Sparkles,
-  Info,
   Loader2,
   Sliders,
   Volume2,
@@ -621,10 +620,6 @@ export const CreateVoiceModal: React.FC = () => {
       setErrorMsg('Please enter a test phrase to preview the voice.');
       return;
     }
-    if (provider === 1 && !refText.trim()) {
-      setErrorMsg('OmniVoice requires reference text transcript to prevent acoustic hallucinations.');
-      return;
-    }
     setIsCloneAuditioning(true);
     setErrorMsg(null);
 
@@ -704,11 +699,6 @@ export const CreateVoiceModal: React.FC = () => {
         return;
       }
 
-      if (provider === 1 && !refText.trim()) {
-        setErrorMsg('OmniVoice requires reference text transcript to prevent acoustic hallucinations.');
-        return;
-      }
-
       setIsSubmitting(true);
       try {
         const { sourceAudio, useCutRange } = resolveCloneAudioUploadSource({
@@ -726,7 +716,7 @@ export const CreateVoiceModal: React.FC = () => {
           description: description.trim(),
           language,
           kind: 'clone',
-          ref_text: refText.trim(),
+          ref_text: refText.trim() || undefined,
           instruct: instruct.trim(),
           audio: sourceAudio || undefined,
           denoise,
@@ -1283,17 +1273,13 @@ export const CreateVoiceModal: React.FC = () => {
               {/* Reference Audio Transcript for OmniVoice */}
               {provider === 1 && (
                 <div className="space-y-1.5">
-                  <div className="flex items-center justify-between">
-                    <label className="block text-xs font-bold text-stone-700">
-                      Reference Audio Transcript <span className="text-rose-500">*</span>
-                    </label>
-                    <span className="text-[10px] text-amber-700 font-semibold flex items-center gap-0.5">
-                      <Info className="w-3 h-3" /> Prevents hallucinations
-                    </span>
-                  </div>
+                  <label htmlFor="omnivoice-ref-text" className="block text-xs font-bold text-stone-700">
+                    Reference Audio Transcript (optional)
+                  </label>
                   <textarea
+                    id="omnivoice-ref-text"
                     rows={2}
-                    placeholder="Exact words spoken in the reference audio sample..."
+                    placeholder="Leave blank to transcribe the reference audio automatically."
                     value={refText}
                     onChange={(e) => setRefText(e.target.value)}
                     className="w-full text-xs p-2.5 bg-white rounded-lg border border-[#E7E4DC] focus:border-[#8D4B00] outline-hidden font-medium"

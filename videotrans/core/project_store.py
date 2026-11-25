@@ -57,6 +57,11 @@ def init_project_dirs(project_id: str) -> dict[str, Path]:
 
 def _row_to_dict(row: Any) -> dict[str, Any]:
     d = dict(row)
+    try:
+        duration = float(d.get("duration") or 0)
+        d["duration"] = duration if math.isfinite(duration) else 0.0
+    except (TypeError, ValueError, OverflowError):
+        d["duration"] = 0.0
     if "state_json" in d:
         try:
             d["state"] = json.loads(d.pop("state_json") or "{}")
@@ -86,6 +91,8 @@ def create_project(
     state: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Create and persist a new project record and its artifact directories."""
+    if not math.isfinite(float(duration)):
+        raise ValueError("Project duration must be finite")
     pid = project_id or uuid.uuid4().hex
     now = time.time()
     state_json = json.dumps(state or {})
@@ -191,6 +198,8 @@ def update_project(project_id: str, **kwargs: Any) -> Optional[dict[str, Any]]:
     }
     updates = {}
     for k, v in kwargs.items():
+        if k == "duration" and not math.isfinite(float(v)):
+            raise ValueError("Project duration must be finite")
         if k == "state":
             updates["state_json"] = json.dumps(v or {})
         elif k in allowed:

@@ -2,6 +2,7 @@
 import pytest
 from pathlib import Path
 from videotrans.core.db import init_db, set_db_path, get_db_path
+from videotrans.core.db import db_conn
 from videotrans.core.project_store import (
     create_project,
     get_project,
@@ -49,6 +50,20 @@ def test_create_and_get_project():
     assert fetched["id"] == proj["id"]
     assert fetched["name"] == "Test Video Dub"
     assert fetched["state"]["segments"][0]["text"] == "hello"
+
+
+def test_nonfinite_duration_is_rejected_and_legacy_record_is_readable():
+    with pytest.raises(ValueError, match="duration must be finite"):
+        create_project(name="Invalid", duration=float("nan"))
+
+    project = create_project(name="Legacy")
+    with pytest.raises(ValueError, match="duration must be finite"):
+        update_project(project["id"], duration=float("inf"))
+
+    with db_conn() as conn:
+        conn.execute("UPDATE projects SET duration = ? WHERE id = ?", ("nan", project["id"]))
+    assert get_project(project["id"])["duration"] == 0.0
+    assert list_projects()[0]["duration"] == 0.0
 
 
 def test_update_project_state_and_stage():

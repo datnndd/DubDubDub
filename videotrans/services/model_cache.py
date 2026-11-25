@@ -86,6 +86,25 @@ def evict_vieneu_engine(device: Optional[str] = None) -> None:
             _vieneu_cache.pop(k, None)
 
 
+def load_omnivoice_model(model_dir: Path | str, device: str, dtype: Any) -> Any:
+    from huggingface_hub import try_to_load_from_cache
+    from omnivoice import OmniVoice
+
+    asr_model = "openai/whisper-base"
+    cached_weights = try_to_load_from_cache(asr_model, "model.safetensors")
+    if isinstance(cached_weights, str):
+        snapshot = Path(cached_weights).parent
+        if all((snapshot / name).is_file() for name in (
+            "config.json", "preprocessor_config.json", "tokenizer.json", "generation_config.json",
+        )):
+            asr_model = str(snapshot)
+    # Whisper loads only for automatic transcription. Keep VRAM available for OmniVoice.
+    return OmniVoice.from_pretrained(
+        str(model_dir), device_map=device, dtype=dtype,
+        asr_model_name=asr_model, asr_device="cpu",
+    )
+
+
 def get_cached_omnivoice_model(
     model_dir: Path | str,
     device: str = "auto",
@@ -104,12 +123,7 @@ def get_cached_omnivoice_model(
             return _omnivoice_cache[cache_key]
 
         logger.info("Loading and caching OmniVoice model from %s on %s...", model_path, dev)
-        from omnivoice import OmniVoice
-        model = OmniVoice.from_pretrained(
-            str(model_path),
-            device_map=device,
-            dtype=dtype,
-        )
+        model = load_omnivoice_model(model_path, device, dtype)
         _omnivoice_cache[cache_key] = model
         return model
 

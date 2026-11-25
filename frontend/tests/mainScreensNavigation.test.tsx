@@ -250,6 +250,18 @@ describe('Top-Level Navigation & Main Screen Interfaces', () => {
       expect(markup).toContain('data-testid="delete-project-proj-alpha"');
     });
 
+    test('renders projects with a legacy nonnumeric duration', () => {
+      useDubDubStore.setState({
+        projectsList: [{
+          id: 'legacy-nan', name: 'NanDur', stage: 1, status: 'pending',
+          duration: 'nan' as unknown as number,
+        }],
+      });
+      const markup = renderToStaticMarkup(<ProjectsScreen />);
+      expect(markup).toContain('NanDur');
+      expect(markup).not.toContain('NaNs');
+    });
+
     test('renders empty state when projectsList is empty', () => {
       useDubDubStore.setState({ projectsList: [] });
       const markup = renderToStaticMarkup(<ProjectsScreen />);

@@ -105,6 +105,31 @@ def test_audio_normalizer_duration_validation(tmp_path):
     assert out_wav4.is_file()
 
 
+@pytest.mark.parametrize("duration", [29.7, 30.6])
+def test_mp3_duration_validation_uses_audio_samples(tmp_path, duration):
+    from videotrans.util.help_ffmpeg import runffmpeg
+
+    source = tmp_path / "sample.mp3"
+    runffmpeg([
+        "-y", "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}",
+        "-c:a", "libmp3lame", "-b:a", "128k", "-write_xing", "0",
+        "-id3v2_version", "0", str(source),
+    ], force_cpu=True)
+    # Prepend a valid ID3v2 header and 16 KiB of padding without changing any audio frames.
+    id3_header = b"ID3\x04\x00\x00\x00\x01\x00\x00"
+    source.write_bytes(id3_header + bytes(16_384) + source.read_bytes())
+    output = tmp_path / "reference.wav"
+
+    if duration > 30:
+        with pytest.raises(ValueError, match=r"got 30\.6\d?s"):
+            normalize_reference_audio(source, output, provider=tts.OMNIVOICE_TTS)
+        assert not output.exists()
+    else:
+        meta = normalize_reference_audio(source, output, provider=tts.OMNIVOICE_TTS)
+        assert meta["duration"] == pytest.approx(duration, abs=0.1)
+        assert output.is_file()
+
+
 def test_custom_voices_api_lifecycle(voice_api_env):
     app = voice_api_env["app"]
     tmp_path = voice_api_env["tmp_path"]
@@ -480,6 +505,32 @@ def test_preview_clone_and_auto_synthesize_endpoints(voice_api_env):
     asyncio.run(scenario())
 
 
+def test_omnivoice_auto_transcription_failure_returns_error(voice_api_env, monkeypatch):
+    from videotrans.services import voice_preview
+
+    calls = []
+
+    def unavailable_asr(_audio, ref_text, *_args, **kwargs):
+        calls.append((ref_text, kwargs["num_step"]))
+        raise RuntimeError("Whisper is unavailable")
+
+    monkeypatch.setattr(voice_preview, "_preview_synthesizer", None)
+    monkeypatch.setattr(voice_preview, "_run_omnivoice_synthesis", unavailable_asr)
+    audio = create_wav_file(voice_api_env["tmp_path"] / "reference.wav")
+
+    async def scenario():
+        async with TestClient(TestServer(voice_api_env["app"])) as client:
+            form = aiohttp.FormData()
+            form.add_field("provider", "1")
+            form.add_field("audio", audio.read_bytes(), filename=audio.name, content_type="audio/wav")
+            response = await client.post("/api/voices/preview-clone", data=form)
+            assert response.status == 503
+            assert "automatic transcription" in (await response.json())["detail"]
+
+    asyncio.run(scenario())
+    assert calls == [(None, 16)]
+
+
 def test_mp3_cloning_flow_and_preview_edge_cases(voice_api_env):
     """Verify full MP3 upload voice cloning flow, preview audio button endpoint, and edge cases."""
     app = voice_api_env["app"]
@@ -569,14 +620,20 @@ def test_mp3_cloning_flow_and_preview_edge_cases(voice_api_env):
             res_trim = await client.post("/api/voices/preview-clone", data=form_trim)
             assert res_trim.status == 200
 
-            # 8. Edge case: OmniVoice in preview-clone without ref_text must return 400
-            form_omni_bad = aiohttp.FormData()
-            form_omni_bad.add_field("audio", test_mp3.read_bytes(), filename="voice_sample.mp3", content_type="audio/mpeg")
-            form_omni_bad.add_field("provider", "1")
-            form_omni_bad.add_field("ref_text", "")
+            # 8. OmniVoice accepts an omitted transcript for preview and save.
+            form_omni = aiohttp.FormData()
+            form_omni.add_field("audio", test_mp3.read_bytes(), filename="voice_sample.mp3", content_type="audio/mpeg")
+            form_omni.add_field("provider", "1")
+            res_omni = await client.post("/api/voices/preview-clone", data=form_omni)
+            assert res_omni.status == 200
 
-            res_omni_bad = await client.post("/api/voices/preview-clone", data=form_omni_bad)
-            assert res_omni_bad.status == 400
+            form_omni_save = aiohttp.FormData()
+            form_omni_save.add_field("name", "OmniVoice with automatic transcription")
+            form_omni_save.add_field("provider", "1")
+            form_omni_save.add_field("audio", test_mp3.read_bytes(), filename="voice_sample.mp3", content_type="audio/mpeg")
+            form_omni_save.add_field("preview_filename", (await res_omni.json())["preview_filename"])
+            res_omni_save = await client.post("/api/custom-voices", data=form_omni_save)
+            assert res_omni_save.status == 201
 
             # 9. Edge case: Traversal attempt in preview-audio must return 400
             res_traversal = await client.get("/api/voices/preview-audio/..secret.wav")

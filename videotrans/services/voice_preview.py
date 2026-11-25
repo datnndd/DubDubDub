@@ -652,12 +652,13 @@ def _run_vieneu_batch_synthesis(
 
 def _run_omnivoice_synthesis(
     ref_audio: Path,
-    ref_text: str,
+    ref_text: Optional[str],
     output_file: Path,
     text: str,
     use_cuda: bool = True,
     speed: float = 1.0,
     abort_event: Optional[threading.Event] = None,
+    num_step: Optional[int] = None,
 ) -> None:
     """Run OmniVoice TTS preview synthesis with cached model, falling back to CPU if needed."""
     from videotrans.configure.config import ROOT_DIR
@@ -671,6 +672,8 @@ def _run_omnivoice_synthesis(
     from videotrans.services.model_cache import get_cached_omnivoice_model, evict_omnivoice_model
     from videotrans.util import gpus
 
+    generation_options = {"num_step": num_step} if num_step is not None else {}
+
     def _infer(device: str, dtype: Any):
         if abort_event is not None and abort_event.is_set():
             raise RuntimeError("Cancelled")
@@ -681,8 +684,9 @@ def _run_omnivoice_synthesis(
             wav = model.generate(
                 text=text,
                 ref_audio=ref_audio.as_posix(),
-                ref_text=ref_text or None,
+                ref_text=(ref_text or "").strip() or None,
                 speed=speed or 1.0,
+                **generation_options,
             )
             if abort_event is not None and abort_event.is_set():
                 raise RuntimeError("Cancelled")
@@ -921,6 +925,8 @@ async def synthesize_clone_preview(
     lang = language or "vi"
     sample_text = (text or "").strip() or get_default_preview_text(lang)
     ref_src = Path(audio_path).resolve()
+    ref_text = (ref_text or "").strip() or None
+    auto_transcribe = provider == tts.OMNIVOICE_TTS and ref_text is None
 
     async with _get_path_lock(preview_path):
         call_abort = threading.Event()
@@ -955,22 +961,23 @@ async def synthesize_clone_preview(
                 except Exception as exc:
                     logger.warning("VieNeu clone preview synthesis failed: %s", exc)
 
-            elif provider == tts.OMNIVOICE_TTS and ref_src.is_file():
+            elif provider == tts.OMNIVOICE_TTS and (auto_transcribe or ref_src.is_file()):
                 try:
                     async with _get_gpu_lock():
                         await asyncio.to_thread(
                             _run_omnivoice_synthesis,
                             ref_src,
-                            ref_text or "",
+                            ref_text,
                             preview_path,
                             sample_text,
                             use_cuda,
                             abort_event=call_abort,
+                            num_step=16 if auto_transcribe else None,
                         )
                     return
-                except ImportError:
-                    logger.info("omnivoice package not installed, falling back to snippet preview")
                 except Exception as exc:
+                    if auto_transcribe:
+                        raise
                     logger.warning("OmniVoice clone preview synthesis failed: %s", exc)
 
             # Robust snippet fallback from reference audio
@@ -989,6 +996,8 @@ async def synthesize_clone_preview(
             await asyncio.wait_for(_do_synthesis(), timeout=CLONE_TIMEOUT_SECONDS)
         except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError, Exception) as exc:
             call_abort.set()
+            if auto_transcribe:
+                raise
             logger.warning("Clone preview synthesis timed out or failed (%s), generating fallback preview audio", exc)
             if ref_src and ref_src.is_file():
                 await asyncio.to_thread(
@@ -1001,6 +1010,8 @@ async def synthesize_clone_preview(
                 generate_fallback_preview_wav(preview_path)
 
         if not _is_valid_preview_wav(preview_path):
+            if auto_transcribe:
+                raise RuntimeError("OmniVoice returned invalid preview audio")
             generate_fallback_preview_wav(preview_path)
 
     cleanup_previews_dir(exclude_names={preview_path.name})
