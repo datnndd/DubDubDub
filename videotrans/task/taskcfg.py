@@ -202,6 +202,8 @@ class TaskCfgVTT(TaskCfgSTT, TaskCfgTTS, TaskCfgSTS):
     source_audio_volume: float = 0.0  # final mix contribution from original video audio
     thumbnail: Union[os.PathLike,str]=None  # optional exported video cover image
     subtitle_style: Optional[dict] = None  # per-job hard subtitle appearance
+    annotations: Optional[list] = None  # Stage 4 positioned on-screen annotations
+    burn_annotations: bool = False  # Whether to burn Stage 4 annotations into rendered video
     batch:bool=False  # Batch translation mode or single video translation mode
     batch_size:int=0  # 0=concurrent batch mode, >0 n items per batch
     

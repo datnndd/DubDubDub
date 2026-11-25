@@ -233,18 +233,28 @@ def run(
             cancellation_token=token,
         )
         reused_merged_dub = False
-        if task.cfg.subtitles:
+        has_burn_annotations = bool(
+            getattr(task.cfg, "burn_annotations", False)
+            and getattr(task.cfg, "annotations", None)
+        )
+        if task.cfg.subtitles or has_burn_annotations:
             # Stage 4 is authoritative for edited text/timing. Reuse the prepared
             # media/cache and enter the existing dubbing/assembly stages directly.
             task.cfg.clear_cache = False
             Path(task.cfg.source_sub).parent.mkdir(parents=True, exist_ok=True)
-            Path(task.cfg.source_sub).write_text(task.cfg.subtitles, encoding="utf-8")
-            Path(task.cfg.target_sub).write_text(task.cfg.subtitles, encoding="utf-8")
+            Path(task.cfg.source_sub).write_text(task.cfg.subtitles or "", encoding="utf-8")
+            Path(task.cfg.target_sub).write_text(task.cfg.subtitles or "", encoding="utf-8")
             from videotrans.util.help_srt import get_subtitle_from_srt
-            task.source_srt_list = get_subtitle_from_srt(task.cfg.source_sub, is_file=True) or []
-            task.target_srt_list = get_subtitle_from_srt(task.cfg.target_sub, is_file=True) or []
+            if task.cfg.subtitles:
+                task.source_srt_list = get_subtitle_from_srt(task.cfg.source_sub, is_file=True) or []
+                task.target_srt_list = get_subtitle_from_srt(task.cfg.target_sub, is_file=True) or []
+            else:
+                task.source_srt_list = []
+                task.target_srt_list = []
             task.should_recogn = False
             task.should_trans = False
+            if has_burn_annotations and not getattr(task, "is_audio_trans", False) and getattr(task.cfg, "app_mode", "") != "tiqu":
+                task.should_hebing = True
             if not was_clear_cache and _stage_merged_dubbing_for_render(task):
                 reused_merged_dub = True
                 task.should_dubbing = True

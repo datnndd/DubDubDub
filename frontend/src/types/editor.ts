@@ -28,6 +28,7 @@ export interface EditVideoState {
   thumbnail: { id: string; file: File | null; name: string; url: string } | null;
   exporting: boolean;
   error: string | null;
-  activeTab: 'audio' | 'subtitles' | 'assets';
+  activeTab: 'audio' | 'subtitles' | 'annotations' | 'assets';
   isCapCutModalOpen?: boolean;
+  burnAnnotations?: boolean;
 }

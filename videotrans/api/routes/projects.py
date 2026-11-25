@@ -682,6 +682,23 @@ def _prepare_capcut_assets(project_id: str) -> dict[str, Path]:
     segments = state.get("segments") or []
     if not isinstance(segments, list):
         raise HTTPException(status_code=400, detail="Invalid project segments")
+    annotations = state.get("annotations") if isinstance(state.get("annotations"), list) else []
+
+    ann_w, ann_h = 1920, 1080
+    res_str = str((state.get("project") or {}).get("resolution") or "")
+    m_res = re.search(r"(\d{2,5})\s*[xX×]\s*(\d{2,5})", res_str)
+    if m_res:
+        ann_w, ann_h = int(m_res.group(1)), int(m_res.group(2))
+    elif project.get("media_path") and Path(str(project.get("media_path"))).is_file():
+        try:
+            from videotrans.ocr._frame_source import probe_video_meta
+            meta = probe_video_meta(str(project.get("media_path")))
+            if int(meta.get("width") or 0) > 0 and int(meta.get("height") or 0) > 0:
+                ann_w, ann_h = int(meta["width"]), int(meta["height"])
+        except Exception:
+            pass
+
+    from videotrans.util._annotations_ass import build_annotations_ass, build_annotations_srt
 
     try:
         # 1. subtitles_edited.srt
@@ -693,6 +710,15 @@ def _prepare_capcut_assets(project_id: str) -> dict[str, Path]:
         target_srt_path = exports_dir / f"{prefix}subtitles_target.srt"
         target_content = _build_srt(segments, field="rawTranslation" if any(isinstance(s, dict) and "rawTranslation" in s for s in segments) else "targetText")
         target_srt_path.write_text(target_content, encoding="utf-8")
+
+        # 3. annotations.srt & annotations.ass (on-screen annotations for CapCut & Aegisub)
+        annotations_srt_path = exports_dir / f"{prefix}annotations.srt"
+        annotations_srt_content = build_annotations_srt(annotations, field="targetText")
+        annotations_srt_path.write_text(annotations_srt_content, encoding="utf-8")
+
+        annotations_ass_path = exports_dir / f"{prefix}annotations.ass"
+        annotations_ass_content = build_annotations_ass(annotations, width=ann_w, height=ann_h)
+        annotations_ass_path.write_text(annotations_ass_content, encoding="utf-8")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid segment timestamp: {exc}") from exc
 
@@ -728,15 +754,21 @@ def _prepare_capcut_assets(project_id: str) -> dict[str, Path]:
             raise HTTPException(status_code=400, detail=f"Invalid project duration for audio export: {exc}") from exc
 
     # 4. bundle.zip
+    has_annotations = bool(annotations_srt_content.strip())
     zip_path = exports_dir / f"{prefix}capcut_export_{project_id}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.write(edited_srt_path, f"{prefix}subtitles_edited.srt")
         zf.write(target_srt_path, f"{prefix}subtitles_target.srt")
         zf.write(voiceover_path, f"{prefix}voiceover_merged.wav")
+        if has_annotations:
+            zf.write(annotations_srt_path, f"{prefix}annotations.srt")
+            zf.write(annotations_ass_path, f"{prefix}annotations.ass")
 
     return {
         "subtitles_edited.srt": edited_srt_path,
         "subtitles_target.srt": target_srt_path,
+        "annotations.srt": annotations_srt_path,
+        "annotations.ass": annotations_ass_path,
         "voiceover_merged.wav": voiceover_path,
         "bundle.zip": zip_path,
     }
@@ -754,6 +786,14 @@ async def get_capcut_asset_handler(project_id: str, asset_name: str):
         download_name = target.name
     elif clean_name in {"subtitles_target.srt", "target.srt"}:
         target = assets["subtitles_target.srt"]
+        media_type = "text/plain; charset=utf-8"
+        download_name = target.name
+    elif clean_name in {"annotations.srt", "onscreen.srt"}:
+        target = assets["annotations.srt"]
+        media_type = "text/plain; charset=utf-8"
+        download_name = target.name
+    elif clean_name in {"annotations.ass", "onscreen.ass"}:
+        target = assets["annotations.ass"]
         media_type = "text/plain; charset=utf-8"
         download_name = target.name
     elif clean_name in {"voiceover_merged.wav", "audio.wav", "audio"}:

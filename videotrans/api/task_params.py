@@ -413,6 +413,16 @@ def build_task_params(
         "source_audio_volume": _safe_volume(raw_orig_vol, 0.0),
         "thumbnail": None if is_asr_only else options.get("thumbnailPath"),
         "subtitle_style": options.get("subtitleStyle") if isinstance(options.get("subtitleStyle"), dict) else None,
+        "annotations": (
+            [dict(a) for a in options.get("annotations", []) if isinstance(a, dict)]
+            if (not is_asr_only and isinstance(options.get("annotations"), list))
+            else None
+        ),
+        "burn_annotations": (
+            False
+            if is_asr_only
+            else bool(_pick_defined(options, "burnAnnotations", "burn_annotations", default=False))
+        ),
         "force_recogn": bool(options.get("forceAsr", False)) if is_asr_only else False,
         "clear_cache": job_type not in {"render", "translation"},
         "embed_bgm": not is_asr_only,

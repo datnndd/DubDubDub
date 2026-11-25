@@ -82,9 +82,13 @@ def reset_project_stage(project_id: str, stage: int) -> dict:
             state["segments"] = baseline
         elif state.get("segments") and (project.get("stage", 1) >= 4 or state.get("currentStep", 1) >= 4):
             raise BaselineMissingError("Original Stage 3 result unavailable. Reset and rerun Stage 3 before resetting Stage 4.")
+        state["annotations"] = []
+        state["burnAnnotations"] = True
 
     if stage <= 1:
         state["segments"] = []
+        state["annotations"] = []
+        state["burnAnnotations"] = True
         state["transcriptOptions"] = None
         state["selectedSegmentOption"] = "utterances"
         state["forceAsr"] = True

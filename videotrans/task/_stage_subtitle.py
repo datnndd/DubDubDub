@@ -14,8 +14,28 @@ class SubtitleMixin:
 
     def _process_subtitles(self) -> Union[tuple[str, str], None]:
         logger.debug(f"\n======准备要嵌入的字幕:{self.cfg.subtitle_type=}=====")
-        if not Path(self.cfg.target_sub).exists() :
-            raise VideoTransError(tr("No valid subtitle file exists")+self.cfg.target_sub)
+        burn_anns = bool(
+            getattr(self.cfg, "burn_annotations", False)
+            and getattr(self.cfg, "annotations", None)
+            and self.cfg.subtitle_type in [1, 3]
+        )
+        subtitle_langcode = translator.get_subtitle_code(show_target=self.cfg.target_language)
+
+        has_target_srt = Path(self.cfg.target_sub).exists() and Path(self.cfg.target_sub).stat().st_size > 0
+        if not has_target_srt:
+            if burn_anns:
+                from videotrans.util._annotations_ass import build_annotations_ass
+                vinfo = getattr(self, "video_info", None) or {}
+                vw = int(vinfo.get("width") or 1920)
+                vh = int(vinfo.get("height") or 1080)
+                only_ann_ass = Path(self.cfg.cache_folder) / "end.ass"
+                only_ann_ass.write_text(
+                    build_annotations_ass(list(self.cfg.annotations), width=vw, height=vh),
+                    encoding="utf-8",
+                )
+                return only_ann_ass.name, subtitle_langcode
+            if not Path(self.cfg.target_sub).exists():
+                raise VideoTransError(tr("No valid subtitle file exists")+self.cfg.target_sub)
 
         if not Path(self.cfg.source_sub).exists() or (self.cfg.source_language_code == self.cfg.target_language_code):
             if self.cfg.subtitle_type == 3:
@@ -68,6 +88,15 @@ class SubtitleMixin:
             return os.path.basename(process_end_subtitle), subtitle_langcode
 
         process_end_subtitle_ass = set_ass_font(process_end_subtitle, self.cfg.subtitle_style)
+        if burn_anns:
+            from videotrans.util._annotations_ass import append_annotations_to_ass
+            vinfo = getattr(self, "video_info", None) or {}
+            vh = int(vinfo.get("height") or 1080)
+            append_annotations_to_ass(
+                process_end_subtitle_ass,
+                list(self.cfg.annotations),
+                source_video_height=vh,
+            )
         basename = os.path.basename(process_end_subtitle_ass)
         return basename, subtitle_langcode
 

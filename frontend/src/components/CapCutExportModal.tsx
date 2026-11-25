@@ -13,6 +13,7 @@ import {
   Layers,
 } from 'lucide-react';
 import { apiRequest } from '../api/client';
+import { generateAnnotationsAssContent } from '../types/annotation';
 
 export function formatSrtTime(sec: number): string {
   const totalMs = Math.max(0, Math.round(Number(sec || 0) * 1000));
@@ -64,12 +65,35 @@ export const CapCutExportModal: React.FC = () => {
   const isOpen = useDubDubStore((s) => s.editVideo?.isCapCutModalOpen);
   const setCapCutModalOpen = useDubDubStore((s) => s.setCapCutModalOpen);
   const segments = useDubDubStore((s) => s.segments || []);
+  const annotations = useDubDubStore((s) => s.annotations || []);
+  const project = useDubDubStore((s) => s.project);
   const activeProjectId = useDubDubStore((s) => s.activeProjectId);
 
   const [downloadingZip, setDownloadingZip] = useState(false);
   const [folderStatus, setFolderStatus] = useState<string | null>(null);
 
   if (!isOpen) return null;
+
+  const hasAnnotations = annotations.some((a) =>
+    Boolean((a?.targetText || a?.sourceText || '').trim())
+  );
+  const parsedRes = /^(\d{2,5})\s*[xX×]\s*(\d{2,5})/.exec(String(project?.resolution || ''));
+  const exportWidth = parsedRes ? Number(parsedRes[1]) : 1920;
+  const exportHeight = parsedRes ? Number(parsedRes[2]) : 1080;
+
+  const handleDownloadAnnotationsSrt = () => {
+    const srt = generateSrtContent(annotations, 'targetText');
+    triggerBlobDownload(srt, 'annotations.srt');
+  };
+
+  const handleDownloadAnnotationsAss = () => {
+    if (activeProjectId) {
+      window.open(`/api/projects/${activeProjectId}/export-capcut/annotations.ass`, '_blank');
+      return;
+    }
+    const ass = generateAnnotationsAssContent(annotations, exportWidth, exportHeight);
+    triggerBlobDownload(ass, 'annotations.ass');
+  };
 
   const handleDownloadEditedSrt = () => {
     const srt = generateSrtContent(segments, 'targetText');
@@ -224,7 +248,7 @@ export const CapCutExportModal: React.FC = () => {
           <div className="space-y-2.5">
             <div className="flex items-center justify-between">
               <h4 className="text-xs font-bold text-stone-800 uppercase tracking-wider">
-                Exported Project Assets (3 Files)
+                Exported Project Assets ({hasAnnotations ? '5 Files' : '3 Files'})
               </h4>
               <button
                 data-download-zip-btn="true"
@@ -300,6 +324,52 @@ export const CapCutExportModal: React.FC = () => {
                   <span>Download</span>
                 </button>
               </div>
+
+              {hasAnnotations && (
+                <>
+                  {/* Asset 4: Annotations SRT for CapCut */}
+                  <div className="p-3 rounded-xl border border-amber-200/80 bg-amber-50/40 flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="w-8 h-8 rounded-lg bg-amber-100 text-[#8D4B00] flex items-center justify-center shrink-0">
+                        <FileText className="w-4 h-4" />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-stone-900 truncate">annotations.srt</div>
+                        <div className="text-[10px] text-stone-500">On-screen callouts (CapCut Captions)</div>
+                      </div>
+                    </div>
+                    <button
+                      data-download-annotations-srt="true"
+                      onClick={handleDownloadAnnotationsSrt}
+                      className="px-2.5 py-1 rounded-lg border border-stone-200 bg-white hover:bg-stone-50 text-stone-700 text-xs font-semibold flex items-center gap-1 transition-colors cursor-pointer shrink-0"
+                    >
+                      <Download className="w-3 h-3" />
+                      <span>Download</span>
+                    </button>
+                  </div>
+
+                  {/* Asset 5: Positioned Annotations ASS for Aegisub */}
+                  <div className="p-3 rounded-xl border border-indigo-200/80 bg-indigo-50/40 flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="w-8 h-8 rounded-lg bg-indigo-100 text-indigo-700 flex items-center justify-center shrink-0">
+                        <Layers className="w-4 h-4" />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-stone-900 truncate">annotations.ass</div>
+                        <div className="text-[10px] text-stone-500">Positioned boxes + cover (Aegisub)</div>
+                      </div>
+                    </div>
+                    <button
+                      data-download-annotations-ass="true"
+                      onClick={handleDownloadAnnotationsAss}
+                      className="px-2.5 py-1 rounded-lg border border-stone-200 bg-white hover:bg-stone-50 text-stone-700 text-xs font-semibold flex items-center gap-1 transition-colors cursor-pointer shrink-0"
+                    >
+                      <Download className="w-3 h-3" />
+                      <span>Download</span>
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           </div>
         </div>

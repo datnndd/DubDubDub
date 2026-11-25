@@ -2,7 +2,7 @@ import { StateCreator } from 'zustand';
 import type { ProjectRecord } from '../types/project';
 import type { Segment } from '../types/segment';
 import { fetchProjects, fetchProject, createProject, deleteProject as apiDeleteProject, bulkDeleteProjects, updateProjectState, resetProjectStage, fetchSubprojects } from '../api/projects';
-import { DEFAULT_EDIT_VIDEO, DEFAULT_SUBTITLE_STYLES } from './editVideoSlice';
+import { DEFAULT_EDIT_VIDEO, DEFAULT_SUBTITLE_STYLES, normalizeAnnotationRecord } from './editVideoSlice';
 import { formatTimecode } from './playbackSlice';
 import { formatLocalDateYmd } from '../utils/date';
 
@@ -337,6 +337,17 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
           ? formatTimecode(resolvedDurSec)
           : savedDurationStr || '00:00.000';
 
+      const rawAnnotations = Array.isArray(stateData?.annotations) ? stateData.annotations : [];
+      const normalizedAnnotations = rawAnnotations.map((ann: any, idx: number) =>
+        normalizeAnnotationRecord(ann, idx)
+      );
+      const resolvedBurnAnnotations =
+        stateData?.burnAnnotations !== undefined
+          ? Boolean(stateData.burnAnnotations)
+          : stateData?.editVideo?.burnAnnotations !== undefined
+          ? Boolean(stateData.editVideo.burnAnnotations)
+          : true;
+
       set((state: any) => ({
         ...state,
         selectedFile: null,
@@ -346,6 +357,12 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
         maxUnlockedStep: Math.max(project.stage || 1, targetStep),
         drawerOpen: false,
         segments: normalizedSegments,
+        annotations: normalizedAnnotations,
+        activeAnnotationId: normalizedAnnotations[0]?.id || null,
+        annotationDrawMode: false,
+        annotationScanning: false,
+        annotationTranslating: false,
+        annotationStatusMessage: null,
         ocrCrop: { active: false, segmentId: null, roi: stateData?.ocrCrop?.roi || [0.05, 0.75, 0.9, 0.2], loading: false, error: null },
         subtitleSource: stateData?.subtitleSource === 'video_ocr' ? 'video_ocr' : 'audio_asr',
         ocrRoiConfirmed: Boolean(stateData?.ocrRoiConfirmed),
@@ -372,10 +389,11 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
           ? {
               ...DEFAULT_EDIT_VIDEO,
               ...stateData.editVideo,
+              burnAnnotations: resolvedBurnAnnotations,
               backgroundAudio: normalizeSavedAsset(stateData.editVideo.backgroundAudio),
               thumbnail: normalizeSavedAsset(stateData.editVideo.thumbnail),
             }
-          : { ...DEFAULT_EDIT_VIDEO },
+          : { ...DEFAULT_EDIT_VIDEO, burnAnnotations: resolvedBurnAnnotations },
         activeJob: isRunningOrQueued ? {
           jobId: jobForThisProj!.jobId!,
           projectId: id,
@@ -668,12 +686,15 @@ export const createProjectSlice: StateCreator<any, [], [], ProjectSlice> = (set,
       dubbingStatus: currentState.dubbingStatus,
       tuning: currentState.tuning,
       segments: currentState.segments,
+      annotations: currentState.annotations || [],
+      burnAnnotations: currentState.editVideo?.burnAnnotations ?? true,
       transcriptOptions: currentState.transcriptOptions,
       selectedSegmentOption: currentState.selectedSegmentOption,
       subtitleStyles: currentState.subtitleStyles,
       editVideo: {
         audioMix: currentState.editVideo?.audioMix,
         activeTab: currentState.editVideo?.activeTab,
+        burnAnnotations: currentState.editVideo?.burnAnnotations ?? true,
         backgroundAudio: currentState.editVideo?.backgroundAudio
           ? {
               id: currentState.editVideo.backgroundAudio.id,

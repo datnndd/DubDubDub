@@ -15,6 +15,11 @@ import {
   Subtitles,
   Bold,
   Italic,
+  ScanText,
+  Crop,
+  Languages,
+  Plus,
+  Loader2,
 } from 'lucide-react';
 
 export const Stage4EditVideo: React.FC = () => {
@@ -40,6 +45,35 @@ export const Stage4EditVideo: React.FC = () => {
   const updateSubtitleStyle = useDubDubStore((s) => s.updateSubtitleStyle);
   const setActiveInspectorTab = useDubDubStore((s) => s.setActiveInspectorTab);
   const updateSegmentText = useDubDubStore((s) => s.updateSegmentText);
+  const backend = useDubDubStore((s) => s.backend);
+  const updateTranslationProvider = useDubDubStore((s) => s.updateTranslationProvider);
+  const annotations = useDubDubStore((s) => s.annotations || []);
+  const activeAnnotationId = useDubDubStore((s) => s.activeAnnotationId);
+  const annotationDrawMode = useDubDubStore((s) => Boolean(s.annotationDrawMode));
+  const annotationScanning = useDubDubStore((s) => Boolean(s.annotationScanning));
+  const annotationTranslating = useDubDubStore((s) => Boolean(s.annotationTranslating));
+  const annotationStatusMessage = useDubDubStore((s) => s.annotationStatusMessage);
+  const filterStaticWatermarks = useDubDubStore((s) => s.filterStaticWatermarks ?? true);
+  const setActiveAnnotationId = useDubDubStore((s) => s.setActiveAnnotationId);
+  const setAnnotationDrawMode = useDubDubStore((s) => s.setAnnotationDrawMode);
+  const setFilterStaticWatermarks = useDubDubStore((s) => s.setFilterStaticWatermarks);
+  const setBurnAnnotations = useDubDubStore((s) => s.setBurnAnnotations);
+  const scanVideoAnnotations = useDubDubStore((s) => s.scanVideoAnnotations);
+  const addManualAnnotation = useDubDubStore((s) => s.addManualAnnotation);
+  const updateAnnotation = useDubDubStore((s) => s.updateAnnotation);
+  const updateAnnotationStyle = useDubDubStore((s) => s.updateAnnotationStyle);
+  const deleteAnnotation = useDubDubStore((s) => s.deleteAnnotation);
+  const clearAnnotations = useDubDubStore((s) => s.clearAnnotations);
+  const translateAnnotations = useDubDubStore((s) => s.translateAnnotations);
+
+  const translationProviders = backend?.options?.translationProviders?.length
+    ? backend.options.translationProviders
+    : [
+        { id: 'google', label: 'Google Translate', translateType: 0 },
+        { id: 'openai', label: 'OpenAI ChatGPT', translateType: 1 },
+        { id: 'gemini', label: 'Gemini', translateType: 2 },
+        { id: 'deepseek', label: 'DeepSeek', translateType: 3 },
+      ];
 
   const activeTab = editVideo.activeTab || 'audio';
   const duration = project.durationSec || 1;
@@ -164,7 +198,7 @@ export const Stage4EditVideo: React.FC = () => {
               </button>
               <button
                 onClick={() => setActiveInspectorTab('subtitles')}
-                className={`px-2.5 py-1 rounded-md transition-colors flex items-center gap-1 cursor-pointer ${
+                className={`px-2 py-1 rounded-md transition-colors flex items-center gap-1 cursor-pointer ${
                   activeTab === 'subtitles'
                     ? 'bg-white text-[#8D4B00] shadow-2xs'
                     : 'text-stone-500 hover:text-stone-800'
@@ -172,6 +206,24 @@ export const Stage4EditVideo: React.FC = () => {
               >
                 <Type className="w-3.5 h-3.5" />
                 <span>Subtitles</span>
+              </button>
+              <button
+                type="button"
+                data-testid="stage4-tab-annotations"
+                onClick={() => setActiveInspectorTab('annotations')}
+                className={`px-2 py-1 rounded-md transition-colors flex items-center gap-1 cursor-pointer ${
+                  activeTab === 'annotations'
+                    ? 'bg-white text-[#8D4B00] shadow-2xs'
+                    : 'text-stone-500 hover:text-stone-800'
+                }`}
+              >
+                <ScanText className="w-3.5 h-3.5" />
+                <span>Annotations</span>
+                {annotations.length > 0 && (
+                  <span className="px-1 py-0.2 rounded-full bg-amber-100 text-[#8D4B00] text-[9px] font-mono">
+                    {annotations.length}
+                  </span>
+                )}
               </button>
               <button
                 onClick={() => setActiveInspectorTab('assets')}
@@ -434,6 +486,289 @@ export const Stage4EditVideo: React.FC = () => {
               </div>
             )}
 
+            {activeTab === 'annotations' && (
+              <div className="space-y-3" data-testid="stage4-annotations-panel">
+                <div className="p-2.5 rounded-xl border border-stone-200 bg-stone-50/70 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-[11px] font-bold uppercase tracking-wider text-stone-600">
+                      Capture On-Screen Text
+                    </h4>
+                    {annotations.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => clearAnnotations()}
+                        className="text-[10px] font-semibold text-rose-600 hover:text-rose-800 cursor-pointer"
+                      >
+                        Clear All
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-1.5">
+                    <button
+                      type="button"
+                      data-testid="scan-annotations-btn"
+                      disabled={annotationScanning}
+                      onClick={() => void scanVideoAnnotations()}
+                      className="px-2 py-1.5 rounded-lg bg-[#8D4B00] hover:bg-[#743D00] text-white text-[11px] font-bold flex items-center justify-center gap-1 cursor-pointer disabled:opacity-50"
+                      title="Scan full video frames with PaddleOCR (excluding bottom subtitles)"
+                    >
+                      {annotationScanning ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <ScanText className="w-3.5 h-3.5" />
+                      )}
+                      <span>Auto-Scan</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      data-testid="toggle-draw-annotation-btn"
+                      onClick={() => setAnnotationDrawMode(!annotationDrawMode)}
+                      className={`px-2 py-1.5 rounded-lg border text-[11px] font-bold flex items-center justify-center gap-1 cursor-pointer transition-colors ${
+                        annotationDrawMode
+                          ? 'bg-sky-700 text-white border-sky-800'
+                          : 'bg-white hover:bg-stone-100 text-stone-800 border-stone-200'
+                      }`}
+                      title="Drag a rectangle directly on the video preview to OCR a callout"
+                    >
+                      <Crop className="w-3.5 h-3.5" />
+                      <span>{annotationDrawMode ? 'Drawing…' : 'Draw Box'}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      data-testid="add-manual-annotation-btn"
+                      onClick={() => addManualAnnotation()}
+                      className="px-2 py-1.5 rounded-lg border border-stone-200 bg-white hover:bg-stone-100 text-stone-800 text-[11px] font-semibold flex items-center justify-center gap-1 cursor-pointer"
+                      title="Add a manual annotation card at current playhead"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Manual</span>
+                    </button>
+                  </div>
+
+                  <div className="flex flex-col gap-1 pt-0.5 text-[11px] text-stone-700">
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={filterStaticWatermarks}
+                        onChange={(e) => setFilterStaticWatermarks(e.target.checked)}
+                        className="accent-[#8D4B00]"
+                      />
+                      <span>Ignore static logos / corner watermarks</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        data-testid="burn-annotations-toggle"
+                        checked={editVideo.burnAnnotations ?? true}
+                        onChange={(e) => setBurnAnnotations(e.target.checked)}
+                        className="accent-[#8D4B00]"
+                      />
+                      <span>Burn annotations when rendering MP4 directly</span>
+                    </label>
+                  </div>
+                </div>
+
+                {/* Translate Bar */}
+                <div className="p-2.5 rounded-xl border border-stone-200 bg-stone-50/70 flex items-center gap-2">
+                  <select
+                    data-testid="annotation-translate-provider"
+                    value={Number(backend?.config?.translateType ?? 0)}
+                    onChange={(e) => updateTranslationProvider(Number(e.target.value))}
+                    className="flex-1 min-w-0 text-xs font-semibold px-2 py-1.5 rounded-lg border border-stone-200 bg-white text-stone-800"
+                  >
+                    {translationProviders.map((p: any) => (
+                      <option key={p.translateType} value={p.translateType}>
+                        {p.label}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    data-testid="translate-annotations-btn"
+                    disabled={annotationTranslating || annotations.length === 0}
+                    onClick={() => void translateAnnotations()}
+                    className="px-2.5 py-1.5 rounded-lg bg-stone-900 hover:bg-black text-white text-[11px] font-bold flex items-center gap-1 shrink-0 cursor-pointer disabled:opacity-50"
+                  >
+                    {annotationTranslating ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Languages className="w-3.5 h-3.5" />
+                    )}
+                    <span>Translate All</span>
+                  </button>
+                </div>
+
+                {annotationStatusMessage && (
+                  <div
+                    data-testid="annotation-status-banner"
+                    className="rounded-lg border border-amber-200 bg-amber-50/80 px-2.5 py-1.5 text-[11px] text-amber-950"
+                  >
+                    {annotationStatusMessage}
+                  </div>
+                )}
+
+                {/* Annotation Cards */}
+                {annotations.length === 0 ? (
+                  <div className="py-6 px-3 text-center rounded-xl border border-dashed border-stone-200 text-xs text-stone-500 space-y-1">
+                    <p className="font-semibold text-stone-700">No on-screen annotations yet</p>
+                    <p className="text-[11px]">
+                      Click <strong>Auto-Scan</strong> to detect callouts across the video, or use{' '}
+                      <strong>Draw Box</strong> to select specific labels on the preview.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2.5">
+                    {annotations.map((ann, idx) => {
+                      const isSelected = ann.id === activeAnnotationId;
+                      return (
+                        <div
+                          key={ann.id}
+                          data-annotation-card={ann.id}
+                          onClick={() => {
+                            setActiveAnnotationId(ann.id);
+                            seek(ann.startSec);
+                          }}
+                          className={`p-2.5 rounded-xl border space-y-2 transition-colors cursor-pointer ${
+                            isSelected
+                              ? 'border-amber-400 bg-amber-50/40 shadow-2xs'
+                              : 'border-stone-200 bg-white hover:border-stone-300'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-1.5 text-[10px]">
+                            <div className="flex items-center gap-1.5 font-mono">
+                              <span className="px-1.5 py-0.5 rounded bg-stone-800 text-white font-bold">
+                                #{idx + 1}
+                              </span>
+                              <input
+                                type="number"
+                                step="0.1"
+                                min="0"
+                                aria-label={`Annotation ${idx + 1} start seconds`}
+                                value={ann.startSec}
+                                onClick={(e) => e.stopPropagation()}
+                                onChange={(e) =>
+                                  updateAnnotation(ann.id, { startSec: Number(e.target.value) })
+                                }
+                                className="w-14 px-1 py-0.5 rounded border border-stone-200 bg-white text-stone-800"
+                              />
+                              <span>→</span>
+                              <input
+                                type="number"
+                                step="0.1"
+                                min="0.1"
+                                aria-label={`Annotation ${idx + 1} end seconds`}
+                                value={ann.endSec}
+                                onClick={(e) => e.stopPropagation()}
+                                onChange={(e) =>
+                                  updateAnnotation(ann.id, { endSec: Number(e.target.value) })
+                                }
+                                className="w-14 px-1 py-0.5 rounded border border-stone-200 bg-white text-stone-800"
+                              />
+                              <span className="text-stone-400">s</span>
+                            </div>
+                            <button
+                              type="button"
+                              data-testid={`delete-annotation-${ann.id}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                deleteAnnotation(ann.id);
+                              }}
+                              className="p-1 rounded hover:bg-rose-50 text-stone-400 hover:text-rose-600 cursor-pointer"
+                              title="Delete annotation"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+
+                          <div className="space-y-1.5" onClick={(e) => e.stopPropagation()}>
+                            <input
+                              type="text"
+                              placeholder="Original on-screen text (OCR)"
+                              value={ann.sourceText}
+                              onChange={(e) =>
+                                updateAnnotation(ann.id, { sourceText: e.target.value })
+                              }
+                              className="w-full text-[11px] px-2 py-1 rounded border border-stone-200 bg-stone-50 text-stone-700"
+                            />
+                            <textarea
+                              rows={2}
+                              placeholder="Translated text for CapCut / Aegisub"
+                              value={ann.targetText}
+                              onChange={(e) =>
+                                updateAnnotation(ann.id, { targetText: e.target.value })
+                              }
+                              className="w-full text-xs font-medium px-2 py-1 rounded border border-stone-200 bg-white text-stone-900 resize-none"
+                            />
+                          </div>
+
+                          <div
+                            className="grid grid-cols-4 gap-1.5 pt-0.5 text-[10px] text-stone-500"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <label className="flex flex-col gap-0.5">
+                              <span>Cover</span>
+                              <input
+                                type="color"
+                                value={ann.style?.bgColor || '#18181B'}
+                                onChange={(e) =>
+                                  updateAnnotationStyle(ann.id, { bgColor: e.target.value })
+                                }
+                                className="w-full h-6 rounded border border-stone-200 cursor-pointer"
+                              />
+                            </label>
+                            <label className="flex flex-col gap-0.5">
+                              <span>Text</span>
+                              <input
+                                type="color"
+                                value={ann.style?.textColor || '#FFFFFF'}
+                                onChange={(e) =>
+                                  updateAnnotationStyle(ann.id, { textColor: e.target.value })
+                                }
+                                className="w-full h-6 rounded border border-stone-200 cursor-pointer"
+                              />
+                            </label>
+                            <label className="flex flex-col gap-0.5">
+                              <span>Box %</span>
+                              <input
+                                type="number"
+                                min="0"
+                                max="100"
+                                value={Math.round(ann.style?.bgOpacity ?? 92)}
+                                onChange={(e) =>
+                                  updateAnnotationStyle(ann.id, {
+                                    bgOpacity: Math.max(0, Math.min(100, Number(e.target.value) || 0)),
+                                  })
+                                }
+                                className="w-full h-6 px-1 rounded border border-stone-200 bg-white text-stone-800 font-mono"
+                              />
+                            </label>
+                            <label className="flex flex-col gap-0.5">
+                              <span>Font px</span>
+                              <input
+                                type="number"
+                                min="10"
+                                max="120"
+                                value={Math.round(ann.style?.fontSize || 28)}
+                                onChange={(e) =>
+                                  updateAnnotationStyle(ann.id, {
+                                    fontSize: Math.max(10, Math.min(120, Number(e.target.value) || 24)),
+                                  })
+                                }
+                                className="w-full h-6 px-1 rounded border border-stone-200 bg-white text-stone-800 font-mono"
+                              />
+                            </label>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
             {activeTab === 'assets' && (
               <div className="space-y-4">
                 {/* BGM Upload & Preview */}
@@ -501,7 +836,7 @@ export const Stage4EditVideo: React.FC = () => {
       </section>
 
       {/* LOWER DECK: Multi-Track Timeline */}
-      <section className="h-[210px] shrink-0 w-full bg-white rounded-xl border border-[#E7E4DC] shadow-xs flex flex-col overflow-hidden">
+      <section className="h-[234px] shrink-0 w-full bg-white rounded-xl border border-[#E7E4DC] shadow-xs flex flex-col overflow-hidden">
         {/* Timeline Header & Zoom Controls */}
         <div className="h-7 px-3 border-b border-[#E7E4DC] flex items-center justify-between bg-[#FAF9F6] shrink-0">
           <div className="flex items-center gap-2">
@@ -570,6 +905,51 @@ export const Stage4EditVideo: React.FC = () => {
                   </div>
                 );
               })}
+            </div>
+          </div>
+
+          {/* Track 2b: On-Screen Annotations Track */}
+          <div
+            data-testid="timeline-annotations-track"
+            className="h-7 flex items-center gap-2 bg-stone-100/70 rounded-lg px-2 border border-stone-200/80"
+          >
+            <div className="w-20 shrink-0 flex items-center gap-1 text-[10px] font-bold text-stone-700">
+              <ScanText className="w-3 h-3 text-sky-600" />
+              <span>Notes</span>
+            </div>
+            <div className="relative flex-1 h-4.5 bg-sky-100/50 rounded overflow-hidden">
+              {annotations.length === 0 ? (
+                <span className="px-2 text-[9px] text-stone-400 flex items-center h-full">
+                  No on-screen annotations
+                </span>
+              ) : (
+                annotations.map((ann) => {
+                  const annLeft = (ann.startSec / duration) * 100;
+                  const annWidth = Math.max(0.8, ((ann.endSec - ann.startSec) / duration) * 100);
+                  const isSelected = ann.id === activeAnnotationId;
+                  return (
+                    <div
+                      key={ann.id}
+                      data-annotation-chip={ann.id}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setActiveAnnotationId(ann.id);
+                        setActiveInspectorTab('annotations');
+                        seek(ann.startSec);
+                      }}
+                      className={`absolute top-0 bottom-0 rounded border text-[9px] truncate px-1 flex items-center transition-all ${
+                        isSelected
+                          ? 'bg-sky-700 text-white border-sky-900 shadow-xs z-10'
+                          : 'bg-sky-200/85 text-sky-950 border-sky-300 hover:bg-sky-300'
+                      }`}
+                      style={{ left: `${annLeft}%`, width: `${annWidth}%` }}
+                      title={ann.targetText || ann.sourceText}
+                    >
+                      {ann.targetText || ann.sourceText || 'Annotation'}
+                    </div>
+                  );
+                })
+              )}
             </div>
           </div>
 

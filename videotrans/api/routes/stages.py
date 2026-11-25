@@ -47,6 +47,26 @@ class OcrExtractRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
 
+class AnnotationScanRequest(BaseModel):
+    mediaId: str
+    language: Optional[str] = None
+    excludeRoi: Optional[Any] = None
+    sampleIntervalMs: int = 1000
+    filterStatic: bool = True
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+class AnnotationRegionRequest(BaseModel):
+    mediaId: str
+    anchorSec: float = 0.0
+    roi: Any
+    language: Optional[str] = None
+    maxSpanSec: float = 15.0
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
 class SegmentSplitRequest(BaseModel):
     segment: dict[str, Any]
     splitTime: float
@@ -223,6 +243,87 @@ async def ocr_extract_handler(
     except Exception as exc:
         runtime_config.logger.exception("OCR extraction failed", exc_info=True)
         raise HTTPException(status_code=400, detail=f"OCR extraction failed: {get_msg_from_except(exc)}") from exc
+
+    return JSONResponse(result)
+
+
+@router.post("/api/ocr/annotations/scan")
+async def ocr_annotations_scan_handler(
+    payload: AnnotationScanRequest,
+    request: Request,
+) -> JSONResponse:
+    from videotrans.ocr._annotations import DEFAULT_EXCLUDE_ROI, normalize_roi_tuple, scan_video_annotations
+
+    media_id = str(payload.mediaId or "")
+    media_store = getattr(request.app.state, "media_store", None) or MEDIA
+    media = media_store.get(media_id)
+    if media is None or not media.path.is_file():
+        raise HTTPException(status_code=404, detail="Select and inspect a media file before scanning annotations")
+
+    try:
+        excl = (
+            DEFAULT_EXCLUDE_ROI
+            if payload.excludeRoi is None
+            else normalize_roi_tuple(payload.excludeRoi, default=None)
+        )
+        interval_ms = max(200, min(5000, int(payload.sampleIntervalMs or 1000)))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    scanner_fn = getattr(request.app.state, "annotation_scanner", None) or scan_video_annotations
+    try:
+        result = await asyncio.to_thread(
+            scanner_fn,
+            media.path,
+            language=payload.language,
+            exclude_roi=excl,
+            sample_interval_ms=interval_ms,
+            filter_static=bool(payload.filterStatic),
+        )
+    except Exception as exc:
+        runtime_config.logger.exception("Annotation full-frame scan failed", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Annotation scan failed: {get_msg_from_except(exc)}") from exc
+
+    return JSONResponse(result)
+
+
+@router.post("/api/ocr/annotations/region")
+async def ocr_annotations_region_handler(
+    payload: AnnotationRegionRequest,
+    request: Request,
+) -> JSONResponse:
+    from videotrans.ocr._annotations import extract_region_annotation, normalize_roi_tuple
+
+    media_id = str(payload.mediaId or "")
+    media_store = getattr(request.app.state, "media_store", None) or MEDIA
+    media = media_store.get(media_id)
+    if media is None or not media.path.is_file():
+        raise HTTPException(status_code=404, detail="Select and inspect a media file before extracting an annotation")
+
+    try:
+        anchor_sec = float(payload.anchorSec)
+        max_span_sec = float(payload.maxSpanSec or 15.0)
+        if not math.isfinite(anchor_sec) or anchor_sec < 0 or not math.isfinite(max_span_sec) or max_span_sec <= 0:
+            raise ValueError("anchorSec must be >= 0 and maxSpanSec must be > 0")
+        norm_roi = normalize_roi_tuple(payload.roi, default=None)
+        if norm_roi is None:
+            raise ValueError("roi must have positive width and height within [0, 1]")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    region_fn = getattr(request.app.state, "annotation_region_extractor", None) or extract_region_annotation
+    try:
+        result = await asyncio.to_thread(
+            region_fn,
+            media.path,
+            anchor_sec=anchor_sec,
+            roi=norm_roi,
+            language=payload.language,
+            max_span_sec=max_span_sec,
+        )
+    except Exception as exc:
+        runtime_config.logger.exception("Annotation region extraction failed", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Annotation extraction failed: {get_msg_from_except(exc)}") from exc
 
     return JSONResponse(result)
 
